@@ -1,0 +1,198 @@
+# JWT Auth Interceptor with Auto Refresh on 401
+
+## 1. What is it?
+
+An HTTP interceptor that automatically attaches a JWT access token to every outgoing request, and — if the server responds with `401 Unauthorized` (token expired) — silently refreshes the token using a refresh token, then retries the original failed request with the new token. All of this happens transparently, without the component or service that made the request knowing anything went wrong.
+
+## 2. Why was it introduced?
+
+Before interceptors handled this centrally, every service/component that made an HTTP call had to:
+
+- Manually attach the auth header.
+- Manually catch 401 errors.
+- Manually call a refresh endpoint and retry.
+
+This led to duplicated, error-prone auth logic scattered across the app. Also, without careful handling, expired tokens meant users got logged out or saw errors on every API call the moment their token expired — even though a valid refresh token existed that could silently renew the session.
+
+The interceptor pattern solves this by centralizing cross-cutting concerns (auth headers, error handling, retries) in one place, so the rest of the app can just "make requests" without worrying about token lifecycle.
+
+## 3. How does it work?
+
+**High-level flow:**
+
+1. Every outgoing HTTP request passes through the interceptor.
+2. The interceptor clones the request and attaches the current access token in the `Authorization` header.
+3. The request proceeds. If it succeeds, nothing special happens.
+4. If the response is a `401`, the interceptor:
+   - Checks if a refresh is already in progress.
+   - If not in progress, calls the refresh endpoint to get a new access token.
+   - Once refreshed, retries the original request with the new token.
+   - If refresh itself fails (refresh token expired/invalid), logs the user out.
+5. **Critical part:** if multiple requests fail with 401 at the same time (e.g., a dashboard firing 5 parallel API calls), only ONE refresh call should be made — not five. The other four requests should wait for that single refresh to complete, then retry using the new token.
+
+## 4. Example
+
+```typescript
+import {
+  HttpInterceptor, HttpRequest, HttpHandler, HttpEvent, HttpErrorResponse
+} from '@angular/common/http';
+import { Injectable } from '@angular/core';
+import { Observable, BehaviorSubject, throwError } from 'rxjs';
+import { catchError, filter, take, switchMap, finalize } from 'rxjs/operators';
+import { AuthService } from './auth.service';
+
+@Injectable()
+export class AuthInterceptor implements HttpInterceptor {
+  // Guard flag — ensures only ONE refresh call happens even if
+  // multiple requests get 401 at the same time
+  private isRefreshing = false;
+
+  // Holds the latest refreshed token. Starts as null so waiting
+  // requests know a refresh hasn't completed yet.
+  private refreshTokenSubject = new BehaviorSubject<string | null>(null);
+
+  constructor(private authService: AuthService) {}
+
+  intercept(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+    // Attach the access token to every outgoing request
+    const authReq = this.addToken(req, this.authService.getAccessToken());
+
+    return next.handle(authReq).pipe(
+      catchError((error: HttpErrorResponse) => {
+        // Only handle 401s here; other errors just propagate
+        if (error.status === 401) {
+          return this.handle401(req, next);
+        }
+        return throwError(() => error);
+      })
+    );
+  }
+
+  private addToken(req: HttpRequest<any>, token: string | null) {
+    if (!token) return req;
+    // Requests are immutable — must clone to modify headers
+    return req.clone({
+      setHeaders: { Authorization: `Bearer ${token}` }
+    });
+  }
+
+  private handle401(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+    if (!this.isRefreshing) {
+      // THIS request becomes the one responsible for refreshing
+      this.isRefreshing = true;
+      // Reset subject so other waiting requests know refresh is in-flight
+      this.refreshTokenSubject.next(null);
+
+      return this.authService.refreshToken().pipe(
+        switchMap((newToken: string) => {
+          this.isRefreshing = false;
+          // Broadcast the new token to any requests that were waiting
+          this.refreshTokenSubject.next(newToken);
+          // Retry the original failed request with the new token
+          return next.handle(this.addToken(req, newToken));
+        }),
+        catchError((err) => {
+          this.isRefreshing = false;
+          // Refresh token itself is invalid/expired — log the user out
+          this.authService.logout();
+          return throwError(() => err);
+        }),
+        finalize(() => (this.isRefreshing = false))
+      );
+    } else {
+      // A refresh is ALREADY in progress — don't fire another one.
+      // Wait until refreshTokenSubject emits a non-null (i.e. new) token,
+      // then retry this request with it.
+      return this.refreshTokenSubject.pipe(
+        filter(token => token !== null),
+        take(1), // only take the first new token, then unsubscribe
+        switchMap(token => next.handle(this.addToken(req, token!)))
+      );
+    }
+  }
+}
+```
+
+## 5. Example Explanation / Execution Flow
+
+**Scenario: 5 parallel requests fire, all get 401 at roughly the same time.**
+
+1. Request A hits 401 first. `isRefreshing` is `false`, so A sets it to `true` and calls `refreshToken()`. `refreshTokenSubject` is reset to `null`.
+2. Requests B, C, D, E also hit 401 while the refresh is still in flight. Each checks `isRefreshing` — it's now `true` — so instead of calling refresh again, they subscribe to `refreshTokenSubject` and wait.
+3. The refresh call completes. A gets the new token, sets `isRefreshing = false`, and pushes the new token into `refreshTokenSubject` via `.next(newToken)`.
+4. B, C, D, E — all subscribed to `refreshTokenSubject` — receive that emission, pass the `filter(token !== null)` check, and each retries its original request with the new token.
+5. Only **one** network call was made to the refresh endpoint, even though 5 requests failed with 401.
+
+Without this guard, all 5 requests would independently call the refresh endpoint — see the trap below for why that's a serious problem.
+
+## 6. When should we use it?
+
+- Any app using short-lived access tokens + long-lived refresh tokens (standard OAuth2/JWT setup).
+- SPAs where multiple API calls can fire in parallel (dashboards, initial page load fetching several resources at once).
+- Anywhere you want silent token renewal instead of forcing users to re-login every time the access token expires.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- Centralized, DRY auth logic — no component needs to know about tokens.
+- Seamless UX — users aren't logged out just because a short-lived token expired.
+- Prevents redundant refresh calls, reducing load on the auth server.
+
+**Disadvantages**
+- Adds complexity (shared state, RxJS operators) that's easy to get wrong.
+- If not handled carefully, can cause infinite retry loops (e.g., if refreshed token is also rejected with 401).
+- Storing refresh tokens client-side (localStorage) has XSS risk; httpOnly cookies are safer but need CSRF protection.
+
+## 8. Common Interview Traps
+
+**This is the core trap the question is asking about:**
+
+**The "multiple 401s at once" race condition.**
+If you naively refresh the token inside the `catchError` of every failing request without a shared guard, and 5 requests fail with 401 simultaneously, you get **5 separate calls to the refresh endpoint**. This causes:
+- Wasted/duplicate network calls to the auth server.
+- Some backends **invalidate the previous refresh token every time it's used** (refresh token rotation) — so if request A's refresh succeeds and rotates the token, request B's refresh (using the now-stale, already-consumed refresh token) fails, potentially logging the user out even though the session was actually valid.
+- Race condition on which "new token" ends up stored — the last refresh response to resolve wins, and earlier retried requests might use a token that's about to be invalidated.
+
+**The fix:** use a shared flag (`isRefreshing`) + a `BehaviorSubject` (or similar shared stream) so only the *first* 401 triggers a real refresh call, and all subsequent concurrent 401s just wait on that same in-flight refresh and reuse its result.
+
+Other traps interviewers probe:
+- Forgetting `req.clone()` — `HttpRequest` objects are immutable, you cannot mutate headers directly.
+- Not excluding the refresh-token endpoint itself from the interceptor — if the refresh call also gets a 401, it can trigger infinite recursion.
+- Not handling the case where the refresh token itself is expired/invalid — must log the user out, not retry forever.
+- Using `mergeMap`/`concatMap` instead of `switchMap` for the retry, which could pile up outdated retries instead of properly waiting per request.
+
+## 9. Interview Follow-up Questions
+
+**Q: Why do you need `req.clone()` instead of modifying the request directly?**
+Answer: `HttpRequest` is immutable by design in Angular — this prevents unintended mutation of a request object that might be reused/retried elsewhere. `clone()` returns a new request with the specified changes.
+
+**Q: What happens if the refresh token is also expired?**
+Answer: The refresh call itself fails (e.g., 401 from the refresh endpoint). In `catchError`, that should trigger a full logout / redirect to login, not another refresh attempt.
+
+**Q: Why use a `BehaviorSubject` instead of a simple `Subject`?**
+Answer: `BehaviorSubject` holds the last emitted value, so we can initialize it with `null` to represent "no token yet" and safely reset it before each new refresh, while late-subscribing waiting requests still get the correct final value once it's emitted.
+
+**Q: How do you avoid infinite loops if the refreshed token is also rejected?**
+Answer: Track retry state on the request (e.g., a custom header/flag) so a request is retried at most once; if it fails 401 again after using a supposedly fresh token, don't retry again — log out instead.
+
+**Q: Should you exclude any endpoints from this interceptor?**
+Answer: Yes — the login and refresh-token endpoints themselves should be excluded (or handled separately) to avoid attaching a stale token or causing recursive refresh attempts.
+
+## 10. Interview-Ready Answer
+
+"I'd write an `HttpInterceptor` that clones every outgoing request to attach the current access token in the Authorization header. In the response pipeline, I catch errors and check if the status is 401 — if so, I trigger a refresh flow. The tricky part is handling multiple requests failing with 401 at the same time: if you don't guard against it, every failed request would independently call the refresh endpoint, which wastes calls and can actually break things if the backend rotates refresh tokens on each use. So I use a boolean flag to track whether a refresh is already in progress, and a BehaviorSubject to broadcast the new token once it's available. The first 401 triggers the actual refresh call; any other 401s that come in while that's in flight just subscribe to the BehaviorSubject, wait for the new token, and retry their original request with it using switchMap. If the refresh call itself fails, I log the user out instead of retrying indefinitely."
+
+## 11. Quick Revision
+
+**Quick Revision**
+- What: Interceptor that attaches JWT to requests and auto-refreshes on 401, then retries.
+- Why: Centralize auth logic, avoid forcing re-login on every short-lived token expiry.
+- Problem solved: Manual per-service token handling; abrupt logouts on token expiry.
+- How: Attach token → on 401 → refresh once (guarded by flag) → broadcast new token via BehaviorSubject → retry pending requests.
+- Use when: OAuth2/JWT apps with short-lived access + refresh tokens, especially with parallel API calls.
+- Important: The trap — simultaneous 401s must NOT each trigger their own refresh call; use a shared flag + BehaviorSubject to dedupe.
+- Remember: `req.clone()` for immutability; exclude refresh/login endpoints from the interceptor; log out if refresh itself fails.
+
+## Memory Trick
+
+Think of it as: a single receptionist handing out a new keycard. If 5 people show up at once with expired keycards, the receptionist doesn't print 5 new keycards — they print ONE, and everyone waiting gets a copy of that same new card.
