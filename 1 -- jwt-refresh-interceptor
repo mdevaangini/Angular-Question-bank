@@ -1,4 +1,4 @@
-# JWT Auth Interceptor with Auto Refresh on 401
+# JWT(JSON Web token) Auth Interceptor with Auto Refresh on 401
 
 ## 1. What is it?
 
