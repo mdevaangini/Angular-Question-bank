@@ -25,7 +25,7 @@ This works great for code Angular controls. The problem: third-party SDKs (payme
 - Alternative/complementary approach: inject `ChangeDetectorRef` and call `this.cdr.markForCheck()` (for `OnPush` components) or `this.cdr.detectChanges()` — this directly asks Angular to re-check this component's view, without needing to go through the zone at all.
 - In modern **zoneless** Angular (signals-based change detection, no Zone.js), the fix looks different: if you're using a `signal()` for the state, writing to it (`this.paymentStatus.set('success')`) automatically notifies Angular's reactivity graph and schedules a render — regardless of what zone/context the write happened in. Signals sidestep this whole class of bug because they don't rely on Zone.js interception at all.
 
-## 4. Example
+## 4. Example  -> working eg link --> https://stackblitz.com/edit/dt3ubztt-stoggwyl?file=src%2Fapp%2Fsignal-checkout.component.ts,src%2Fapp%2Fbuggy-checkout.component.ts,src%2Fapp%2Ffixed-checkout.component.ts,src%2Fapp%2Fapp.component.ts
 
 ```typescript
 import { Component, NgZone, ChangeDetectorRef, OnInit } from '@angular/core';
