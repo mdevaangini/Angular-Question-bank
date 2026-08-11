@@ -30,7 +30,7 @@ The interceptor pattern solves this by centralizing cross-cutting concerns (auth
    - If refresh itself fails (refresh token expired/invalid), logs the user out.
 5. **Critical part:** if multiple requests fail with 401 at the same time (e.g., a dashboard firing 5 parallel API calls), only ONE refresh call should be made — not five. The other four requests should wait for that single refresh to complete, then retry using the new token.
 
-## 4. Example
+## 4. Example -> the working angular eg  --> https://stackblitz.com/edit/x2mtcxrc?file=src%2Fapp%2Fapp.component.ts
 
 ```typescript
 import {
