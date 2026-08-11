@@ -1,0 +1,171 @@
+# Custom Structural Directive: *appHasRole="'admin'"
+
+## 1. What is it?
+
+A structural directive is a directive that changes the DOM's structure — adding, removing, or repeating elements — rather than just changing an element's appearance or behavior. `*ngIf` and `*ngFor` are Angular's built-in examples. This question asks you to build your own: `*appHasRole="'admin'"`, which renders the element (and everything inside it) only if the current user has the given role, and removes it entirely from the DOM otherwise.
+
+The key distinction to hold onto: this isn't like `[hidden]` or `display: none`, which just visually hide an element while it stays in the DOM. A structural directive controlled by `*` actually adds or removes the element from the DOM entirely.
+
+## 2. Why was it introduced?
+
+Before structural directives, conditionally showing/hiding DOM content required manually manipulating the DOM (or CSS visibility tricks, which don't actually remove elements — bad for security-sensitive content, since it's still in the DOM and inspectable/removable via devtools). Angular needed a declarative, reusable way to say "only put this in the DOM if some condition holds" — that's exactly what `*ngIf` does for booleans.
+
+But `*ngIf` only handles simple truthy/falsy conditions. Real apps constantly need role-based or permission-based rendering: "show this button only to admins," "show this section only to users with `canEdit`." Without a custom structural directive, every component would repeat the same `*ngIf="userService.hasRole('admin')"` boilerplate everywhere, mixing authorization logic into templates repeatedly. A custom structural directive centralizes that logic into one reusable, declarative, testable place — you write the role-check logic once, and every template just says `*appHasRole="'admin'"`.
+
+## 3. How does it work?
+
+**The `*` is syntactic sugar.** When you write:
+```html
+<div *appHasRole="'admin'">Admin panel</div>
+```
+Angular desugars this at compile time into:
+```html
+<ng-template [appHasRole]="'admin'">
+  <div>Admin panel</div>
+</ng-template>
+```
+The element and its content become the *template* — nothing more than a blueprint that isn't rendered by default. Your directive is attached to that `<ng-template>`, and it decides whether or when to actually stamp that blueprint into the live DOM.
+
+**The two key injectables every structural directive needs:**
+- `TemplateRef<T>` — a reference to that `<ng-template>` blueprint (the content to conditionally render).
+- `ViewContainerRef` — a reference to *where* in the DOM that content should be inserted (the "container" marking this directive's location).
+
+**The core API:**
+- `viewContainerRef.createEmbeddedView(templateRef)` — stamps the template into the DOM at this location.
+- `viewContainerRef.clear()` — removes whatever was previously stamped in, emptying the container.
+
+Your directive's job is simply: when the role condition is true, call `createEmbeddedView()`; when false, call `clear()`.
+
+## 4. Example
+
+```typescript
+import { Directive, Input, TemplateRef, ViewContainerRef, OnInit } from '@angular/core';
+import { AuthService } from './auth.service';
+
+@Directive({
+  selector: '[appHasRole]',
+  standalone: true,
+})
+export class HasRoleDirective implements OnInit {
+  // The [appHasRole] input receives whatever comes after the * in the template.
+  // Supports a single role or an array, e.g. *appHasRole="['admin','editor']"
+  private requiredRoles: string[] = [];
+  private hasView = false;
+
+  @Input() set appHasRole(role: string | string[]) {
+    this.requiredRoles = Array.isArray(role) ? role : [role];
+    this.updateView();
+  }
+
+  constructor(
+    private templateRef: TemplateRef<unknown>,
+    private viewContainer: ViewContainerRef,
+    private authService: AuthService
+  ) {}
+
+  ngOnInit(): void {
+    // Re-check when the directive initializes, in case roles load async
+    this.updateView();
+  }
+
+  private updateView(): void {
+    const permitted = this.requiredRoles.some(role =>
+      this.authService.currentUserRoles.includes(role)
+    );
+
+    if (permitted && !this.hasView) {
+      // Stamp the <ng-template> content into the DOM right here
+      this.viewContainer.createEmbeddedView(this.templateRef);
+      this.hasView = true;
+    } else if (!permitted && this.hasView) {
+      // Fully remove it from the DOM - not just hide it
+      this.viewContainer.clear();
+      this.hasView = false;
+    }
+  }
+}
+```
+
+```html
+<!-- Usage - looks just like a built-in Angular directive -->
+<div *appHasRole="'admin'">
+  <button (click)="deleteUser()">Delete User</button>
+</div>
+
+<div *appHasRole="['admin', 'moderator']">
+  <button (click)="banUser()">Ban User</button>
+</div>
+```
+
+## 5. Example Explanation / Execution Flow
+
+1. Angular parses `*appHasRole="'admin'"` and desugars it into an `<ng-template>` wrapping the `<div>`. Nothing renders yet — the template is inert.
+2. Angular instantiates `HasRoleDirective` on that `<ng-template>`, injecting `TemplateRef` (a handle to the blueprint) and `ViewContainerRef` (a handle to the insertion point in the DOM).
+3. The `@Input() set appHasRole(role)` setter fires with `'admin'`, storing it and calling `updateView()`.
+4. `updateView()` checks `authService.currentUserRoles` against the required role(s).
+5. If the user has the role: `viewContainer.createEmbeddedView(templateRef)` runs, which clones the template's content and inserts it into the live DOM at the container's location. `hasView` flips to `true` so we don't insert duplicates on repeated checks.
+6. If the user doesn't have the role: nothing is inserted — the DOM never contains the `<div>` or its children at all (verify via "Inspect Element" — it's genuinely absent, not just hidden).
+7. If roles change later (e.g., after an async permissions fetch) and you re-trigger `updateView()`, the directive can call `clear()` to remove a previously-shown view, or `createEmbeddedView()` to add one that wasn't there before — fully reactive to role changes.
+
+## 6. When should we use it?
+
+- Role-based or permission-based UI (admin panels, feature flags, subscription-tier gating).
+- Any reusable conditional-rendering logic that's more complex than a single boolean and would otherwise be copy-pasted across many templates as `*ngIf="someComplexExpression"`.
+- When you want the condition to read declaratively and self-documenting in the template (`*appHasRole="'admin'"` communicates intent far better than a buried boolean flag).
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- Centralizes authorization logic in one testable, reusable place instead of scattering it across components.
+- Content is genuinely removed from the DOM when not permitted — better for security-sensitive UI than CSS-based hiding, since hidden-but-present DOM nodes can still be inspected or manipulated via devtools.
+- Reads declaratively in templates, improving readability.
+
+**Disadvantages**
+- Slightly more ceremony to write than a plain `*ngIf` with a boolean getter.
+- Only one structural directive can be applied per host element (you can't stack `*ngIf` and `*appHasRole` on the same tag — you'd need to nest an `<ng-container>` or combine the logic into one directive).
+- If overused for trivial conditions, it can obscure simple logic behind an abstraction that requires jumping to another file to understand.
+
+## 8. Common Interview Traps
+
+- Forgetting that the `*` is just sugar for `<ng-template>` — candidates who can't explain the desugaring usually can't correctly implement `createEmbeddedView`/`clear` either.
+- Confusing structural directives with attribute directives — attribute directives (like `[ngClass]`) change an element's appearance/behavior without adding/removing it from the DOM; structural directives change DOM structure.
+- Forgetting the `hasView` guard — without it, you might call `createEmbeddedView` repeatedly on every change detection cycle, stacking duplicate views.
+- Not realizing only one `*`-prefixed structural directive is allowed per element — a common "why doesn't `*ngIf` and `*appHasRole` work together on the same div" confusion.
+- Using `[hidden]` or CSS `display:none` as if it were equivalent — it isn't, especially for security: hidden content is still present in the DOM and in application memory/bindings, still runs change detection, and can be revealed by inspecting/editing the DOM.
+- Forgetting to unsubscribe if role data comes from an Observable — same general RxJS memory-leak trap as anywhere else in Angular.
+
+## 9. Interview Follow-up Questions
+
+**Q: What does `*ngIf="condition"` actually desugar to?**
+Answer: `<ng-template [ngIf]="condition"><!-- content --></ng-template>` — same mechanism as any custom structural directive, just built into Angular.
+
+**Q: Why can't you use two structural directives on the same element?**
+Answer: Each `*`-prefixed directive implies wrapping the element in its own `<ng-template>`; you can't nest two templates around the same single element via shorthand syntax. The fix is to split them across nested elements (often using a non-rendering `<ng-container>`) so each directive gets its own template.
+
+**Q: How would you support an "else" template, like `*ngIf...else`?**
+Answer: Add a second `@Input() appHasRoleElse: TemplateRef<unknown>` and in `updateView()`, call `viewContainer.createEmbeddedView(elseTemplateRef)` when the condition is false, in addition to clearing the "true" view.
+
+**Q: How is this different from just disabling a button when the user lacks permission?**
+Answer: Disabling still renders the element in the DOM (visible, sometimes still interactable via devtools tricks or accessibility tools), whereas a structural directive fully removes it — better when you don't want unauthorized users to even know a feature exists, not just be blocked from using it.
+
+**Q: Why inject `TemplateRef` via the constructor instead of `@Input()`?**
+Answer: `TemplateRef` refers to the `<ng-template>` this directive is literally attached to (implicit, structural) — it's a fixed reference tied to where the directive sits in the template, not a value passed in from the parent, so constructor injection is the correct mechanism.
+
+## 10. Interview-Ready Answer
+
+"A structural directive changes DOM structure rather than an element's styling, and the `*` syntax is really just sugar — `*appHasRole="'admin'"` gets desugared into an `<ng-template>` wrapping the element, with the directive applied to that template. To build it, I'd inject `TemplateRef`, which is a handle to that template blueprint, and `ViewContainerRef`, which represents where in the DOM to insert it. In the `@Input() set appHasRole()` setter, I'd check the required role against the current user's roles from an auth service, and call `viewContainerRef.createEmbeddedView(templateRef)` to render the content if permitted, or `viewContainerRef.clear()` to remove it if not — tracking a `hasView` flag so I don't create duplicate views on repeated checks. The important distinction from something like `[hidden]` is that this actually removes the element from the DOM entirely rather than just visually hiding it, which matters for security-sensitive UI since hidden-but-present elements can still be found and manipulated via devtools."
+
+## 11. Quick Revision
+
+**Quick Revision**
+- What: A custom structural directive that adds/removes DOM content based on role permission.
+- Why: Centralize repeated role-check logic instead of scattering `*ngIf` conditions everywhere; genuinely remove unauthorized content from the DOM.
+- Problem solved: No built-in Angular directive handles role/permission-based rendering; raw `*ngIf` boilerplate gets duplicated across templates.
+- How: `*appHasRole="'admin'"` desugars to `<ng-template [appHasRole]>`; inject `TemplateRef` + `ViewContainerRef`; call `createEmbeddedView()`/`clear()` based on the role check.
+- Use when: Role-based UI, feature flags, permission gating, any reusable non-trivial conditional rendering.
+- Important: Only one structural directive per element; content is fully removed from DOM (unlike `[hidden]`/CSS).
+- Remember: Guard with a `hasView` boolean to avoid creating duplicate embedded views on repeated change detection.
+
+## Memory Trick
+
+Think of it as: a bouncer at a club door holding the guest list (`TemplateRef` = the party happening inside, `ViewContainerRef` = the doorway). Check the ID (role) against the list — if it matches, let them through and open the door (`createEmbeddedView`); if not, the door stays shut and nobody can even see what's happening inside (`clear` — full removal, not just a curtain over the window).
