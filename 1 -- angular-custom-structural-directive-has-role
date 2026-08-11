@@ -36,7 +36,7 @@ The element and its content become the *template* — nothing more than a bluepr
 
 Your directive's job is simply: when the role condition is true, call `createEmbeddedView()`; when false, call `clear()`.
 
-## 4. Example
+## 4. Example   -> working eg link -->  https://stackblitz.com/edit/uyybps4j?file=package.json,src%2Fapp%2Fapp.component.ts
 
 ```typescript
 import { Directive, Input, TemplateRef, ViewContainerRef, OnInit } from '@angular/core';
