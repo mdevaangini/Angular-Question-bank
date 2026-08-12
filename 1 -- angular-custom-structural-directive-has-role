@@ -65,7 +65,7 @@ export class HasRoleDirective implements OnInit {
 
   ngOnInit(): void {
     // Re-check when the directive initializes, in case roles load async
-    this.updateView();
+    this.updateView();   
   }
 
   private updateView(): void {
