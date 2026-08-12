@@ -1,8 +1,5 @@
 # Drag-and-Drop Between Two Lists (CDK) — Optimistic Reorder + Rollback
 
-**Suggested filename:** `angular-cdk-drag-drop-optimistic-reorder-rollback.md`
-**Suggested folder:** `interview-notes/angular/`
-
 ## 1. What is it?
 
 This is a build scenario: use Angular CDK's `DragDropModule` to let a user drag items both within a list (reorder) and between two connected lists (e.g., a "To Do" / "Done" Kanban board), update the UI *instantly* on drop (optimistic update), persist the new order/position to a backend API in the background, and *roll back* the UI to its pre-drag state if that API call fails.
