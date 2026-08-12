@@ -1,0 +1,219 @@
+# Drag-and-Drop Between Two Lists (CDK) — Optimistic Reorder + Rollback
+
+**Suggested filename:** `angular-cdk-drag-drop-optimistic-reorder-rollback.md`
+**Suggested folder:** `interview-notes/angular/`
+
+## 1. What is it?
+
+This is a build scenario: use Angular CDK's `DragDropModule` to let a user drag items both within a list (reorder) and between two connected lists (e.g., a "To Do" / "Done" Kanban board), update the UI *instantly* on drop (optimistic update), persist the new order/position to a backend API in the background, and *roll back* the UI to its pre-drag state if that API call fails.
+
+Three concerns are stacked on top of each other here: the drag-and-drop mechanics themselves (CDK), the optimistic-UI pattern (update first, confirm later), and a rollback strategy (undo cleanly if the confirmation never comes).
+
+## 2. Why was it introduced?
+
+**CDK drag-and-drop exists because** implementing drag-and-drop by hand — with the native HTML5 Drag and Drop API or raw mouse/touch event listeners — is notoriously fiddly: browser inconsistencies, no built-in touch support, no accessibility (keyboard dragging, screen reader announcements), no auto-scroll near list edges, and you'd have to hand-roll animations for the "items shift out of the way" effect. Angular CDK's `@angular/cdk/drag-drop` package solves all of that as an unstyled, reusable behavior primitive (no Material styling forced on you), integrated with Angular's change detection.
+
+**Optimistic updates exist because** waiting for a round-trip API call before visually moving a dragged card makes drag-and-drop feel broken — the whole point of direct-manipulation UI is that it responds instantly. So the standard pattern is: apply the reorder to local state the moment the user drops (perceived as instant), fire the persist call in the background, and only if it fails, reconcile by rolling back — most of the time the user never even notices a network call happened.
+
+## 3. How does it work?
+
+**Wiring up two connected lists:**
+- Each list is a `cdkDropList` (with `[cdkDropListData]` bound to its backing array).
+- Wrapping both `cdkDropList`s in a container with the `cdkDropListGroup` directive auto-connects them, so items can be dragged from either one into the other (alternative: explicitly set `[cdkDropListConnectedTo]` on each list, pointing at the other's `id`).
+- Each draggable element inside a list gets the `cdkDrag` directive.
+- The `(cdkDropListDropped)` event fires once, on *either* list, when a drop completes, with a `CdkDragDrop<T>` payload containing `previousIndex`, `currentIndex`, `previousContainer`, and `container`.
+
+**Distinguishing a reorder from a transfer:**
+- If `event.previousContainer === event.container`, the item was dropped back into the *same* list — that's a reorder, handled with CDK's `moveItemInArray(array, previousIndex, currentIndex)`.
+- If they differ, the item moved to the *other* list — that's a transfer, handled with `transferArrayItem(previousArray, currentArray, previousIndex, currentIndex)`.
+- **Both helpers mutate the arrays they're given, in place.** This matters a lot once rollback and signals enter the picture (see traps).
+
+**The optimistic-update-with-rollback flow:**
+1. Before mutating anything, snapshot the current state of both lists (a shallow copy is enough, since you're not mutating the objects inside, only array order/membership).
+2. Apply the move using `moveItemInArray`/`transferArrayItem` on **copies**, then commit those copies as the new state — instant visual feedback.
+3. Fire the API call to persist the change, in the background, non-blocking.
+4. On success: do nothing further — the optimistic state already matches reality.
+5. On failure: restore the snapshot(s) taken in step 1, and surface an error (toast/snackbar).
+
+## 4. Example
+
+```typescript
+import { Component, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import {
+  DragDropModule,
+  CdkDragDrop,
+  moveItemInArray,
+  transferArrayItem,
+} from '@angular/cdk/drag-drop';
+import { TaskService, Task } from './task.service';
+
+@Component({
+  selector: 'app-task-board',
+  standalone: true,
+  imports: [CommonModule, DragDropModule],
+  template: `
+    <div class="board" cdkDropListGroup>
+      <div class="column">
+        <h3>To Do</h3>
+        <div
+          cdkDropList
+          id="todo"
+          [cdkDropListData]="todo()"
+          (cdkDropListDropped)="drop($event)"
+          class="list"
+        >
+          <div class="card" *ngFor="let task of todo(); trackBy: trackById" cdkDrag [cdkDragData]="task">
+            {{ task.title }}
+          </div>
+        </div>
+      </div>
+
+      <div class="column">
+        <h3>Done</h3>
+        <div
+          cdkDropList
+          id="done"
+          [cdkDropListData]="done()"
+          (cdkDropListDropped)="drop($event)"
+          class="list"
+        >
+          <div class="card" *ngFor="let task of done(); trackBy: trackById" cdkDrag [cdkDragData]="task">
+            {{ task.title }}
+          </div>
+        </div>
+      </div>
+    </div>
+  `,
+})
+export class TaskBoardComponent {
+  todo = signal<Task[]>([{ id: 1, title: 'Write tests' }, { id: 2, title: 'Fix bug' }]);
+  done = signal<Task[]>([{ id: 3, title: 'Setup CI' }]);
+
+  constructor(private taskService: TaskService) {}
+
+  trackById(_: number, task: Task): number {
+    return task.id;
+  }
+
+  drop(event: CdkDragDrop<Task[]>): void {
+    // 1. Snapshot BEFORE mutating anything - moveItemInArray/transferArrayItem
+    // mutate in place, so this is the only chance to remember "before".
+    const todoSnapshot = [...this.todo()];
+    const doneSnapshot = [...this.done()];
+    const movedTask = event.item.data as Task; // set via [cdkDragData]="task"
+
+    // 2. Apply the move OPTIMISTICALLY, on fresh array copies, then commit
+    // those copies via signal.set() - a new reference is required, since
+    // set() uses Object.is() and won't notify on a same-reference mutation.
+    if (event.previousContainer === event.container) {
+      const list = [...event.container.data];
+      moveItemInArray(list, event.previousIndex, event.currentIndex);
+      this.commit(event.container.id, list);
+    } else {
+      const previousList = [...event.previousContainer.data];
+      const currentList = [...event.container.data];
+      transferArrayItem(previousList, currentList, event.previousIndex, event.currentIndex);
+      this.commit(event.previousContainer.id, previousList);
+      this.commit(event.container.id, currentList);
+    }
+
+    // 3. Persist in the background - UI has already updated, user isn't waiting.
+    this.taskService
+      .persistMove({ taskId: movedTask.id, toColumn: event.container.id, toIndex: event.currentIndex })
+      .subscribe({
+        error: () => {
+          // 4. Rollback - restore exactly what was there before the drag.
+          this.todo.set(todoSnapshot);
+          this.done.set(doneSnapshot);
+          // e.g. this.toast.show('Could not save - reverted your change.');
+        },
+      });
+  }
+
+  private commit(listId: string, list: Task[]): void {
+    if (listId === 'todo') this.todo.set(list);
+    else this.done.set(list);
+  }
+}
+```
+
+## 5. Example Explanation / Execution Flow
+
+**Happy path (reorder within "To Do"):**
+1. User drags "Fix bug" above "Write tests" within the same "To Do" list and drops it.
+2. `drop()` fires with `event.previousContainer === event.container` (both are the `todo` list) — this branch takes the `moveItemInArray` path.
+3. Snapshots of both `todo` and `done` are taken first, in case a rollback is needed later.
+4. A *copy* of the `todo` array is made, `moveItemInArray` reorders that copy, and `commit()` calls `this.todo.set(list)` with the new array reference — the UI re-renders instantly showing the new order.
+5. `persistMove()` fires in the background; the user is already looking at the new order and isn't blocked waiting for it.
+6. The API call succeeds — nothing else happens, since the optimistic state was already correct.
+
+**Failure path (cross-list transfer that gets rejected by the server):**
+1. User drags "Setup CI" from "Done" back into "To Do."
+2. `event.previousContainer !== event.container`, so `transferArrayItem` runs — it removes the item from a copy of `done` and inserts it into a copy of `todo`.
+3. Both `commit()` calls update the signals — UI instantly shows the card in "To Do."
+4. `persistMove()` is called; this time the API returns an error (e.g., the task was deleted server-side in the meantime).
+5. The `error` callback fires, calling `this.todo.set(todoSnapshot)` and `this.done.set(doneSnapshot)` — both lists snap back to exactly how they looked *before* the drag, and a toast informs the user their change didn't save.
+
+## 6. When should we use it?
+
+- Kanban/task boards (To Do / In Progress / Done columns).
+- Sortable to-do lists, priority queues, playlist reordering.
+- Assignment UIs — dragging a ticket/task from an "Unassigned" list into a specific person's column.
+- Any admin table/list where row order itself is meaningful data that needs to be persisted (e.g., display priority, menu ordering).
+- Optimistic-update-with-rollback specifically applies any time an interaction needs to *feel* instant but is backed by a network call that can fail — this pattern isn't unique to drag-and-drop.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- CDK gives you accessible (keyboard-operable, screen-reader-announced), touch-and-mouse-compatible drag-and-drop with built-in animations and auto-scroll, for a fraction of the effort of a hand-rolled implementation.
+- It's unstyled (`@angular/cdk`, not `@angular/material`), so it drops into any design system without fighting default styles.
+- The optimistic-update pattern makes the interaction feel instant regardless of backend latency, which matters a lot for direct-manipulation UI specifically.
+
+**Disadvantages**
+- `moveItemInArray`/`transferArrayItem` mutating in place is a real footgun combined with signals or `OnPush` — easy to silently ship a UI that doesn't visually update because you mutated a reference instead of replacing it.
+- Every optimistic mutation needs a paired rollback path — this roughly doubles the state-management code compared to a "wait for the server, then update" implementation.
+- Concurrent operations (dragging again before the first save resolves) need explicit handling, or you risk rolling back to a stale snapshot and clobbering a newer, still-in-flight change.
+
+## 8. Common Interview Traps
+
+- Forgetting to connect the two `cdkDropList`s (via `cdkDropListGroup` or `[cdkDropListConnectedTo]`) — without it, the drag preview shows but items can't actually be dropped into the other list.
+- Not realizing `moveItemInArray`/`transferArrayItem` mutate their arguments in place — combined with signals, mutating the *existing* array reference and then calling `.set()` with that same reference won't trigger a re-render (`.set()` compares with `Object.is()` by default), so nothing visually updates even though the data technically changed.
+- Skipping the pre-mutation snapshot and trying to "compute the inverse" after the fact to roll back — fragile and error-prone compared to just keeping a clean copy of the prior state upfront.
+- Not distinguishing `event.previousContainer === event.container` — calling `transferArrayItem` for what was actually a same-list reorder (or vice versa) silently corrupts one of the arrays.
+- Ignoring concurrent drags: if the user drags twice quickly, an unguarded implementation can roll back to an outdated snapshot after the *second* drag already changed things, effectively undoing a change the user never asked to undo. Needs either disabling further drags while a save is in flight (`[cdkDropListDisabled]`), or a proper request-sequencing/snapshot-per-operation strategy.
+- Skipping `trackBy` in the `*ngFor` powering a drag list — CDK relies on stable DOM node identity for its move animations; without `trackBy`, Angular may destroy/recreate nodes unnecessarily and animations glitch.
+
+## 9. Interview Follow-up Questions
+
+**Q: How do you allow dragging items between two separate drop lists?**
+Answer: Wrap both `cdkDropList` elements in a parent with the `cdkDropListGroup` directive to auto-connect them, or explicitly bind `[cdkDropListConnectedTo]` on each list to the other's `id`.
+
+**Q: What's the difference between `moveItemInArray` and `transferArrayItem`?**
+Answer: `moveItemInArray` reorders elements within a single array. `transferArrayItem` removes an element from one array and inserts it into a different array — used specifically for cross-list drags.
+
+**Q: Why do you need to clone the arrays before calling these CDK helpers, if you want rollback support?**
+Answer: Both helpers mutate in place. If you don't keep a separate snapshot taken *before* the mutation, there's no clean way to reconstruct the prior state after an API failure — you'd have to manually reverse-engineer the inverse operation instead of just restoring a copy.
+
+**Q: What happens if the user drags a second item before the first drag's API call has resolved?**
+Answer: Without explicit handling, this is a race: if the first call fails after the second drag already changed state, a naive rollback restores the *first* snapshot, silently discarding the second, legitimate change. Standard fixes are disabling further dragging while a save is pending, or tracking each operation's own before-state and only rolling back that specific operation's effect.
+
+**Q: Would you send the entire reordered array to the backend, or just the moved item's new position?**
+Answer: Generally just the delta — something like `{ taskId, toColumn, toIndex }` — rather than the whole list, since that's smaller, avoids race conditions from two clients reordering simultaneously, and lets the backend be the source of truth for final ordering (some APIs return the authoritative new order, which the client can then reconcile against).
+
+## 10. Interview-Ready Answer
+
+"I'd use Angular CDK's drag-and-drop module — `cdkDropList` for each list, `cdkDrag` on each item, and `cdkDropListGroup` (or explicit `cdkDropListConnectedTo`) to connect the two lists so items can move between them. In the `(cdkDropListDropped)` handler, I check whether `event.previousContainer === event.container` to decide between `moveItemInArray` for a same-list reorder or `transferArrayItem` for a cross-list move. Since both of those mutate arrays in place, I take a snapshot of both lists' current state *before* calling them, then apply the move to fresh array copies and commit those via signal `.set()` — that gives an instant, optimistic UI update. I fire the persist call to the API in the background; if it fails, I restore the pre-drag snapshots I took earlier, which cleanly reverts the UI, and surface an error toast. The main things I'd watch for are: making sure I clone before mutating so rollback is actually possible, and disabling further drags while a save is in flight so a second drag can't race with the first one's rollback and get incorrectly undone."
+
+## 11. Quick Revision
+
+**Quick Revision**
+- What: CDK drag-and-drop across two connected lists, with optimistic reorder + API persistence + rollback on failure.
+- Why: Hand-rolled DnD is painful (accessibility, touch, animation); optimistic updates make drag interactions feel instant despite network latency.
+- How: `cdkDropListGroup` connects lists -> `(cdkDropListDropped)` -> compare containers -> `moveItemInArray` (same list) or `transferArrayItem` (cross list) on **copies** -> commit -> persist in background -> restore pre-drag snapshot on error.
+- Biggest trap: CDK helpers mutate in place — always snapshot and clone *before* mutating, especially with signals/OnPush.
+- Also watch: connecting the lists at all, distinguishing reorder vs transfer correctly, and guarding against concurrent drags racing the rollback.
+
+## Memory Trick
+
+Think of it like a whiteboard sticky-note board with a photographer standing by: before you let someone move a sticky note, the photographer snaps a photo (the snapshot). You let them move the note right away (optimistic update) so nobody's stuck waiting. Then you quietly mail the new arrangement to head office (the API call). If head office rejects it, you pull out the photo and put every note back exactly where it was (rollback) — the room never has to know anything went wrong except for a small note on the door (the toast).
