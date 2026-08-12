@@ -75,7 +75,13 @@ PaymentSDK.onSuccess(() => {
 ```
 
 ```typescript
-// Zoneless / Signals version — no NgZone needed at all
+// Zoneless / Signals version — no NgZone needed at all -> What changed is how Angular decides to repaint at all — and runOutsideAngular() stops mattering because the thing it "hides work from" doesn't exist anymore.In the zone-full app, runOutsideAngular() had real teeth: it made the code inside run in the "root zone" instead of the "Angular zone," so Zone.js's monkey-patched setTimeout never told NgZone that anything happened, so tick() never got scheduled. That's why your signal write updated correctly in memory but never painted.
+
+In the zoneless app, there is no "Angular zone" vs "root zone" distinction anymore — zone.js isn't loaded at all, so those concepts are just gone. ngZone.runOutsideAngular(fn) still exists as an API (for backward compatibility so old code doesn't crash), but it's effectively a no-op now — it just calls fn() directly, since there's nothing to "run outside of." Wrapping your payment callback in it no longer hides anything from anyone.
+More importantly, the trigger for repainting changed entirely. In zone-full mode, the trigger was "did Zone.js notice some async work finish." In zoneless mode, the trigger is "did a signal that's read in a template get written to." That's it — no zone context matters at all anymore. So when this.status.set('success') runs, Angular's scheduler picks up that write directly, regardless of what function it was called from or what zone-flavored wrapper surrounded it, and schedules a repaint itself.
+So the short version: runOutsideAngular() used to matter because it controlled whether Zone.js saw your code. Now that Zone.js is gone, that control has no effect — the only thing that matters is whether you wrote to a signal.
+
+
 import { signal } from '@angular/core';
 
 export class CheckoutComponent {
