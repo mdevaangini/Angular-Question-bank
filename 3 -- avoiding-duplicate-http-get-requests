@@ -1,6 +1,3 @@
-> **Suggested filename:** `avoiding-duplicate-http-get-requests.md`
-> **Suggested folder:** `interview-notes/angular/http-networking/`
-
 # Given two identical HTTP GET calls that both return the same data, how would you avoid duplicate requests?
 
 ## 1. What is it?
