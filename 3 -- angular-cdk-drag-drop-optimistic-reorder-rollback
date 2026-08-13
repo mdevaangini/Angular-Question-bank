@@ -32,7 +32,7 @@ Three concerns are stacked on top of each other here: the drag-and-drop mechanic
 4. On success: do nothing further — the optimistic state already matches reality.
 5. On failure: restore the snapshot(s) taken in step 1, and surface an error (toast/snackbar).
 
-## 4. Example
+## 4. Example  --> https://stackblitz.com/edit/tln8wsyt?file=src%2Fapp%2Fapp.component.ts
 
 ```typescript
 import { Component, signal } from '@angular/core';
