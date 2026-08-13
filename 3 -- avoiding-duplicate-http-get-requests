@@ -1,0 +1,161 @@
+> **Suggested filename:** `avoiding-duplicate-http-get-requests.md`
+> **Suggested folder:** `interview-notes/angular/http-networking/`
+
+# Given two identical HTTP GET calls that both return the same data, how would you avoid duplicate requests?
+
+## 1. What is it?
+
+Request deduplication is a pattern where, if two (or more) callers ask for the exact same GET resource **while a request for it is already in flight**, only one real HTTP call is made to the server. The second (and third, fourth...) caller is transparently handed the result of the request that's already running, instead of triggering its own network call.
+
+This is different from **caching**. Deduplication only cares about requests that overlap in time — it stops two calls from racing each other right now. Caching is about not re-fetching data you already have, even minutes later. A good answer distinguishes the two, because interviewers commonly test whether you conflate them.
+
+## 2. Why introduced?
+
+In a component-based UI, it's extremely common for the same data to be needed in more than one place at (almost) the same time — a header widget and a sidebar widget both need the logged-in user's profile on page load, two instances of a lazy-loaded feature module both call the same "get config" endpoint, or a parent and child component both trigger the same GET in `ngOnInit()`. Without dedup:
+
+- The backend gets hit twice (or N times) for identical data, wasting server resources and rate-limit budget.
+- The two responses can arrive out of order, so you can get a subtle race condition (last-response-wins isn't guaranteed to be the "freshest" one if the server has any variance in response time).
+- Duplicate optimistic loading spinners / loading states can flicker as one request finishes before the other.
+
+Deduplication solves all three by collapsing concurrent identical requests into a single shared one.
+
+## 3. How does it work?
+
+The core trick: **cache the Observable itself (not just the eventual data) while the request is in flight, keyed by something that identifies the request** (usually the full URL + serialized query params, sometimes + method + body for POST-as-a-query patterns).
+
+Step by step:
+
+1. Maintain a `Map<string, Observable<T>>` of "requests currently in flight," keyed by request identity.
+2. When a `get(url)` call comes in:
+   - If the map already has an entry for that key, **return the same Observable instance** — don't call `http.get()` again.
+   - If not, call `http.get()`, pipe it through `shareReplay(1)` (so multiple subscribers share one underlying HTTP call and each gets the value even if they subscribe a tick apart), store it in the map, and return it.
+3. Use `finalize()` on the piped observable to **remove the entry from the map** once the request completes (success or error). This is critical — without it, the "dedup" cache would live forever and silently turn into a permanent (and never-invalidated) cache, which is a different, more dangerous feature you didn't ask for.
+4. Because `shareReplay(1)` multicasts, every caller that subscribed while the request was in flight gets the exact same emitted value from the exact same underlying HTTP call — the server only saw one request.
+
+The cleanest place to implement this in Angular is either:
+- **A shared service method** (`get<T>(url)`) that every component/service calls instead of `HttpClient.get()` directly, or
+- **An `HttpInterceptorFn`** that does this transparently for all outgoing GETs matching some rule — nobody has to remember to call a special method.
+
+## 4. Example  --> https://stackblitz.com/edit/qp81kha7?file=src%2Fapp%2Fcounting.interceptor.ts
+
+```typescript
+// dedup-http.service.ts
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Observable } from 'rxjs';
+import { finalize, shareReplay } from 'rxjs/operators';
+
+@Injectable({ providedIn: 'root' })
+export class DedupHttpService {
+  private http = inject(HttpClient);
+
+  // key -> the in-flight (or just-completed-but-not-yet-cleaned-up) Observable
+  private inFlight = new Map<string, Observable<unknown>>();
+
+  get<T>(url: string): Observable<T> {
+    const existing = this.inFlight.get(url);
+    if (existing) {
+      // Someone already asked for this URL and it hasn't resolved/errored yet.
+      // Hand them the SAME observable - no new HTTP call.
+      return existing as Observable<T>;
+    }
+
+    const request$ = this.http.get<T>(url).pipe(
+      shareReplay(1),               // multicast the one real response to every subscriber
+      finalize(() => this.inFlight.delete(url)) // stop deduping once settled
+    );
+
+    this.inFlight.set(url, request$);
+    return request$;
+  }
+}
+```
+
+Two "simultaneous" callers:
+
+```typescript
+// component-a.ts
+this.dedupHttp.get<UserProfile>('/api/user-profile').subscribe(profile => {
+  this.profileA = profile;
+});
+
+// component-b.ts, firing in the same tick
+this.dedupHttp.get<UserProfile>('/api/user-profile').subscribe(profile => {
+  this.profileB = profile;
+});
+```
+
+Only **one** `GET /api/user-profile` reaches the network. Both components get the response.
+
+## 5. Example Explanation – Execution Flow
+
+1. Component A calls `dedupHttp.get('/api/user-profile')`. The map has no entry for that URL, so a real `http.get()` fires, gets wrapped in `shareReplay(1)` + `finalize(...)`, and is stored in the map under that key. Component A subscribes to it.
+2. Milliseconds later (before the response has come back), Component B calls `dedupHttp.get('/api/user-profile')` with the same URL. The map **does** have an entry now — component B is handed that exact same Observable and subscribes to it too. No second HTTP call is made.
+3. The server responds. `shareReplay(1)` pushes that single value to **both** subscribers (A and B), in whatever order they subscribed.
+4. `finalize()` fires once the source completes, removing the URL from the map.
+5. If a **third** caller asks for the same URL *after* step 4 has already run, there's no in-flight entry anymore, so a brand-new HTTP request is made. This is the key proof that this is deduplication, not caching — repeat calls after the first one has already settled are NOT free.
+
+## 6. When to use?
+
+- Multiple components/widgets on the same screen independently need the same reference/config/profile data on init.
+- A shared piece of "app bootstrap" data (feature flags, current user, app config) that many independent services ask for during startup.
+- Any place where a double-click, a fast re-render, or two lifecycle hooks firing close together could plausibly fire the same GET twice.
+- As a general-purpose `HttpInterceptor` for a whole app, so individual feature teams don't have to think about it.
+
+Not really needed for POSTs/PUTs/DELETEs (those aren't idempotent/safe to dedupe blindly — you generally do NOT want to silently drop a "duplicate" mutation, that's a very different, riskier decision) or for GETs where a slightly stale duplicate response genuinely doesn't matter.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- Cuts real network/backend load without changing any calling code (if done via interceptor).
+- Removes a whole class of race conditions caused by two near-simultaneous identical requests resolving out of order.
+- Cheap to implement — a `Map` and two RxJS operators.
+- Composable with `HttpInterceptor`s, so it can be applied app-wide with one registration.
+
+**Disadvantages**
+- Only helps with *concurrent* duplicates — doesn't reduce total request count for genuinely sequential repeat calls (that needs real caching with a TTL/invalidation strategy, which is a bigger design decision).
+- Keying purely by URL is naive if two logically-different requests can share a URL (e.g., the same endpoint with an auth token that varies per user in a multi-tenant admin tool) — the key must capture everything that affects the response.
+- If you forget the `finalize()` cleanup, this silently turns into an unintentional infinite cache that never refreshes — a subtle, hard-to-notice bug.
+- Doesn't handle cancellation semantics well by itself — if the *first* caller unsubscribes (e.g., navigates away), a plain `shareReplay` with default `refCount: false` will keep the source alive anyway (which is actually what you usually want for dedup, but it's a decision you have to consciously make, not an accident).
+
+## 8. Common Interview Traps
+
+- **Confusing dedup with caching.** Interviewers love asking "so if I call it again 10 seconds later, does it still work?" — if your answer implies "yes forever," that's actually describing a cache, and you should be able to say clearly why your `finalize()`-cleanup approach is NOT that.
+- **Forgetting `shareReplay`, using `share()` instead.** Plain `share()` (with default `resetOnRefCount`/no buffer) can miss late subscribers who join after the source already emitted — `shareReplay(1)` guarantees anyone who subscribes before the source's `finalize` cleanup runs still gets the value.
+- **Keying only by URL when params/body matter.** `GET /api/search?q=cats` and `GET /api/search?q=dogs` are NOT duplicates — the key must include serialized query params (and often headers like `Authorization` if responses vary per user/tenant).
+- **Trying to solve this with `debounceTime`/`switchMap` instead.** Those solve a *different* problem — rapid-fire *user-triggered* calls (like a search-as-you-type box), where you want to cancel/ignore earlier calls in favor of the latest one. Request dedup is about two calls for the *same* thing that should both get an answer, not about discarding one in favor of another.
+- **Not cleaning up on error, only on success.** Use `finalize()` (fires on both complete and error), not `tap()` on the success path only — otherwise a failed request leaves a permanently "stuck" entry in the map, and every future call for that URL silently reuses the failed Observable forever.
+
+## 9. Interview Follow-up Questions
+
+**Q1: How is this different from HTTP caching (like an ETag/Cache-Control based cache)?**
+A: HTTP caching (browser cache, service worker, ETags) avoids re-fetching data that hasn't changed, potentially for a long time, and is governed by cache headers/TTLs. This pattern only prevents two *overlapping in-flight* requests for the same resource — once the first one settles, the "dedup" protection is gone and the next call is a fresh network hit. They're complementary, not the same thing, and you could layer both.
+
+**Q2: Would you implement this as a service method or an HttpInterceptor? Why?**
+A: An interceptor is usually better for app-wide consistency — no developer has to remember to call a special method, and it applies uniformly to every GET matching your key strategy. A service method is more explicit and easier to reason about/test in isolation, and makes sense if only a handful of endpoints need this behavior rather than the whole app.
+
+**Q3: What happens if the params are the same but the Authorization header (i.e., the logged-in user) differs?**
+A: If you key purely by URL, you'd incorrectly serve User B a response cached/deduped from User A's in-flight request — a real security bug in a multi-tenant app. The key needs to include whatever varies the response: URL + serialized params + (if relevant) a user/session identifier.
+
+**Q4: Does `shareReplay(1)` leak memory if nobody ever unsubscribes?**
+A: `shareReplay` keeps its internal `ReplaySubject` (and therefore the last emitted value) alive as long as there's a subscriber, or indefinitely if you don't pass `{ refCount: true }` in modern RxJS. In this dedup pattern that's fine, because `finalize()` removes it from our own `Map` once the source completes — the `ReplaySubject` itself becomes eligible for garbage collection once nothing references it, since we don't hold onto it after that point.
+
+**Q5: How would you unit test this?**
+A: Fire two `.get(url)` calls back to back inside a `fakeAsync`/`TestScheduler` context, assert `HttpTestingController` (Angular's `HttpClientTestingModule`) only recorded **one** matching request via `httpMock.expectOne(url)`, flush it once, and assert both subscriptions received the value. Then fire a third call *after* flushing and assert a *second* `expectOne` request now exists, proving it wasn't accidentally turned into a permanent cache.
+
+## 10. Interview-Ready Answer
+
+"I'd avoid the duplicate request by deduplicating in-flight calls rather than trying to prevent the calls from being triggered in the first place. Concretely, I'd keep a `Map` keyed by the request's identity — URL plus serialized query params, and anything else that affects the response, like a user or tenant ID. When a GET comes in, if there's already an entry in the map for that key, I return the exact same Observable instead of calling `HttpClient.get()` again; if there isn't, I make the real call, pipe it through `shareReplay(1)` so every subscriber gets the one response, and clean the entry out of the map with `finalize()` once it settles — success or error. That last part matters: without the cleanup, this quietly turns into a permanent, never-invalidated cache, which is a different and riskier feature than what was asked. I'd usually implement this as an `HttpInterceptor` so it applies consistently across the app without every feature team having to remember to opt in, and I'd keep it clearly separate in my head from real HTTP caching — this only protects against requests that genuinely overlap in time, not repeat calls minutes apart."
+
+## 11. Quick Revision
+
+- **What**: collapse overlapping identical in-flight GETs into one real HTTP call.
+- **How**: `Map<key, Observable>` + `shareReplay(1)` + `finalize()` cleanup, keyed by URL + params (+ user/tenant if relevant).
+- **Not the same as caching** — protection disappears once the request settles.
+- Best implemented as an `HttpInterceptor` for app-wide coverage.
+- `finalize()`, not `tap()` — must clean up on error too, or the map entry gets stuck forever.
+- Different problem from `debounceTime`/`switchMap` (those cancel earlier calls in favor of the latest; dedup gives every caller an answer).
+
+## 12. Memory Trick
+
+**"Same line, same call."** Picture two people calling the same customer-support number about the same issue at the same time — a good switchboard puts them on the *same call* instead of dialing the support agent twice. Once that call ends, the next person who calls starts a brand-new call — the switchboard doesn't remember old calls forever, it just merges the ones happening *right now*.
