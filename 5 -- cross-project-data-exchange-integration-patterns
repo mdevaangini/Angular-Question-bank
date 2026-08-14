@@ -1,0 +1,186 @@
+# If two independent projects need to exchange information, what techniques or integration patterns would you consider for data transfer?
+
+## 1. What is it?
+
+This is a system-design-flavored scenario question: given two projects that are independently built, deployed, and versioned (not sharing a codebase), what's the right way for them to exchange data at runtime? The honest answer is "it depends on where the two projects actually live relative to each other" — two frontend apps rendered on the same page, two apps in the same browser but different origins (like a host page embedding a third-party widget), or two entirely separate systems that never share a browser tab at all, each call for a different pattern.
+
+## 2. Why is this a real problem worth having named patterns for?
+
+Organizations increasingly split products into independently deployable pieces — micro-frontends, separately owned services, third-party embeds/widgets, teams that each want to ship on their own schedule with their own tech stack. Without a deliberate integration pattern, ad-hoc solutions creep in: global variables shared across scripts, one app directly importing internals from another repo, or reaching across an iframe boundary to poke at another app's DOM. All of these quietly reintroduce tight coupling, break security boundaries, and undermine the entire reason the projects were split apart in the first place — independent deployability, freedom of tech stack, and team autonomy. Choosing the right pattern for the actual relationship between the two projects preserves that independence while still letting them cooperate.
+
+## 3. How does it work?
+
+The right technique depends on where the two projects sit relative to each other:
+
+**Same page, same origin** (a micro-frontend setup where both apps are served from the same domain):
+- Custom DOM events, or a shared `EventTarget` instance, dispatched/listened to on `window` — simple, no security ceremony needed since both apps already trust each other's origin.
+- The `BroadcastChannel` API — purpose-built for same-origin messaging across tabs, windows, or frames; simpler than the older `storage`-event trick.
+- `localStorage`/`sessionStorage` plus the `storage` event — works, but the event only fires in *other* tabs/windows, never the one that made the change, which is a common source of confusion.
+- Module Federation (Webpack 5+) — lets independently built and deployed bundles share actual live JS modules/components at runtime, not just data.
+- Web Components as a framework-agnostic integration boundary — one app exposes a custom element that any other app, regardless of framework, can consume.
+
+**Same page, different origin** (a host app embedding a widget or third-party app via `<iframe>`):
+- `window.postMessage()` — the standard, secure mechanism for passing data across origins in the browser. Requires explicit origin validation on both ends (covered below).
+
+**Entirely separate systems, no shared browser tab** (backend-to-backend, or frontends that never render together):
+- REST or GraphQL APIs — synchronous request/response, the most common default.
+- Webhooks — one system pushes an HTTP callback to the other when something happens, inverting the usual "client pulls data" direction.
+- Message queues / event buses (Kafka, RabbitMQ, SQS) — asynchronous and decoupled, good for high volume or when the consumer might be slow or temporarily offline.
+- WebSockets — for real-time, low-latency, bidirectional needs.
+
+## 4. Example
+
+The cross-origin iframe case is the one most specific to "two independent frontend projects," and the one with the sharpest security trap, so it's worth walking through in code.
+
+```typescript
+// host-app: parent.component.ts (deployed at https://host.example.com)
+import { Component, OnInit, OnDestroy } from '@angular/core';
+
+@Component({ selector: 'app-parent', /* ... */ })
+export class ParentComponent implements OnInit, OnDestroy {
+  private readonly CHILD_ORIGIN = 'https://widget.example.com';
+  private messageHandler = (event: MessageEvent) => this.handleMessage(event);
+
+  ngOnInit(): void {
+    window.addEventListener('message', this.messageHandler);
+  }
+
+  ngOnDestroy(): void {
+    window.removeEventListener('message', this.messageHandler);
+  }
+
+  private handleMessage(event: MessageEvent): void {
+    // CRITICAL: validate the origin before trusting anything in event.data.
+    // Any page holding a reference to this window can call postMessage on it.
+    if (event.origin !== this.CHILD_ORIGIN) {
+      return;
+    }
+
+    if (event.data?.type === 'CHILD_READY') {
+      this.sendToChild({ type: 'INIT_DATA', payload: { userId: 42, theme: 'dark' } });
+    }
+
+    if (event.data?.type === 'ITEM_SELECTED') {
+      console.log('Child selected item:', event.data.payload);
+    }
+  }
+
+  sendToChild(message: unknown): void {
+    const iframe = document.querySelector('iframe') as HTMLIFrameElement;
+    // Always specify the target origin explicitly - '*' defeats the whole point.
+    iframe.contentWindow?.postMessage(message, this.CHILD_ORIGIN);
+  }
+}
+```
+
+```typescript
+// embedded widget app: widget.component.ts (deployed independently at https://widget.example.com)
+import { Component, OnInit, OnDestroy } from '@angular/core';
+
+@Component({ selector: 'app-widget', /* ... */ })
+export class WidgetComponent implements OnInit, OnDestroy {
+  private readonly PARENT_ORIGIN = 'https://host.example.com';
+  private messageHandler = (event: MessageEvent) => this.handleMessage(event);
+
+  ngOnInit(): void {
+    window.addEventListener('message', this.messageHandler);
+    // Announce readiness to the parent, targeting its known origin explicitly.
+    window.parent.postMessage({ type: 'CHILD_READY' }, this.PARENT_ORIGIN);
+  }
+
+  ngOnDestroy(): void {
+    window.removeEventListener('message', this.messageHandler);
+  }
+
+  private handleMessage(event: MessageEvent): void {
+    if (event.origin !== this.PARENT_ORIGIN) return;
+
+    if (event.data?.type === 'INIT_DATA') {
+      this.applyInitData(event.data.payload);
+    }
+  }
+
+  onItemClick(item: { id: number; name: string }): void {
+    window.parent.postMessage({ type: 'ITEM_SELECTED', payload: item }, this.PARENT_ORIGIN);
+  }
+
+  private applyInitData(payload: { userId: number; theme: string }): void {
+    // apply initial data to local state
+  }
+}
+```
+
+## 5. Example Explanation – Execution Flow
+
+1. The host app renders `<iframe src="https://widget.example.com/...">`, embedding the independently built and deployed widget app.
+2. On init, the widget posts a `CHILD_READY` message up to `window.parent`, explicitly targeting the host's known origin.
+3. The host's `message` listener fires and checks `event.origin === CHILD_ORIGIN` first — it only proceeds if that matches, which protects against a compromised or misconfigured iframe pretending to be the widget.
+4. Seeing `CHILD_READY`, the host responds by posting `INIT_DATA` into the iframe's `contentWindow`, again with an explicit target origin, never `'*'`.
+5. The widget's listener receives it, validates `event.origin === PARENT_ORIGIN`, and applies the initial data.
+6. Later, the user clicks an item inside the widget — the widget posts `ITEM_SELECTED` with the item payload back up to the parent.
+7. The host receives and handles it — updating its own state, navigating, whatever's appropriate.
+8. Throughout, the two apps only ever communicate through this narrow, explicit, origin-checked message channel. Neither has a direct reference to the other's internals, DOM, or JS runtime — they could be built in entirely different frameworks, deployed independently, and versioned on separate schedules.
+
+## 6. When to use?
+
+- **postMessage**: two apps that render together in the browser but live at different origins — embedded widgets, third-party integrations, payment iframes, cross-origin micro-frontends.
+- **Custom events / BroadcastChannel**: two apps or modules that share the same origin and just need a lightweight, no-security-ceremony way to talk — same-origin micro-frontends, or communicating across tabs of the same app.
+- **Module Federation**: when you need to share actual live components or logic at runtime, not just data — e.g., a shell app rendering a feature owned and deployed by a different team, without rebuilding the shell.
+- **REST/GraphQL**: two systems that don't share a browser tab at all, where the caller needs an answer right away.
+- **Message queues/webhooks**: two systems that shouldn't be tightly coupled in time — the producer shouldn't fail or block just because the consumer is slow, offline, or overloaded.
+- **WebSockets**: either side needs to push real-time updates to the other without polling.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- Keeping the integration boundary narrow and explicit (well-defined messages, validated payloads) preserves independent deployability — either project can be rebuilt, redeployed, or even rewritten in a different framework without breaking the other, as long as the message contract stays stable.
+- postMessage specifically works across origins without any server involvement, and is natively supported with no extra dependencies.
+- Async patterns (queues, webhooks) decouple system availability — one side being down or slow doesn't cascade into the other failing.
+
+**Disadvantages**
+- postMessage's payload is just data — no shared component instances, no live bindings, so genuinely deep integration (rendering another team's live UI) needs something heavier like Module Federation.
+- Async/queue-based integration adds real operational complexity — you now need to reason about message ordering, retries, and eventual consistency instead of a simple call-and-response.
+- Module Federation usually requires matching (or carefully managed) framework versions between the two bundles, which reintroduces a form of coupling the "independent projects" premise was trying to avoid.
+- Any cross-boundary channel (postMessage, webhooks, APIs) needs its message/payload contract versioned and maintained carefully — an undocumented shape change on one side silently breaks the other.
+
+## 8. Common Interview Traps
+
+- Using `postMessage(data, '*')` — this defeats the entire security model. If the iframe's URL is ever hijacked or redirected, or the message accidentally reaches the wrong window, `'*'` means it gets delivered anyway.
+- Skipping `event.origin` validation on receipt — this is the classic postMessage vulnerability. Any page that obtains a reference to your window (e.g., via `window.open`) can call `postMessage` on it; an unchecked handler will process whatever it sends.
+- Misunderstanding the `storage` event's scope — it fires in *other* tabs/windows of the same origin, never in the tab that actually made the localStorage change. A very common "why isn't my listener firing" bug.
+- Assuming `BroadcastChannel` works cross-origin — it doesn't; it's same-origin only, so it's not a substitute for postMessage in the iframe scenario above.
+- Treating a shared npm package as a *runtime* integration pattern — it's a build-time/deploy-time coupling. Both projects have to rebuild and redeploy to pick up changes, which quietly contradicts the goal of genuine runtime independence.
+- For network-based integration: not distinguishing synchronous (REST/GraphQL — caller waits) from asynchronous (queues/webhooks — decoupled timing). Choosing sync when the consumer might be slow or offline causes cascading failures; choosing async when the caller genuinely needs an immediate answer adds unnecessary complexity.
+
+## 9. Interview Follow-up Questions
+
+**Q1: How would you secure a postMessage-based integration against a malicious page?**
+A: Always validate `event.origin` against an explicit allow-list before processing `event.data`, always specify an explicit `targetOrigin` when sending (never `'*'`), and treat the payload itself as untrusted external input — validate its shape and type before acting on it, the same way you'd treat any other data from outside your app.
+
+**Q2: If the two apps are on the same origin, is there something simpler than postMessage?**
+A: Yes — a shared `EventTarget` or custom DOM events on `window`, or the `BroadcastChannel` API, both work fine same-origin without needing origin-validation ceremony. `BroadcastChannel` specifically wouldn't work for the cross-origin iframe case, though, since it's same-origin only.
+
+**Q3: What's Module Federation, and how does it differ from postMessage-style communication?**
+A: Module Federation (Webpack 5+) lets independently built and deployed bundles share actual live JS modules or components at runtime — app A can import and render a real component from app B's deployed bundle, not just pass serializable data. It's a much deeper integration than postMessage, and usually requires matching framework versions between the two, versus postMessage's shallow, framework-agnostic "pass data across a boundary" approach.
+
+**Q4: When would you reach for a message queue instead of a direct API call between two systems?**
+A: When the two systems shouldn't be tightly coupled in time — the producer shouldn't have to wait on, or fail because of, the consumer being slow, offline, or overloaded. Queues also help absorb bursts of traffic and let multiple independent consumers process the same event.
+
+**Q5: What data would you avoid putting directly in a postMessage payload?**
+A: Anything sensitive that doesn't strictly need to cross that boundary. If origin validation is ever misconfigured on either side, the payload could be exposed to the wrong recipient. Long-lived auth tokens in particular are worth handling carefully — prefer short-lived, narrowly scoped tokens over passing durable credentials across a frame boundary at all, if that can be avoided.
+
+## 10. Interview-Ready Answer
+
+"It really depends on where the two projects need to communicate. If they're two frontend apps rendered together on the same page — like a host app embedding a widget via an iframe — I'd reach for `window.postMessage()`, since it's the standard, secure way to pass data across origins in the browser. The two non-negotiables there are: always specify an explicit target origin when sending, never `'*'`, and always validate `event.origin` on the receiving end before trusting the payload — otherwise any page that gets a reference to your window can send it arbitrary messages. If the two apps are same-origin, something lighter like a custom `EventTarget` or the `BroadcastChannel` API works without that origin-validation overhead. If the two projects are actually separate backend systems rather than two things sharing a browser tab, it comes down to sync versus async: a REST or GraphQL API for a straightforward request/response where the caller needs an immediate answer, or a message queue or webhook if the two systems shouldn't be tightly coupled in time, so the producer doesn't fail or block just because the consumer is slow or temporarily down. The common thread across all of these is keeping the boundary narrow and explicit — passing well-defined, validated messages — rather than shortcuts like global variables or directly importing across repos, which quietly reintroduces the coupling that splitting the projects apart was supposed to remove."
+
+## 11. Quick Revision
+
+- Same page, same origin: custom events/`EventTarget`, `BroadcastChannel`, or Module Federation if you need to share live components, not just data.
+- Same page, cross-origin (iframe/embed): `window.postMessage()` — always explicit `targetOrigin`, always validate `event.origin` on receipt.
+- Separate systems, no shared browser tab: REST/GraphQL (sync, request/response) vs. message queue/webhooks (async, decoupled timing) vs. WebSockets (real-time, bidirectional).
+- Biggest trap: `postMessage(data, '*')` or skipping origin validation — breaks the entire security model.
+- A shared npm package is build-time coupling, not a runtime integration pattern — it contradicts genuine independent deployability.
+
+## 12. Memory Trick
+
+Think of it like sending information between companies sharing an office building versus companies in different cities. Same floor, same company (same origin, same page) — you can just shout across the room (custom events) or use the intercom (`BroadcastChannel`). Different companies sharing a building (cross-origin, same page/iframe) — you use sealed, addressed envelopes through a supervised mail slot (`postMessage`): you always write the exact recipient's name on the envelope (`targetOrigin`), and you never accept an envelope without checking who it's actually from (validate `event.origin`). Completely different cities (separate systems, no shared page) — you either call and wait on the line (REST/GraphQL, synchronous) or drop a letter in a mailbox and let them read it whenever they get to it (message queue, asynchronous).
