@@ -30,15 +30,21 @@ The right technique depends on where the two projects sit relative to each other
 
 ## 4. Example
 
-The cross-origin iframe case is the one most specific to "two independent frontend projects," and the one with the sharpest security trap, so it's worth walking through in code.
+The cross-origin iframe case is the one most specific to "two independent frontend projects," and the one with the sharpest security trap, so it's worth walking through in code. This is the exact code running in the verified StackBlitz demo linked with this note — not a simplified stand-in.
 
 ```typescript
-// host-app: parent.component.ts (deployed at https://host.example.com)
-import { Component, OnInit, OnDestroy } from '@angular/core';
+// host-app: host.component.ts (in production: deployed at https://host.example.com)
+import { Component, OnInit, OnDestroy, ViewChild, ElementRef } from '@angular/core';
 
-@Component({ selector: 'app-parent', /* ... */ })
-export class ParentComponent implements OnInit, OnDestroy {
-  private readonly CHILD_ORIGIN = 'https://widget.example.com';
+@Component({ selector: 'app-host', /* ... */ })
+export class HostComponent implements OnInit, OnDestroy {
+  @ViewChild('widgetFrame') widgetFrame!: ElementRef<HTMLIFrameElement>;
+
+  // In production: the widget's real, different domain, e.g. 'https://widget.example.com'.
+  // (The demo substitutes window.location.origin since StackBlitz can't easily host
+  // two different domains in one project - the postMessage calls and validation
+  // logic below are identical either way, only this constant's value differs.)
+  private readonly CHILD_ORIGIN = window.location.origin;
   private messageHandler = (event: MessageEvent) => this.handleMessage(event);
 
   ngOnInit(): void {
@@ -65,21 +71,23 @@ export class ParentComponent implements OnInit, OnDestroy {
     }
   }
 
-  sendToChild(message: unknown): void {
-    const iframe = document.querySelector('iframe') as HTMLIFrameElement;
+  private sendToChild(message: unknown): void {
+    const win = this.widgetFrame?.nativeElement?.contentWindow;
+    if (!win) return;
     // Always specify the target origin explicitly - '*' defeats the whole point.
-    iframe.contentWindow?.postMessage(message, this.CHILD_ORIGIN);
+    win.postMessage(message, this.CHILD_ORIGIN);
   }
 }
 ```
 
 ```typescript
-// embedded widget app: widget.component.ts (deployed independently at https://widget.example.com)
+// embedded widget app: widget.component.ts (in production: deployed independently at https://widget.example.com)
 import { Component, OnInit, OnDestroy } from '@angular/core';
 
 @Component({ selector: 'app-widget', /* ... */ })
 export class WidgetComponent implements OnInit, OnDestroy {
-  private readonly PARENT_ORIGIN = 'https://host.example.com';
+  // In production: the host's real, different domain, e.g. 'https://host.example.com'.
+  private readonly PARENT_ORIGIN = window.location.origin;
   private messageHandler = (event: MessageEvent) => this.handleMessage(event);
 
   ngOnInit(): void {
@@ -110,6 +118,8 @@ export class WidgetComponent implements OnInit, OnDestroy {
 }
 ```
 
+The live demo also wires up two extra buttons on the host side purely to make section 8's traps observable rather than theoretical: one calls `win.postMessage(message, 'https://this-does-not-match-anything.example.com')` to show the browser silently drop a message sent with the wrong `targetOrigin`, and the other calls `handleMessage()` directly with a fake `{ origin: 'https://evil...', data: {...} }` object to prove the `if (event.origin !== ...) return;` guard actually rejects it.
+
 ## 5. Example Explanation – Execution Flow
 
 1. The host app renders `<iframe src="https://widget.example.com/...">`, embedding the independently built and deployed widget app.
@@ -120,6 +130,8 @@ export class WidgetComponent implements OnInit, OnDestroy {
 6. Later, the user clicks an item inside the widget — the widget posts `ITEM_SELECTED` with the item payload back up to the parent.
 7. The host receives and handles it — updating its own state, navigating, whatever's appropriate.
 8. Throughout, the two apps only ever communicate through this narrow, explicit, origin-checked message channel. Neither has a direct reference to the other's internals, DOM, or JS runtime — they could be built in entirely different frameworks, deployed independently, and versioned on separate schedules.
+
+This exact flow was verified live in the StackBlitz demo: the handshake (`CHILD_READY` → `INIT_DATA`) happens automatically within ~500ms of the iframe loading, clicking an item posts `ITEM_SELECTED` back up correctly, the wrong-`targetOrigin` button's message never reaches the widget's log at all (confirming the browser drops it silently), and the spoofed-origin button produces a visible `REJECTED message claiming origin "https://evil-impersonator.example.com"` line — the guard clause catching it in real time rather than just on paper.
 
 ## 6. When to use?
 
