@@ -28,7 +28,7 @@ The right technique depends on where the two projects sit relative to each other
 - Message queues / event buses (Kafka, RabbitMQ, SQS) — asynchronous and decoupled, good for high volume or when the consumer might be slow or temporarily offline.
 - WebSockets — for real-time, low-latency, bidirectional needs.
 
-## 4. Example
+## 4. Example   --> https://stackblitz.com/edit/gmiqu7yn?file=src%2Fapp%2Fhost.component.ts
 
 The cross-origin iframe case is the one most specific to "two independent frontend projects," and the one with the sharpest security trap, so it's worth walking through in code. This is the exact code running in the verified StackBlitz demo linked with this note — not a simplified stand-in.
 
