@@ -2,7 +2,8 @@
 
 ## 1. What is it?
 
-Authentication (often shortened to AuthN) is the process of verifying **who** a user is — confirming identity, typically via a password, a token, a biometric, or delegation to a trusted identity provider. Authorization (AuthZ) is the process of verifying **what** an already-identified user is allowed to do — checking permissions, roles, or ownership against a specific action or resource. They're sequential and distinct: authentication always happens first, because you can't meaningfully decide what someone is permitted to do until you know who they are.
+Authentication (often shortened to AuthN) is the process of verifying **who** a user is — confirming identity, typically via a password, a token, a biometric, or delegation to a trusted identity provider.
+Authorization (AuthZ) is the process of verifying **what** an already-identified user is allowed to do — checking permissions, roles, or ownership against a specific action or resource. They're sequential and distinct: authentication always happens first, because you can't meaningfully decide what someone is permitted to do until you know who they are.
 
 ## 2. Why introduced?
 
