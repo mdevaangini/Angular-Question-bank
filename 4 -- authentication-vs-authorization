@@ -14,7 +14,12 @@ Separating the two cleanly also matters architecturally: authentication typicall
 ## 3. How does it work?
 
 **Common authentication mechanisms:**
-- Username/password, checked against a hashed credential store.
+- Username/password, checked against a hashed credential store. --> Instead of saving your actual password in a database, a well-built system stores a hash of it — the output of a one-way cryptographic function. Feed the same password in, and you always get the same hash out, but you can't reverse a hash back into the original password.
+So a "credential store" (usually a database table) holds something like:
+
+                                                                          username: alice
+                                                                          password_hash: $2b$12$KIXQ7f3n9z... (not "hunter2")
+
 - Token-based auth (JWT) — after an initial login, a signed token is issued and sent on subsequent requests; the server verifies the signature to confirm identity without re-checking the password every time.
 - Session-based auth — the server stores session state and identifies the user via a session ID in a cookie.
 - OAuth2/OIDC (SSO, "Sign in with Google") — delegates identity verification to a trusted external identity provider.
