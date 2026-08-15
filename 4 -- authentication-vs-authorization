@@ -1,0 +1,156 @@
+# Explain Authentication and Authorization.
+
+## 1. What is it?
+
+Authentication (often shortened to AuthN) is the process of verifying **who** a user is — confirming identity, typically via a password, a token, a biometric, or delegation to a trusted identity provider. Authorization (AuthZ) is the process of verifying **what** an already-identified user is allowed to do — checking permissions, roles, or ownership against a specific action or resource. They're sequential and distinct: authentication always happens first, because you can't meaningfully decide what someone is permitted to do until you know who they are.
+
+## 2. Why introduced?
+
+Any system with more than one trust level needs both, and needs them kept separate. Without authentication, anyone could simply claim to be anyone. Without authorization, once logged in, a user could act with unlimited access regardless of who they actually are — a regular user could delete another user's data or reach an admin-only screen just by knowing the URL.
+
+Separating the two cleanly also matters architecturally: authentication typically happens once per request (or once per session, refreshed via a token), while authorization is checked repeatedly, often per-resource and per-action, against rules that change far more frequently than identity-verification methods do. Conflating the two — checking only "is this user logged in" when the real question was "is this specific user allowed to touch this specific resource" — is one of the most common real-world security mistakes, and is essentially what OWASP calls Broken Access Control, which has topped its list of web application security risks for years.
+
+## 3. How does it work?
+
+**Common authentication mechanisms:**
+- Username/password, checked against a hashed credential store.
+- Token-based auth (JWT) — after an initial login, a signed token is issued and sent on subsequent requests; the server verifies the signature to confirm identity without re-checking the password every time.
+- Session-based auth — the server stores session state and identifies the user via a session ID in a cookie.
+- OAuth2/OIDC (SSO, "Sign in with Google") — delegates identity verification to a trusted external identity provider.
+- Multi-factor authentication (MFA) — adds a second factor (OTP, biometric) on top of a password for stronger identity assurance.
+- API keys — for service-to-service auth, identifying which system is calling rather than which human.
+
+**Common authorization mechanisms:**
+- Role-Based Access Control (RBAC) — permissions attached to roles (admin, editor, viewer), users assigned to roles.
+- Attribute-Based Access Control (ABAC) — access computed dynamically from attributes of the user, the resource, and the context (e.g., "user can edit if user.department === document.department").
+- Access Control Lists (ACLs) — explicit, per-resource, per-user or per-group permission entries.
+- Policy engines (e.g., OPA/Rego, CASL in JS) — centralized, declarative permission rules instead of scattered if-checks.
+- Scopes/claims embedded directly in a token (OAuth scopes) — the token itself carries what its bearer is allowed to do.
+
+**The typical request pipeline:**
+1. The user submits credentials — authentication happens: the server verifies identity and issues a token or session.
+2. The client stores that token/session identifier and attaches it to subsequent requests.
+3. On each request, an authentication layer (middleware/guard) verifies the token or session first, establishing "this request is from user X" — or rejects it outright if the credential is missing, invalid, or expired.
+4. Only after identity is established does authorization logic run: does user X have permission to perform this specific action on this specific resource?
+5. Failing step 3 returns **401 Unauthorized**. Failing step 4 — identity is fine, but not permitted — returns **403 Forbidden**. This status-code distinction is a small detail that signals real understanding in an interview.
+
+## 4. Example
+
+```typescript
+// auth.guard.ts - AUTHENTICATION check: "do we know who this is at all?"
+export const authGuard: CanActivateFn = () => {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+
+  if (!auth.isAuthenticated()) {
+    router.navigate(['/login']);
+    return false; // 401-equivalent: identity not established
+  }
+  return true;
+};
+```
+
+```typescript
+// role.guard.ts - AUTHORIZATION check: "now that we know who this is, are they allowed here?"
+export const adminOnlyGuard: CanActivateFn = () => {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+
+  if (auth.currentUser()?.role !== 'admin') {
+    router.navigate(['/forbidden']);
+    return false; // 403-equivalent: identity known, but not permitted
+  }
+  return true;
+};
+```
+
+```typescript
+// route config: authentication ALWAYS runs before authorization
+{
+  path: 'admin',
+  canActivate: [authGuard, adminOnlyGuard], // order matters: identity first, then permission
+  loadComponent: () => import('./admin.component').then(m => m.AdminComponent),
+}
+```
+
+```typescript
+// server-side pseudocode showing the status code distinction
+app.get('/api/documents/:id', authenticate, (req, res) => {
+  // 'authenticate' middleware already ran: req.user is populated, or the
+  // request was already rejected with 401 before reaching this handler.
+
+  const doc = getDocument(req.params.id);
+  if (req.user.id !== doc.ownerId && req.user.role !== 'admin') {
+    return res.status(403).send('Forbidden'); // known identity, not permitted
+  }
+
+  res.json(doc);
+});
+```
+
+## 5. Example Explanation – Execution Flow
+
+1. A user navigates to `/admin`. `authGuard` runs first and checks `auth.isAuthenticated()`. If the user never logged in — no valid token — this fails immediately, redirects to `/login`, and `adminOnlyGuard` never even runs. This *is* the authentication check: it only ever asks "do we know who this is."
+2. Now say the user *is* logged in (valid token) but holds the `'editor'` role, not `'admin'`. `authGuard` passes — we do know who they are. `adminOnlyGuard` then runs and checks that already-established identity's role, fails, and redirects to `/forbidden`. This is the authorization check: "now that we know who they are, are they allowed *here*?"
+3. The server follows the identical pattern: the `authenticate` middleware runs on every request first, verifying the token and populating `req.user`, or rejecting with 401 if it's missing or invalid. Only if that passes does the route handler run its own authorization check, comparing `req.user` against the specific resource requested, returning 403 if identity is valid but not permitted for that particular document.
+4. Notice authorization is often instance-specific — "can this user edit *this* document" — while authentication is a one-time, request-wide fact — "is this token valid at all." That's exactly why authentication typically happens once via a guard or middleware, while authorization checks are sprinkled per-resource, per-action throughout the app.
+
+## 6. When to use?
+
+Every application with more than a single trust level needs both, distinctly. Authentication is needed anywhere the system needs to know who's acting at all. Authorization is layered on top wherever different identities should have different levels of access — multi-tenant apps, admin panels, apps with paid feature tiers, apps where only a resource's owner can edit it, and any regulated industry (healthcare, finance) with strict access-control requirements.
+
+## 7. Advantages / Disadvantages
+
+**Advantages of keeping them cleanly separated**
+- Identity-verification logic (which may involve external providers, MFA, token issuance) stays independent from business permission rules, which tend to change far more often as the product evolves.
+- Authentication can be centralized and reused everywhere, while authorization can be fine-grained and resource-specific without touching the identity layer at all.
+- Correct 401 vs. 403 semantics give API consumers unambiguous, actionable information: 401 means "log in again," 403 means "you're logged in fine, this just isn't for you."
+
+**Risks of getting this wrong**
+- It's easy to accidentally check only "is logged in" when the real requirement was "is allowed to do this" — this exact gap is Broken Access Control, a leading real-world web vulnerability class.
+- Authorization logic can become scattered and inconsistent across a codebase without deliberate architecture (centralized guards, decorators, or policy engines) — different endpoints quietly implementing slightly different rules.
+- Client-side authorization — hiding a button, disabling a route — is a UX nicety only, never real security. The actual check must be enforced server-side on every request, since client-side code can always be bypassed by calling the API directly.
+
+## 8. Common Interview Traps
+
+- Getting the order backwards — authentication always precedes authorization; you can't check permissions for an identity you haven't established.
+- Treating "checking if the user is logged in" as equivalent to "checking if the user has access" — these are two different checks, and conflating them is the classic real-world bug.
+- Believing a role-conditional `*ngIf` in the UI counts as real authorization — it's UX only; the backend must independently enforce the same rule, or a user can simply call the API directly and bypass the UI entirely.
+- Assuming a valid JWT alone proves authorization — a token proves *authentication* (and may carry claims/scopes used for authorization), but a valid, unexpired, correctly-signed token only proves who's asking, not what they're allowed to do.
+- Forgetting authorization can be instance-specific, not just role-based — "is this user allowed to edit document #123" often needs an ownership/context check, not just "is this user an editor" in general.
+- Not connecting this topic to Broken Access Control being a top-ranked real-world web security risk — naming that connection signals actual security awareness rather than textbook recitation.
+
+## 9. Interview Follow-up Questions
+
+**Q1: What HTTP status codes correspond to authentication vs. authorization failures, and why does the distinction matter?**
+A: 401 Unauthorized means authentication failed — credentials are missing, invalid, or expired, so the fix is logging in again. 403 Forbidden means authentication succeeded but authorization failed — the identity is known and valid, but not permitted, so logging in again won't help at all. Distinguishing them correctly lets the client show the right recovery action instead of a generic error.
+
+**Q2: How would you implement authorization on the client side in Angular without compromising security?**
+A: Use it purely for UX — conditionally hide or disable UI elements the user isn't permitted to use, and add route guards so they can't even navigate to a page they can't use — but treat this entirely as a convenience layer. The real enforcement has to happen server-side on every request, since client-side checks can be trivially bypassed by calling the API directly.
+
+**Q3: What's the difference between RBAC and ABAC?**
+A: RBAC assigns permissions to fixed roles (admin, editor, viewer) and users to those roles — simple, but coarse-grained, and it struggles to express rules like "only the document's owner or their manager can edit it." ABAC computes access dynamically from attributes of the user, resource, and context (department match, time of day, resource sensitivity) — far more flexible and fine-grained, but more complex to design, implement, and audit.
+
+**Q4: How does OAuth2/OIDC relate to authentication and authorization?**
+A: OIDC (built on top of OAuth2) is specifically the authentication layer — it's how identity gets verified via a trusted external provider, returning an ID token describing who the user is. OAuth2 itself is fundamentally an authorization framework — it grants a client limited, scoped access to a resource on a user's behalf, without ever sharing the user's actual credentials with that client. Modern systems commonly use both together: OIDC to authenticate, OAuth2 access tokens (often carrying scopes) to authorize what happens afterward.
+
+**Q5: If a JWT is stolen, what's compromised — authentication, authorization, or both?**
+A: Both, effectively. A valid JWT is what proves identity for subsequent requests, and it typically also carries the claims/scopes/roles used for authorization decisions — so a stolen token lets an attacker impersonate the user for both purposes until it expires or is revoked. That's exactly why keeping tokens out of reach of XSS (httpOnly cookies over `localStorage`), using short expiry windows, and supporting revocation or refresh-token rotation matter so much in real systems.
+
+## 10. Interview-Ready Answer
+
+"Authentication and authorization are two distinct, sequential steps, and mixing them up is one of the most common real-world security mistakes. Authentication answers 'who is this?' — verifying identity, typically through a password, a token, MFA, or delegation to an identity provider via something like OIDC. Authorization answers a completely different question — 'now that we know who this is, what are they allowed to do?' — checking that identity against roles, permissions, or resource ownership for the specific action being attempted. Authentication always has to happen first, since you can't meaningfully check permissions for someone you haven't identified yet. In practice this shows up very concretely in HTTP status codes: a 401 means authentication failed — we don't have a valid identity, so the fix is logging in again — while a 403 means authentication succeeded but authorization failed — we know exactly who you are, you're just not allowed to do this, and logging in again won't change that. The mistake I'd specifically watch for is conflating the two — checking only 'is this user logged in' when the actual requirement was 'is this specific user allowed to touch this specific resource.' That gap is essentially what OWASP calls Broken Access Control, and it's been a top web application security risk for years. And critically, any authorization check done in the frontend — hiding a button, disabling a route — is purely a UX convenience; the real enforcement has to happen server-side on every request, because client-side code can always be bypassed."
+
+## 11. Quick Revision
+
+- Authentication = *who* are you — password, tokens, MFA, OIDC/SSO.
+- Authorization = *what* are you allowed to do — RBAC, ABAC, ACLs, scopes.
+- Authentication always happens first; authorization is checked against an already-established identity.
+- 401 = authentication failed (not logged in / invalid token) — fix: log in again.
+- 403 = authorization failed (logged in fine, just not permitted) — logging in again won't help.
+- Client-side authorization is UX only, never security — always enforce server-side.
+- Broken Access Control (conflating "logged in" with "permitted") is a leading real-world web security risk.
+
+## 12. Memory Trick
+
+Think of a nightclub with a bouncer at the door and a velvet rope around a VIP section inside. The bouncer checking your ID at the door is Authentication — "are you actually who this ID says you are, and are you even on the list at all." Once you're inside, the separate rope around the VIP section is Authorization — "okay, we know exactly who you are, that still doesn't get you past *this* rope." Getting past the bouncer doesn't automatically get you past the rope — two different checks, by two different people — and getting turned away at the rope doesn't mean you should go back and show your ID again, because your ID was never the problem.
