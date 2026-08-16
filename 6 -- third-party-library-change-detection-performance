@@ -1,0 +1,189 @@
+# After integrating a third-party charting library, the whole app becomes sluggish — profiling shows change detection running constantly, even when idle. What happened and what do you do?
+
+## 1. What is it?
+
+This is a classic Angular performance bug: a third-party library (chart, map, video player, rich text editor — anything with its own internal render loop or heavy event listeners) is running *inside* Angular's zone. Every internal thing it does — a `requestAnimationFrame` tick, a `mousemove` for tooltip positioning, a `ResizeObserver` callback, a WebSocket message — gets intercepted by Zone.js and triggers a full Angular change detection pass across the entire component tree, even though none of it has anything to do with your Angular bindings.
+
+The symptom "CD running constantly, even when idle" is the giveaway: nothing the *user* is doing should be causing CD if the app is idle. So the trigger is coming from something running in the background — almost always a third-party library's own animation/render loop or listener firing on a timer.
+
+## 2. Why does this happen?
+
+Angular's default change detection is zone-based. `NgZone` (via Zone.js) monkey-patches every async browser API — `setTimeout`, `setInterval`, `addEventListener`, `XMLHttpRequest`, `fetch`, `Promise`, `requestAnimationFrame`, `MutationObserver`, `ResizeObserver`, and so on. Any of these firing *anywhere* on the page — not just in your Angular code — causes `NgZone` to emit `onMicrotaskEmpty`, which Angular listens to and responds to by running `ApplicationRef.tick()`, which walks and checks the **entire component tree** by default (unless components opt out via `OnPush`).
+
+Charting libraries are a textbook offender because they typically:
+- Run a `requestAnimationFrame` loop for smooth animations/transitions.
+- Attach `mousemove`/`mouseover` listeners directly to the canvas/SVG for tooltips and hover states — firing dozens of times per second.
+- Use a `ResizeObserver` to auto-resize the chart.
+
+None of this was written with Angular in mind — the library has no idea it's running inside a zone, and by default it doesn't need to. It's just doing normal DOM work. But because Zone.js patches these APIs globally, Angular sees every one of these calls as "something might have changed" and re-checks everything.
+
+## 3. How does it work? (the fix)
+
+There are two complementary techniques, and you almost always want both:
+
+**a) Run the library outside Angular's zone with `NgZone.runOutsideAngular()`**
+
+This tells Zone.js "don't intercept the async work inside this callback." Any `setTimeout`, `requestAnimationFrame`, or event listener *registered* inside a `runOutsideAngular()` block inherits that "outside" context — so when those callbacks eventually fire, they no longer trigger `ApplicationRef.tick()`. This is the real fix: it stops the noise at the source instead of just contains the damage.
+
+**b) Use `ChangeDetectionStrategy.OnPush` on the component (and ideally its ancestors)**
+
+Even with the offending library safely outside the zone, other legitimate things (an HTTP response, a button click elsewhere in the app) still trigger CD sometimes — and by default Angular checks the *whole tree* on any trigger, anywhere. `OnPush` tells Angular "only re-check this component if an `@Input` reference changed, an event originated from this component's own template, an `async` pipe emitted, or I explicitly called `markForCheck()`." This limits the blast radius of any CD run that does happen, whether or not you fully solved the zone problem.
+
+If you only re-enter the zone for the specific moments that actually need Angular to know about them (e.g., the user clicked a data point and you need to update Angular-bound state), you do it explicitly with `ngZone.run(() => { ... })` inside the library's callback.
+
+## 4. Example
+
+```typescript
+// chart-wrapper.component.ts
+import {
+  Component,
+  ElementRef,
+  AfterViewInit,
+  OnDestroy,
+  ViewChild,
+  NgZone,
+  ChangeDetectionStrategy,
+  Output,
+  EventEmitter,
+} from '@angular/core';
+import { SomeChartLib } from 'some-chart-lib'; // fictitious third-party charting library
+
+@Component({
+  selector: 'app-chart-wrapper',
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush, // (b) limit blast radius of any CD that does run
+  template: `<div #chartHost class="chart-host"></div>`,
+})
+export class ChartWrapperComponent implements AfterViewInit, OnDestroy {
+  @ViewChild('chartHost', { static: true }) chartHost!: ElementRef<HTMLDivElement>;
+  @Output() pointSelected = new EventEmitter<{ x: number; y: number }>();
+
+  private chart?: SomeChartLib;
+
+  constructor(private ngZone: NgZone) {}
+
+  ngAfterViewInit() {
+    // (a) Everything the chart library does internally — its RAF render loop,
+    // its own mousemove/resize listeners — is registered while we're outside
+    // the Angular zone. Zone.js never intercepts those callbacks, so none of
+    // them trigger ApplicationRef.tick(). This is the actual fix.
+    this.ngZone.runOutsideAngular(() => {
+      this.chart = new SomeChartLib(this.chartHost.nativeElement, {
+        data: [
+          /* ... */
+        ],
+        animate: true, // internally uses requestAnimationFrame
+        onHover: (point) => {
+          // runs on every mousemove over the chart — stays OUTSIDE Angular,
+          // no CD triggered just for tooltip hover
+        },
+        onClick: (point) => {
+          // this IS something Angular-bound state cares about, so we
+          // deliberately re-enter the zone just for this one callback
+          this.ngZone.run(() => {
+            this.pointSelected.emit(point);
+          });
+        },
+      });
+    });
+  }
+
+  ngOnDestroy() {
+    this.chart?.destroy();
+  }
+}
+```
+
+```typescript
+// dashboard.component.ts — the parent that actually reacts to the selection
+@Component({
+  selector: 'app-dashboard',
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [ChartWrapperComponent],
+  template: `
+    <app-chart-wrapper (pointSelected)="onPointSelected($event)"></app-chart-wrapper>
+    <p>Selected: {{ selectedLabel }}</p>
+  `,
+})
+export class DashboardComponent {
+  selectedLabel = 'none';
+
+  onPointSelected(point: { x: number; y: number }) {
+    // This runs inside the zone (event originated from this component's own
+    // template binding), and this component is OnPush, so Angular checks
+    // exactly this component — not the rest of the app.
+    this.selectedLabel = `(${point.x}, ${point.y})`;
+  }
+}
+```
+
+## 5. Example Explanation — Execution Flow
+
+1. `ChartWrapperComponent.ngAfterViewInit()` runs, and everything inside `runOutsideAngular(() => {...})` executes with Zone.js's "current zone" set to the root zone instead of Angular's zone.
+2. `SomeChartLib` is constructed inside that block. It registers its own `requestAnimationFrame` loop and DOM listeners (`mousemove`, `resize`) *during construction*. Because Zone.js's patched APIs check "which zone are we currently in?" at the moment of *registration*, these callbacks are now permanently tagged as "outside Angular" — even though `runOutsideAngular()` has long since returned by the time they actually fire later.
+3. From this point on, the chart animates and responds to mouse hover completely silently as far as Angular is concerned. `NgZone.onMicrotaskEmpty` never fires because of this activity, so `ApplicationRef.tick()` is never called for it. CD stops running while idle.
+4. When the user clicks a data point, `onClick` fires (still outside the zone) — but instead of touching Angular state directly, it calls `this.ngZone.run(() => { this.pointSelected.emit(point) })`. This one call re-enters the Angular zone just long enough to emit the event and trigger exactly one CD pass.
+5. That CD pass starts checking the tree, hits `DashboardComponent` (`OnPush`), sees the event came from `ChartWrapperComponent`'s own output binding in its template — which counts as a valid trigger for an `OnPush` component — updates `selectedLabel`, and Angular re-renders just that piece of the DOM.
+6. Nothing else in the app tree gets checked for hover/animation frames anymore — only for this one deliberate, meaningful interaction.
+
+## 6. When to use?
+
+- Any time you integrate a third-party UI library with its own render loop or heavy DOM event usage: charting libraries (Chart.js, D3, ECharts, Highcharts), maps (Leaflet, Mapbox, Google Maps), rich text editors, video/audio players, drag libraries not built for Angular, canvas/WebGL-based widgets.
+- Any custom code you write that does frequent, purely-visual DOM work not tied to Angular bindings (e.g., a custom cursor-follow effect, a manual scroll-position indicator).
+- Anywhere you see change detection running on a timer/animation frame in the Angular DevTools profiler with no corresponding user action or app update.
+
+Don't reach for `runOutsideAngular` reflexively on code that legitimately needs to update Angular-bound state often (e.g., a live-updating price ticker that should re-render on every tick) — that's normal, expected CD work, not a bug.
+
+## 7. Advantages / Disadvantages
+
+**Advantages of the fix:**
+- Eliminates unnecessary CD cycles entirely at the source rather than just making each cycle cheaper.
+- No architectural changes needed — the library itself is untouched; you only change how you *initialize* it.
+- Composable with `OnPush` for defense in depth.
+
+**Disadvantages / costs:**
+- Easy to get wrong: if you forget to re-enter the zone (`ngZone.run()`) for callbacks that *do* need to update Angular state, the UI silently stops updating for those interactions — a hard-to-debug regression.
+- Adds a small amount of cognitive overhead — every callback from the wrapped library needs a deliberate decision: "does this need to talk to Angular or not?"
+- Doesn't fix libraries that internally schedule work in ways you can't intercept (e.g., a library that lazily attaches listeners on a delayed `import()` after your `runOutsideAngular()` block has already returned) — you'd need to wrap those specific calls too, or fall back to patching at a lower level.
+
+## 8. Common Interview Traps
+
+- **Saying "just use `OnPush`" as the complete answer.** `OnPush` limits how far a triggered CD run spreads — it does not stop the trigger from happening in the first place. If the chart is still inside the zone, `ApplicationRef.tick()` still fires constantly; `OnPush` components in that tree just get skipped *unless* they have an `@Input` reference change, a local template event, an async pipe emission, or a manual `markForCheck()`. The root cause is the zone re-entry, not the checking strategy.
+- **Wrapping the entire component (including things that must update the UI) in `runOutsideAngular` and being surprised the UI "stops working".** You have to selectively re-enter with `ngZone.run()` for the callbacks that matter.
+- **Not knowing that the "outside zone" context is captured at the time the async API is *registered*, not when it *fires*.** This is why you wrap the library's *construction/initialization* in `runOutsideAngular`, not just individual calls after the fact — the internal RAF loop and listeners need to be *registered* while outside.
+- **Confusing this with "the chart library is just slow to render."** Profiling shows CD running constantly — that's specifically an Angular-triggering problem, not a raw rendering-performance problem. Read the profiler carefully before jumping to conclusions.
+- **Forgetting `OnDestroy` cleanup.** If the library's loop keeps running after the component is destroyed (e.g., `chart.destroy()` is never called), you leak a `requestAnimationFrame` loop that runs forever in the background.
+
+## 9. Interview Follow-up Questions
+
+- How does Zone.js actually intercept these APIs under the hood (monkey-patching)?
+- What triggers `ApplicationRef.tick()` besides zone `onMicrotaskEmpty`? (Manual `ApplicationRef.tick()`, `ChangeDetectorRef.detectChanges()`, router navigation, etc.)
+- How would you detect this problem without Angular DevTools — e.g., using `NgZone.isInAngularZone()` or a console spy on `tick()`?
+- What is zoneless Angular (Angular's newer zoneless change detection, built on signals) and how does it change this entire class of problem?
+- What's the difference between `ChangeDetectorRef.detectChanges()` and `markForCheck()`, and when would you use each inside an `OnPush` component?
+- If the third-party library exposes its own "pause/resume rendering" API, would you still bother with `runOutsideAngular`? Why or why not.
+
+## 10. Interview-Ready Answer
+
+"This is a classic Zone.js problem. Angular's default change detection is triggered by `NgZone` listening for any patched async API firing anywhere on the page — not just inside my Angular code. A charting library almost always runs its own `requestAnimationFrame` loop for animation and attaches its own `mousemove`/`resize` listeners for tooltips and responsiveness. Since Zone.js monkey-patches those globally, every one of those calls looks to Angular like 'something changed,' so it kicks off a full tree change-detection pass — which is exactly why the profiler shows CD running constantly even when the user isn't doing anything.
+
+The fix is to initialize the third-party library inside `NgZone.runOutsideAngular()`. That way, all of its internally-registered callbacks — the RAF loop, the hover listeners — are permanently tagged as running outside Angular's zone, so they never trigger `ApplicationRef.tick()`. For the specific interactions that do need to update Angular state, like a click that should update a data-bound label, I explicitly re-enter with `ngZone.run()` inside just that callback. On top of that, I'd put the wrapping component and its ancestors on `OnPush`, so that even if some other trigger elsewhere in the app does cause a CD pass, this subtree is skipped unless something it actually cares about changed."
+
+## 11. Quick Revision
+
+- Symptom: CD running constantly while idle → something outside your control is triggering zone microtasks.
+- Cause: Zone.js patches global async APIs; third-party libraries with RAF loops / DOM listeners trigger `ApplicationRef.tick()` on every internal tick.
+- Fix #1 (root cause): `ngZone.runOutsideAngular(() => { /* init the library here */ })`.
+- Fix #2 (defense in depth): `ChangeDetectionStrategy.OnPush` on the wrapper and its ancestors.
+- Re-enter deliberately: `ngZone.run(() => { /* update Angular state */ })` only for callbacks that matter.
+- `OnPush` alone does NOT stop the trigger — it only limits how much gets re-checked once triggered.
+- Zone context is captured at *registration* time, so wrap the library's *construction*, not individual later calls.
+- Always clean up (`destroy()`) in `ngOnDestroy` so the loop doesn't run forever after the component is gone.
+
+## 12. Memory Trick
+
+**"Zone in, Zone out, OnPush about."**
+- **Zone out** the third-party library's noisy internals (`runOutsideAngular` at construction time).
+- **Zone in** only for the moments that matter (`ngZone.run()` for real state changes).
+- **OnPush about** everything else, so any CD that does slip through only checks what actually needs checking.
