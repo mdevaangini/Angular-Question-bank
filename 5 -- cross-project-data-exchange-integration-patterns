@@ -13,6 +13,13 @@ Organizations increasingly split products into independently deployable pieces �
 The right technique depends on where the two projects sit relative to each other:
 
 **Same page, same origin** (a micro-frontend setup where both apps are served from the same domain):
+
+// Microfrontend explanation-->
+"Same page, same origin" is a completely different setup: both apps are actually part of the same website — same domain, same "house" — even though two separate teams built them as two separate projects and each deploys on its own schedule. Maybe one team owns the dashboard code and another owns a settings widget, but both end up served from myapp.com. Because the browser's isolation rule is based purely on domain, not on who wrote the code or when it was deployed, the browser doesn't see two strangers here at all — it sees two people already standing in the same room. There's no locked door between them to begin with.
+Since there's no lock, there's no need for the whole "write the recipient's name, check the sender's identity" ceremony that postMessage requires. They can just talk directly:
+Custom events is like one person simply saying something out loud in that shared room. One app runs window.dispatchEvent(new CustomEvent('cart-updated', { detail: cart })) — that's just speaking. The other app, if it's listening (window.addEventListener('cart-updated', ...),) hears it. No permission needed, because they're already both allowed to be in that room.
+BroadcastChannel is the same idea but for when the "same website" is open in more than one place — like two separate browser tabs, both showing myapp.com. It's a walkie-talkie channel that only works between tabs/windows of that same site — you tune both ends to the same channel name, and anything said on it is heard everywhere that's tuned in, but never leaks out to a different website.
+//
 - Custom DOM events, or a shared `EventTarget` instance, dispatched/listened to on `window` — simple, no security ceremony needed since both apps already trust each other's origin.
 - The `BroadcastChannel` API — purpose-built for same-origin messaging across tabs, windows, or frames; simpler than the older `storage`-event trick.
 - `localStorage`/`sessionStorage` plus the `storage` event — works, but the event only fires in *other* tabs/windows, never the one that made the change, which is a common source of confusion.
