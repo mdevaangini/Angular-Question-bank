@@ -31,7 +31,7 @@ Even with the offending library safely outside the zone, other legitimate things
 
 If you only re-enter the zone for the specific moments that actually need Angular to know about them (e.g., the user clicked a data point and you need to update Angular-bound state), you do it explicitly with `ngZone.run(() => { ... })` inside the library's callback.
 
-## 4. Example
+## 4. Example  --> https://stackblitz.com/edit/angular-uxwbnmre?file=src%2Fapp%2Fcd-counter-onpush.component.ts
 
 ```typescript
 // chart-wrapper.component.ts
