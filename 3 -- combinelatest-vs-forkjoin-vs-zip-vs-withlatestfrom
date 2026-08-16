@@ -46,7 +46,8 @@ Without four distinct operators, you'd be manually reimplementing this timing lo
 - If `other$` hasn't emitted yet at all, nothing is emitted (there's no "latest" to grab).
 - `other$` emitting on its own, with no corresponding `source$` emission, produces *no* output — it's purely a passive lookup.
 
-## 4. Example  --> https://stackblitz.com/edit/m7ueqfyc?file=src%2Fapp%2Fcombine-latest-demo.component.ts,src%2Fapp%2Fwith-latest-from-demo.component.ts
+## 4. Example  --> v1 ->https://stackblitz.com/edit/m7ueqfyc?file=src%2Fapp%2Fcombine-latest-demo.component.ts,src%2Fapp%2Fwith-latest-from-demo.component.ts
+               --> v2 -> with same source and errors included -> https://stackblitz.com/edit/wmkcxzp2?file=src%2Fapp%2Fwith-latest-from-demo.component.ts
 
 ```typescript
 import { combineLatest, forkJoin, zip, of, Subject } from 'rxjs';
