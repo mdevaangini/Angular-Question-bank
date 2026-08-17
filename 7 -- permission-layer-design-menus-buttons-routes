@@ -1,0 +1,277 @@
+# Designing a Permission Layer — Menus, Buttons, and Routes
+
+## 1. What is it?
+
+A permission layer is the set of pieces that make an app's UI (and, critically, its route access) consistently respect a user's authorization — driven by data the backend returns after login, not hardcoded per screen. The question specifies the API returns "role and allowed menu items" after login; a robust design treats that as two related but distinct pieces of data:
+
+- **Coarse-grained access** — which menu items / routes / screens a user can reach at all (`menuItems: string[]`).
+- **Fine-grained access** — which individual actions/controls within a screen they're allowed to use (`actions: string[]`, e.g. `user.delete`, `report.export`).
+
+The permission layer needs exactly three enforcement points wired to a single shared source of truth: a **route guard** (blocks navigation), a **structural directive** (hides/shows individual UI controls), and a **dynamically rendered menu** (doesn't show links to places the user can't go in the first place).
+
+## 2. Why introduced? (why this is a real design problem, not just an if-check)
+
+The naive approach — sprinkling `*ngIf="user.role === 'admin'"` through templates and one-off route guards per feature — breaks down fast in a real app:
+
+- **Role checks scattered everywhere** means adding a new role or changing what a role can do requires hunting through every component that has a role check, instead of changing one place.
+- **No single source of truth** — the sidebar might show a link that the route guard doesn't actually protect (or vice versa), because two different developers implemented them independently at different times.
+- **Coupling UI visibility to business logic** (`role === 'admin' || role === 'manager'`) instead of to a specific capability makes it impossible to give one manager an extra permission without inventing a new role.
+- **Security theater**: hiding a button is not the same as blocking the action — if the route guard doesn't independently enforce the same rule, a user can just type the URL.
+
+Designing this as a layer — one service holding permission state, one guard, one directive, all driven by the same backend-issued data — solves all four problems at once and is the standard pattern in production Angular apps.
+
+## 3. How does it work?
+
+**Data contract from the login API:**
+
+```typescript
+interface PermissionsPayload {
+  role: 'admin' | 'manager' | 'viewer';
+  menuItems: string[]; // coarse-grained: which routes/sidebar links are reachable
+  actions: string[];   // fine-grained: which individual buttons/controls render
+}
+```
+
+**The four pieces, and how they connect:**
+
+1. **`PermissionsService`** — the single source of truth. Holds the current payload (Angular signal), populated once by `AuthService.login()` right after the API call resolves. Exposes `hasMenu(key)`, `hasAction(key)`, and a `visibleMenu` computed signal (the full menu registry filtered down to what this user's `menuItems` includes).
+2. **`permissionGuard`** (a single, reusable `CanActivateFn`) — routes opt in by declaring `data: { menuKey: 'users' }`. The guard reads that key off the route and checks it against `PermissionsService.hasMenu()`. No route needs a bespoke guard class; adding a new protected route is one line of route config.
+3. **`HasPermissionDirective`** (`*appHasPermission="'user.delete'"`) — structurally identical to `*ngIf`, but checks `PermissionsService.hasAction()`. Gates individual buttons/controls independent of which route they're on.
+4. **Dynamic menu rendering** — the sidebar iterates `permissions.visibleMenu()` instead of a hardcoded list with `*ngIf`s on each link. The menu registry (all *known* menu items, with their labels/paths) lives in code; which subset is *visible* comes entirely from the backend response.
+
+**Why this design, specifically:**
+- Splitting `menuItems` (routes/navigation) from `actions` (buttons/controls) mirrors how real backends usually model this and lets a route be reachable while still hiding specific actions inside it (e.g., a manager can view Reports but not export them) — one flat list of strings can't express that distinction cleanly.
+- One data-driven guard function instead of N guard classes means the *policy* (what menuKey maps to what route) lives entirely in the route config, which is reviewable in one file.
+- The directive re-evaluates via an Angular `effect()` watching the permission signal — not just on its own input binding changing — so if the app ever needs to refresh permissions without a full reload (e.g. after an admin changes someone's role mid-session), every gated button updates automatically.
+
+**The critical security point:** the route guard and the directive are both **client-side, UX-layer enforcement**. They stop the Angular app from *rendering* a screen or control the user shouldn't see — they do **not**, and cannot, stop a user from calling the underlying API directly (via curl, devtools, a modified request). **The backend must independently re-validate every request against the same role/permission rules.** The client-side permission layer's job is to make the legitimate UI experience match what the backend will actually allow — never to be the only check.
+
+## 4. Example   -->  https://stackblitz.com/edit/angular-e7f7r9hq-nqopp5hj?file=src%2Fapp%2Fapp.component.ts
+
+```typescript
+// permissions.service.ts — single source of truth
+import { Injectable, computed, signal } from '@angular/core';
+import { MENU_REGISTRY, MenuEntry, PermissionsPayload } from './models';
+
+const STORAGE_KEY = 'demo_permissions';
+
+@Injectable({ providedIn: 'root' })
+export class PermissionsService {
+  private state = signal<PermissionsPayload | null>(null);
+
+  readonly isLoaded = computed(() => this.state() !== null);
+  readonly role = computed(() => this.state()?.role ?? null);
+
+  readonly visibleMenu = computed<MenuEntry[]>(() => {
+    const current = this.state();
+    if (!current) return [];
+    return MENU_REGISTRY.filter((item) => current.menuItems.includes(item.key));
+  });
+
+  constructor() {
+    const raw = sessionStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      try { this.state.set(JSON.parse(raw)); }
+      catch { sessionStorage.removeItem(STORAGE_KEY); }
+    }
+  }
+
+  setPermissions(payload: PermissionsPayload) {
+    this.state.set(payload);
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+  }
+
+  clear() {
+    this.state.set(null);
+    sessionStorage.removeItem(STORAGE_KEY);
+  }
+
+  hasMenu(key: string): boolean {
+    return this.state()?.menuItems.includes(key) ?? false;
+  }
+
+  hasAction(key: string): boolean {
+    return this.state()?.actions.includes(key) ?? false;
+  }
+}
+```
+
+```typescript
+// permission.guard.ts — one reusable, data-driven guard
+import { inject } from '@angular/core';
+import { CanActivateFn, Router } from '@angular/router';
+import { PermissionsService } from './permissions.service';
+
+export const permissionGuard: CanActivateFn = (route) => {
+  const permissions = inject(PermissionsService);
+  const router = inject(Router);
+
+  if (!permissions.isLoaded()) {
+    return router.parseUrl('/login');
+  }
+
+  const requiredMenuKey = route.data['menuKey'] as string | undefined;
+  if (requiredMenuKey && !permissions.hasMenu(requiredMenuKey)) {
+    return router.parseUrl('/unauthorized');
+  }
+
+  return true;
+};
+```
+
+```typescript
+// has-permission.directive.ts — fine-grained button/control gating
+import { Directive, Input, TemplateRef, ViewContainerRef, effect, inject } from '@angular/core';
+import { PermissionsService } from './permissions.service';
+
+@Directive({ selector: '[appHasPermission]', standalone: true })
+export class HasPermissionDirective {
+  private permissions = inject(PermissionsService);
+  private viewContainer = inject(ViewContainerRef);
+  private templateRef = inject(TemplateRef<unknown>);
+  private hasView = false;
+  private action = '';
+
+  @Input() set appHasPermission(action: string) {
+    this.action = action;
+    this.updateView();
+  }
+
+  constructor() {
+    effect(() => {
+      this.permissions.role(); // subscribe to permission-set changes
+      this.updateView();
+    });
+  }
+
+  private updateView() {
+    const allowed = this.permissions.hasAction(this.action);
+    if (allowed && !this.hasView) {
+      this.viewContainer.createEmbeddedView(this.templateRef);
+      this.hasView = true;
+    } else if (!allowed && this.hasView) {
+      this.viewContainer.clear();
+      this.hasView = false;
+    }
+  }
+}
+```
+
+```typescript
+// app.routes.ts — the policy lives here, in one readable place
+export const routes: Routes = [
+  { path: 'login', loadComponent: () => import('./login.component').then((m) => m.LoginComponent) },
+  { path: 'unauthorized', loadComponent: () => import('./unauthorized.component').then((m) => m.UnauthorizedComponent) },
+  {
+    path: '',
+    component: ShellComponent,
+    canActivate: [permissionGuard], // just "logged in at all"
+    children: [
+      { path: 'dashboard', data: { menuKey: 'dashboard' }, canActivate: [permissionGuard], loadComponent: () => import('./dashboard.component').then((m) => m.DashboardComponent) },
+      { path: 'users', data: { menuKey: 'users' }, canActivate: [permissionGuard], loadComponent: () => import('./users.component').then((m) => m.UsersComponent) },
+      { path: 'reports', data: { menuKey: 'reports' }, canActivate: [permissionGuard], loadComponent: () => import('./reports.component').then((m) => m.ReportsComponent) },
+      { path: 'settings', data: { menuKey: 'settings' }, canActivate: [permissionGuard], loadComponent: () => import('./settings.component').then((m) => m.SettingsComponent) },
+      { path: '', redirectTo: 'dashboard', pathMatch: 'full' },
+    ],
+  },
+  { path: '**', redirectTo: 'login' },
+];
+```
+
+```typescript
+// sidebar (inside shell.component.ts) — renders only what the backend allowed
+template: `
+  <nav>
+    <a *ngFor="let item of permissions.visibleMenu()" [routerLink]="item.path" routerLinkActive="active">
+      {{ item.label }}
+    </a>
+  </nav>
+`
+```
+
+```typescript
+// usage inside a page component
+template: `
+  <button *appHasPermission="'user.create'">+ Create user</button>
+  <button *appHasPermission="'user.delete'" class="danger">Delete</button>
+`
+```
+
+## 5. Example Explanation — Execution Flow
+
+1. User submits login → `AuthService.login()` calls the API → response `{ role, menuItems, actions }` is passed straight into `PermissionsService.setPermissions()`, which updates the signal and persists a copy to `sessionStorage`. The whole permission layer is now populated before any authenticated screen renders.
+2. User navigates to `/users` (by clicking the sidebar, or typing the URL directly). Angular's router evaluates `permissionGuard` for every matched route segment that declares it — first the parent shell route (checks `isLoaded()` only), then the `users` child route (checks `hasMenu('users')`).
+3. If the check fails, the guard returns a `UrlTree` (`router.parseUrl('/unauthorized')`) instead of `true` — Angular treats this as "redirect here instead," cancelling the original navigation. This is why it works identically whether the user clicked a sidebar link or typed the URL: the guard runs on the *route*, not on how navigation was triggered.
+4. If the check passes, the route's component loads (lazily, via `loadComponent`) and renders. Inside it, every `*appHasPermission="'...'"` directive independently checks `hasAction()` against the same `PermissionsService` and creates or clears its embedded view accordingly — same pattern as `*ngIf`, just backed by permission data instead of a plain boolean.
+5. The sidebar itself never hardcodes which links exist per role — it iterates `permissions.visibleMenu()`, a computed signal that filters the full menu registry down to whatever the current `menuItems` list contains. Log in as a different mock user (verified live: Admin sees all four menu links and both `user.create`/`user.delete` buttons; Viewer sees only "Dashboard" and no action buttons at all) and the sidebar, the buttons, and route access all update together — because they all read from the one signal.
+6. Verified live: typing `/users` directly (via a raw link that bypasses the sidebar entirely) while logged in as Viewer immediately redirects to `/unauthorized` — proving the guard, not sidebar hiding, is the actual enforcement point.
+
+## 6. When to use?
+
+This exact shape (service + guard + directive + dynamic menu, all backend-driven) is the right default any time: role/permission data can vary per user or per organization, there's more than a couple of roles or the plan is to add more later, or actions within a screen need finer control than "can see this page." For a genuinely tiny app with exactly two fixed roles and no expectation of growth, a simpler `*ngIf="isAdmin"` sprinkled around might be pragmatic short-term — but that's a scale trade-off to make consciously, not a default, since it's exactly the pattern that becomes painful the moment a third role or a finer-grained rule shows up.
+
+## 7. Advantages / Disadvantages
+
+**Advantages:**
+- One source of truth (`PermissionsService`) — no risk of the sidebar, the guard, and a button disagreeing about what's allowed.
+- Adding a new protected route is one line of route config (`data: { menuKey: '...' }`), not a new guard class.
+- Adding a new gated button is one directive usage, not a new `*ngIf` expression referencing role names.
+- Backend can add new menu items or actions without any frontend deploy, as long as the menu registry already knows about that key (or the registry itself becomes backend-driven for full dynamism).
+- Fine-grained (`actions`) vs coarse-grained (`menuItems`) separation lets "can view this page" and "can perform this action on this page" evolve independently.
+
+**Disadvantages / trade-offs:**
+- More upfront pieces to build than a quick `*ngIf` — not worth it for a two-screen prototype.
+- The menu registry (labels, paths, icons) still lives in frontend code — a fully backend-driven UI (backend also dictates labels/order) is a further step beyond this design, with its own added complexity.
+- Client-side guard/directive checks can lag behind a permission change made server-side mid-session unless the app explicitly re-fetches permissions (e.g., via a periodic refresh or on next navigation) — the guard only checks the cached `PermissionsService` state, not a live API call on every navigation.
+- If the menu registry and backend `menuItems` keys drift out of sync (someone renames a key on one side and not the other), a menu item silently disappears — worth covering with an integration test or a shared constants file if both sides are in the same monorepo.
+
+## 8. Common Interview Traps
+
+- Treating "hide the button" as the security fix — the interviewer is testing whether you say the backend must independently enforce every permission on every request. Client-side checks are UX, not a security boundary.
+- Writing one bespoke `CanActivate` class per protected route instead of a single data-driven guard — works, but doesn't scale and duplicates the same logic N times.
+- Hardcoding role checks (`role === 'admin' || role === 'manager'`) instead of checking a specific action/capability — breaks the moment permissions need to be assigned more granularly than by role name.
+- Forgetting that hiding a sidebar link and blocking the route are two *separate* mechanisms that must both be wired up — a common bug is a menu correctly filtered but the guard missing on that specific route (or vice versa), leaving either a dead link or an unprotected URL.
+- Not persisting permissions across a page refresh, or persisting them without a plan for staleness (a role changed server-side won't be reflected client-side until the next login or explicit re-fetch) — worth mentioning `APP_INITIALIZER` / a `/me` re-fetch on app bootstrap as the more robust alternative to trusting a long-lived cached copy.
+- Confusing authentication (who are you) with authorization (what are you allowed to do) — the guard here assumes the user is already authenticated; `isLoaded()` is really "do we have a permission set," which typically implies a valid session, but a real app usually has a separate `authGuard` for "is there a valid token at all" layered before this one.
+
+## 9. Interview Follow-up Questions
+
+**Q1: What happens if the backend changes a user's role while they're actively using the app?**
+With this design, nothing changes until the next login or an explicit re-fetch — `PermissionsService` only updates when `setPermissions()` is called. For apps where this matters (e.g., an admin revoking access should take effect quickly), you'd add either a periodic re-fetch of a `/me`-style endpoint, or have the backend push an invalidation event (WebSocket/SSE) that triggers `PermissionsService` to refresh, or simply re-check permissions server-side on every API call regardless (which you must do anyway) and have the client redirect/re-auth on a 403 response.
+
+**Q2: Why use `sessionStorage` here instead of `localStorage`, and is storing this client-side safe at all?**
+`sessionStorage` clears when the tab closes, which is a reasonable default for cached UI-state like this (versus `localStorage` persisting indefinitely across sessions). Storing role/menuItems/actions client-side is generally fine since none of it is a secret — it's the same information the API already told the browser it's allowed to know. What must never be cached this casually is the actual auth token/credentials — those need their own, more careful storage and expiry strategy (and ideally an httpOnly cookie rather than JS-accessible storage at all, to reduce XSS exposure).
+
+**Q3: How would you unit test the guard and the directive without hitting a real API?**
+`PermissionsService` is a single injectable with plain methods (`hasMenu`, `hasAction`) — in a guard test, provide a fake `PermissionsService` (or a real instance with `setPermissions()` called directly with test data) via TestBed, then call the guard function with a mock `ActivatedRouteSnapshot` carrying the `data.menuKey` you want to test, and assert on the return value (`true` vs a `UrlTree`). The directive can be tested similarly by rendering a host test component with the directive applied and asserting the embedded view is/isn't created after setting different permission payloads.
+
+**Q4: What if a menu item should be visible but disabled (not hidden) when unauthorized, e.g. to advertise a paid feature?**
+That's a different UX requirement from what `*appHasPermission` does (which removes the element from the DOM entirely, like `*ngIf`). You'd add a separate check — e.g. an attribute directive that toggles a `disabled` state and a tooltip instead of adding/removing the element — since "hidden entirely" and "visible but locked" are genuinely different behaviors that shouldn't share the same directive.
+
+**Q5: How does this interact with lazy-loaded feature modules/routes?**
+Cleanly — `canActivate: [permissionGuard]` combined with `loadComponent`/`loadChildren` means the guard runs *before* the lazy chunk is even fetched, so an unauthorized user never downloads code for a screen they can't see, in addition to never rendering it.
+
+## 10. Interview-Ready Answer
+
+"I'd build this as a small permission layer with one shared source of truth, not scattered role checks. After login, the API's response — role, menuItems, actions — populates a `PermissionsService` holding that state in a signal. `menuItems` drives coarse-grained access: which routes exist and which sidebar links render, filtering a static menu registry down to whatever the backend allowed rather than hardcoding visibility per role. `actions` drives fine-grained access: individual buttons and controls, gated by a structural directive — `*appHasPermission="'user.delete'"` — that works exactly like `*ngIf` but checks the permission service instead of a boolean.
+
+Routes opt into protection declaratively via route `data`, e.g. `data: { menuKey: 'users' }`, checked by a single reusable functional guard rather than one guard class per route — so adding a new protected route is one line of config, not new code. The guard redirects to `/login` if nothing's loaded yet, or `/unauthorized` if the required menu key isn't in the user's list — and critically, this runs identically whether the user clicked a sidebar link or typed the URL directly, which is what actually makes it a security boundary rather than just a UI nicety.
+
+The one thing I'd always flag explicitly: none of this — the guard, the directive, the hidden sidebar link — is a real security boundary on its own. It's all client-side UX matching what the backend will actually allow. The API has to independently re-validate every request against the same role/permission rules, because anyone can bypass the Angular app entirely and hit the API directly."
+
+## 11. Quick Revision
+
+- Split permission data into `menuItems` (coarse: routes/navigation) and `actions` (fine: buttons/controls) — one flat role string can't express both.
+- `PermissionsService` (signals) = single source of truth; guard, directive, and sidebar all read from it, nothing else hardcodes role checks.
+- One reusable `CanActivateFn`, data-driven via `route.data['menuKey']` — not one guard class per route.
+- `*appHasPermission="'action.key'"` = structural directive, same shape as `*ngIf`, checks `hasAction()`.
+- Sidebar renders `visibleMenu` (a computed signal filtering a static menu registry by the backend's `menuItems`) — never a hardcoded per-role list.
+- The guard blocks direct URL navigation identically to blocking a sidebar click — that's what makes it real enforcement, not just hiding a link.
+- Client-side enforcement is UX only — the backend MUST independently re-check permissions on every request.
+- Persist permissions (session-scoped) for refresh continuity, but plan for staleness — a server-side role change won't reflect client-side until re-fetch/re-login.
+- Lazy-loading (`loadComponent`) + `canActivate` together means unauthorized users never even download a restricted screen's code.
+
+## 12. Memory Trick
+
+**"One backend answer, three mirrors."**
+The login API gives one answer — role, menuItems, actions. The sidebar, the route guard, and the button directive are three mirrors all reflecting that same answer back in different shapes: the sidebar reflects it as "which links show," the guard reflects it as "which URLs are allowed," the directive reflects it as "which buttons render." If you ever find yourself writing a *fourth* place that independently decides what a role can do, you've broken the mirror — route it back through `PermissionsService` instead.
