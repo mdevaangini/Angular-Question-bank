@@ -66,14 +66,14 @@ This compiles down to essentially the same constructor-function + `.prototype` m
 
 **class vs constructor function — the real differences:**
 
-| | Constructor function | `class` |
+|                                | Constructor function | `class` |
 |---|---|---|
-| Hoisting | Function declarations are hoisted and usable before definition | Classes are hoisted but land in the "temporal dead zone" — using before declaration throws |
-| Calling without `new` | Silently runs with `this` as `undefined`/global object (non-strict) — a common bug source | Throws `TypeError: Class constructor cannot be invoked without 'new'` |
-| Strict mode | Not automatic | Class bodies are always implicitly strict mode |
-| Enumerability of methods | Methods added via `Function.prototype.method = ...` are enumerable by default (show up in `for...in`) | Methods defined in a class body are **non-enumerable** by default |
-| Syntax for inheritance | Manual: `Child.prototype = Object.create(Parent.prototype)` + `Parent.call(this, ...)` | Declarative: `extends` + `super()` |
-| Static members | Attached manually: `Dog.staticMethod = ...` | `static` keyword |
+| Hoisting                       | Function declarations are hoisted and usable before definition | Classes are hoisted but land in the "temporal dead zone" — using before declaration throws |
+| Calling without `new`          | Silently runs with `this` as `undefined`/global object (non-strict) — a common bug source | Throws `TypeError: Class constructor cannot be invoked without 'new'` |
+| Strict mode                    | Not automatic | Class bodies are always implicitly strict mode |
+| Enumerability of methods       | Methods added via `Function.prototype.method = ...` are enumerable by default (show up in `for...in`) | Methods defined in a class body are **non-enumerable** by default |
+| Syntax for inheritance         | Manual: `Child.prototype = Object.create(Parent.prototype)` + `Parent.call(this, ...)` | Declarative: `extends` + `super()` |
+| Static members                 | Attached manually: `Dog.staticMethod = ...` | `static` keyword |
 
 ## 4. Example
 
