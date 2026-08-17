@@ -1,0 +1,256 @@
+# Settings Dialog Memory Leak — Third-Party Rich-Text Editor
+
+## 1. What is it?
+
+QA's repro (open the settings dialog, close it, repeat 20 times, memory doubles) describes a classic **detached DOM / lingering reference leak**. Angular correctly removes the dialog's component tree from the visible page each time it's closed, but something the third-party rich-text editor set up when it initialized is still holding a reference to that component (and therefore to its DOM node) from **outside** Angular's control — so the JavaScript garbage collector can never reclaim it. Repeat the cycle 20 times and you get 20 fully detached, but still-reachable, copies of the entire editor + its DOM subtree sitting in memory.
+
+This is not an Angular bug — it's what happens whenever a non-Angular-aware library (or code written by hand) acquires a resource in a component's `ngOnInit` and nobody releases it in `ngOnDestroy`.
+
+## 2. Why does this happen? (why third-party editors specifically)
+
+Angular's own bindings and event listeners (`(click)="..."` in a template, `@Input`/`@Output`, etc.) are automatically torn down when a component is destroyed — Angular owns that wiring end to end. But rich-text editors like TinyMCE, CKEditor, Froala, or Quill are **not** Angular-aware; they're vanilla-JS libraries doing their own DOM manipulation and event handling underneath an Angular wrapper component. To do their job, they typically:
+
+- Attach listeners directly to `document`/`window` (e.g., "click outside closes the floating toolbar," global keyboard shortcuts, selection-change tracking) — Angular has no idea these exist and cannot clean them up for you.
+- Keep their **own internal instance registry** (e.g., TinyMCE's `tinymce.editors` array, CKEditor's instance manager) so the library can look up "which editor is this toolbar button for" — if you never call the library's official destroy method, your instance sits in that array forever.
+- Start their own timers (autosave polling, animation loops, `ResizeObserver`/`MutationObserver` watchers).
+- Hold a large internal document model / undo-history buffer.
+
+Every one of these is a **GC root** completely outside Angular's lifecycle. Angular removing the component from its own view tree does nothing to release any of them — you have to explicitly reverse each one yourself, in `ngOnDestroy`, mirroring exactly what was set up in `ngOnInit`/`ngAfterViewInit`.
+
+## 3. How does it work? (root cause + how to diagnose it)
+
+**Why it leaks, mechanically:** JavaScript's garbage collector is reachability-based — an object is only collected once nothing reachable from a GC root (global scope, active closures, event listener tables, timers) points to it anymore. If `document.addEventListener('click', handler)` was called with a `handler` that's a closure referencing `this` (the component instance), then `document` — which lives for the entire life of the page — holds a permanent reference to that closure, which holds a permanent reference to `this`, which holds a permanent reference to `this.host.nativeElement` (the DOM node). Angular removing that node from the visible `<body>` tree doesn't matter: the node is **detached from the page** but still **reachable from `document`'s listener table**, so it counts as "alive" to the GC and is never freed. The same logic applies to a `setInterval` callback closure, or an entry sitting in a library's own internal `Set`/array of instances.
+
+**How you'd actually diagnose this in a real app (Chrome DevTools):**
+1. Open DevTools → Memory tab → take a heap snapshot.
+2. Open/close the dialog ~20 times (matching QA's repro).
+3. Take a second heap snapshot, use the "Comparison" view.
+4. Filter for "Detached" — Chrome specifically flags DOM nodes that are disconnected from the document but still referenced (`Detached HTMLDivElement`, etc.). Seeing a growing count here, roughly matching your open/close count, confirms the leak.
+5. Click into one of the detached nodes and look at its **retainers** tree (who's holding a reference to it) — this walks you straight to the culprit: you'll typically see a chain like `(closure) → clickHandler → Window/document's click listeners` or `EditorRegistry (Set) → LeakyEditorComponent → nativeElement`. That retainer chain **is** the bug report; whatever's at the top of it is what you need to release in `ngOnDestroy`.
+
+**The fix, mechanically:** mirror every acquisition in `ngOnInit` with a matching release in `ngOnDestroy` — same reference, removed the same way it was added:
+
+```typescript
+document.removeEventListener('click', this.clickHandler); // same function reference
+clearInterval(this.autosaveTimer);
+myEditorRegistry.delete(this); // or the library's official .destroy()/.remove() API
+this.largeBuffer = null; // release explicit references too
+```
+
+For a **real** third-party editor, this is almost always exposed as one official cleanup call — e.g., TinyMCE's `editor.destroy()`, CKEditor's `editor.destroy()` (returns a Promise), Quill doesn't ship a built-in destroy but you'd manually remove your own attached listeners and null your reference to the Quill instance. **Always check the library's docs for the official destroy/teardown API first** — it typically handles its own internal listeners/timers/registry entries for you; you're only responsible for anything **you personally** added on top (like a wrapper-level document click listener).
+
+## 4. Example   --> https://stackblitz.com/edit/angular-b7uawmuy-xhuhhdza?file=src%2Fapp%2Fapp.component.ts
+
+```typescript
+// editor-registry.service.ts — stands in for a third-party editor's own
+// internal instance tracker (e.g. TinyMCE's `tinymce.editors`).
+import { Injectable } from '@angular/core';
+
+export interface RegistryStats {
+  liveInstances: number;
+  documentListeners: number;
+  activeIntervals: number;
+  retainedBytesApprox: number;
+}
+
+@Injectable({ providedIn: 'root' })
+export class EditorRegistryService {
+  private instances = new Set<object>();
+  private listenerCount = 0;
+  private intervalCount = 0;
+  private retainedBytes = 0;
+
+  register(instance: object, approxBytes: number) {
+    this.instances.add(instance);
+    this.retainedBytes += approxBytes;
+  }
+  unregister(instance: object, approxBytes: number) {
+    this.instances.delete(instance);
+    this.retainedBytes -= approxBytes;
+  }
+  listenerAdded() { this.listenerCount++; }
+  listenerRemoved() { this.listenerCount--; }
+  intervalAdded() { this.intervalCount++; }
+  intervalRemoved() { this.intervalCount--; }
+
+  getStats(): RegistryStats {
+    return {
+      liveInstances: this.instances.size,
+      documentListeners: this.listenerCount,
+      activeIntervals: this.intervalCount,
+      retainedBytesApprox: this.retainedBytes,
+    };
+  }
+}
+```
+
+```typescript
+// leaky-editor.component.ts — THE BUG. Sets up 3 GC roots, releases none.
+import { Component, ElementRef, OnInit } from '@angular/core';
+import { EditorRegistryService } from './editor-registry.service';
+
+@Component({
+  selector: 'app-leaky-editor',
+  standalone: true,
+  template: `
+    <div class="editor-shell">
+      <div class="toolbar">B <i>I</i> <u>U</u> — mock rich-text toolbar</div>
+      <div class="editor-body">Start typing your settings notes…</div>
+    </div>
+  `,
+})
+export class LeakyEditorComponent implements OnInit {
+  private clickHandler = () => {
+    // pretend to close a floating toolbar/menu on outside click
+  };
+  private autosaveTimer: ReturnType<typeof setInterval> | undefined;
+  private buffer: string[] | null = new Array(50_000).fill('x'); // ~100KB stand-in for the editor's document model
+
+  constructor(private registry: EditorRegistryService, private host: ElementRef) {}
+
+  ngOnInit() {
+    document.addEventListener('click', this.clickHandler);
+    this.registry.listenerAdded();
+
+    this.autosaveTimer = setInterval(() => {}, 500);
+    this.registry.intervalAdded();
+
+    this.registry.register(this, (this.buffer?.length ?? 0) * 2);
+  }
+
+  // NOTE: no ngOnDestroy at all — this is the bug.
+}
+```
+
+```typescript
+// fixed-editor.component.ts — THE FIX. ngOnDestroy mirrors ngOnInit exactly.
+import { Component, ElementRef, OnDestroy, OnInit } from '@angular/core';
+import { EditorRegistryService } from './editor-registry.service';
+
+@Component({
+  selector: 'app-fixed-editor',
+  standalone: true,
+  template: `
+    <div class="editor-shell">
+      <div class="toolbar">B <i>I</i> <u>U</u> — mock rich-text toolbar</div>
+      <div class="editor-body">Start typing your settings notes…</div>
+    </div>
+  `,
+})
+export class FixedEditorComponent implements OnInit, OnDestroy {
+  private clickHandler = () => {};
+  private autosaveTimer: ReturnType<typeof setInterval> | undefined;
+  private buffer: string[] | null = new Array(50_000).fill('x');
+
+  constructor(private registry: EditorRegistryService, private host: ElementRef) {}
+
+  ngOnInit() {
+    document.addEventListener('click', this.clickHandler);
+    this.registry.listenerAdded();
+
+    this.autosaveTimer = setInterval(() => {}, 500);
+    this.registry.intervalAdded();
+
+    this.registry.register(this, (this.buffer?.length ?? 0) * 2);
+  }
+
+  ngOnDestroy() {
+    // 1. Remove the exact listener reference that was added.
+    document.removeEventListener('click', this.clickHandler);
+    this.registry.listenerRemoved();
+
+    // 2. Stop the polling timer — its closure keeps `this` alive otherwise.
+    clearInterval(this.autosaveTimer);
+    this.registry.intervalRemoved();
+
+    // 3. Unregister from the library's own instance tracker.
+    this.registry.unregister(this, (this.buffer?.length ?? 0) * 2);
+
+    // 4. Release the large internal buffer explicitly too.
+    this.buffer = null;
+  }
+}
+```
+
+The dialog host toggles between these two via `*ngIf` on an `@Input() mode: 'leaky' | 'fixed'`, exactly like a real settings dialog opening/closing.
+
+## 5. Example Explanation — Execution Flow
+
+1. User clicks "Open settings" → parent sets `dialogOpen = true` → `*ngIf="dialogOpen"` instantiates `SettingsDialogComponent`, which in turn instantiates either `LeakyEditorComponent` or `FixedEditorComponent` based on `mode`.
+2. That editor component's `ngOnInit` runs: attaches a `document` click listener, starts a `setInterval`, registers itself (and its ~100KB buffer) in the shared `EditorRegistryService`.
+3. User clicks the dialog's close button → parent sets `dialogOpen = false` → Angular destroys `SettingsDialogComponent` and everything inside it, including the editor component. Angular removes the DOM nodes from the page and runs `ngOnDestroy` **if the component implements it**.
+4. **Leaky path:** `LeakyEditorComponent` has no `ngOnDestroy`. The `document` listener, the `setInterval`, and the registry `Set` entry all still hold live references to the now-detached component instance. Repeating steps 1–3 twenty times produces 20 permanently-leaked instances — exactly matching QA's "memory doubles every 20 opens" symptom. In the live demo, the stats panel's counters climb 1-for-1 with every leaky open/close cycle and never come back down (confirmed live: 20 cycles → 19–20 live instances, 19–20 listeners, 19–20 intervals, ~1.8–1.9MB retained, all nonzero after the dialog is fully closed).
+5. **Fixed path:** `FixedEditorComponent`'s `ngOnDestroy` runs synchronously as part of the same destroy call — it removes the listener, clears the interval, and unregisters from the Set before the reference to `this` disappears. Repeating the cycle 20 times produces **zero net change** in the stats — confirmed live: running the fixed cycle 20 times after the leaky cycle left the numbers completely unchanged (each open added, and each close correctly removed, so the running total stayed flat), and starting from a clean reset, a single fixed open/close cycle went from 0 → 1/1/1/98KB → back to exactly 0/0/0/0KB.
+
+## 6. When to use (this cleanup discipline)?
+
+Any time a component's `ngOnInit`/`ngAfterViewInit` acquires a resource that lives **outside** Angular's own reactive/binding system, `ngOnDestroy` must release it. This applies to:
+- Any third-party widget/library wrapper (rich-text editors, charting libraries, map widgets, video players) — always call the library's official destroy/dispose API if one exists.
+- Manually-attached `document`/`window` listeners (`addEventListener` called directly, not via Angular's `(event)` binding).
+- `setInterval`/`setTimeout` handles.
+- `ResizeObserver`/`MutationObserver`/`IntersectionObserver` instances (`.disconnect()`).
+- RxJS subscriptions created manually with `.subscribe()` instead of the `async` pipe (unsubscribe, or better, use `takeUntilDestroyed()`).
+- WebSocket connections, `EventSource` instances.
+
+You do **not** need to do this for anything Angular manages itself — template event bindings, `@Input`/`@Output`, Angular's own DI-provided services with `providedIn: 'root'` (those are meant to live for the app's lifetime).
+
+## 7. Advantages / Disadvantages
+
+**Advantages of disciplined `ngOnDestroy` cleanup:**
+- Predictable, bounded memory usage regardless of how many times a component is mounted/unmounted — critical for long-lived SPA sessions (users who leave a tab open for hours, dashboards, admin panels).
+- Makes the component's resource contract explicit and reviewable — anyone reading the file sees exactly what it acquires and confirms it's released.
+- Avoids secondary symptoms: leaked `setInterval`s keep firing and doing (sometimes expensive) work forever; leaked listeners can fire logic against stale/detached state, causing subtle bugs beyond just memory growth.
+
+**Disadvantages / costs:**
+- Extra boilerplate — every `ngOnInit` acquisition needs a mirrored `ngOnDestroy` release; easy to forget when a component picks up a new side effect later without updating the destroy hook.
+- Third-party library quirks: some libraries' destroy APIs are async (return a Promise), incomplete (don't clean up everything they set up), or undocumented, requiring you to reverse-engineer what needs manual cleanup on top of calling `.destroy()`.
+- Harder to catch in code review than most bugs — the app "works" perfectly during normal manual QA (open the dialog once, looks fine); it only shows up under repetition, which is exactly why QA's specific repro steps ("open and close 20 times") mattered here.
+
+## 8. Common Interview Traps
+
+- Jumping straight to "it's a memory leak, use OnPush" — change detection strategy has nothing to do with this class of bug. This is about GC reachability, not rendering performance.
+- Assuming Angular automatically cleans up anything set up in a component — Angular only manages what it created (its own view/template bindings). Anything you attach to `document`/`window`/a third-party library manually is entirely your responsibility.
+- Forgetting that the **function reference** passed to `removeEventListener` must be the exact same reference passed to `addEventListener` — `document.addEventListener('click', () => {...})` followed by `document.removeEventListener('click', () => {...})` with a **new** arrow function does **not** remove the original listener; you must store the handler as a class property (`private clickHandler = () => {...}`) and reference that same property in both calls.
+- Not knowing about `takeUntilDestroyed()` (Angular 16+) — a cleaner alternative to manually managing a `Subject<void>` + `takeUntil()` + calling `.next()`/`.complete()` in `ngOnDestroy` for RxJS subscription cleanup specifically.
+- Blaming the third-party library outright without checking its docs for an official destroy method — most maintained editor libraries do provide one; the actual bug is usually "we never called it," not "the library is unfixable."
+- Suggesting `ChangeDetectorRef.detach()` or `ngZone.runOutsideAngular()` as a fix — those address CPU/change-detection cost, not memory reachability; they wouldn't move the needle on this specific bug at all.
+
+## 9. Interview Follow-up Questions
+
+**Q1: How would you actually confirm this fix worked in a real (not simulated) app?**
+Chrome DevTools → Memory tab → take a heap snapshot before opening the dialog, open/close it N times, take another snapshot, use the comparison view, and confirm the "Detached HTMLDivElement" (and similar) counts stay flat instead of growing by N. You can also watch the "Retained Size" of your component's constructor name in the "Summary" view across repeated GC-forced snapshots (there's a trash-can/GC icon in DevTools to force a collection before snapshotting, to rule out "not yet collected" false positives).
+
+**Q2: What if the third-party editor doesn't expose an official destroy method?**
+You do what you can control: remove any listeners/timers/observers **you** personally attached in your wrapper component, and null out your own reference to the editor instance so nothing in *your* code keeps it alive. If the library itself leaks internally (keeps its own reference alive with no way to release it), that's a bug to report upstream or a reason to evaluate a different library — but you should still eliminate every leak source within your own control first, since that's usually most of the problem.
+
+**Q3: Would `ChangeDetectionStrategy.OnPush` or trackBy fix this?**
+No — those are unrelated optimizations for reducing how much/how often Angular re-renders. This bug is about objects staying reachable in memory after being logically "removed," which is a garbage-collection/reachability problem, not a rendering-frequency problem.
+
+**Q4: Why does the leak show up specifically as "memory doubles every 20 opens" rather than a slow, even climb?**
+It depends on how the demo/QA measured it — but the underlying pattern (linear growth proportional to open/close count) is the same either way. "Doubles every 20 opens" likely describes their specific measurement interval/rounding, not a fundamentally different pattern — the retained memory here grows linearly and predictably with each un-cleaned-up cycle, which is exactly why the fix (return to a flat baseline after every close) is such a clean signal that the bug is gone.
+
+**Q5: Is `takeUntilDestroyed()` relevant here, or only for RxJS subscriptions?**
+It's RxJS-specific (Angular 16+, `@angular/core/rxjs-interop`) — it automatically unsubscribes when the component/directive is destroyed, tied to Angular's `DestroyRef`. It wouldn't directly help with a raw `document.addEventListener` or `setInterval`, but if you wrapped the editor's callback-based events in an `Observable` (e.g., via `fromEvent` or a manual `Subject`), you could use it there to avoid writing manual `ngOnDestroy` unsubscribe logic for that piece specifically.
+
+## 10. Interview-Ready Answer
+
+"This is a detached DOM / lingering-reference leak, not an Angular-specific bug. The rich-text editor library, being unaware of Angular's lifecycle, attaches things outside Angular's control when the dialog opens — typically a document-level click listener for click-outside-to-close behavior, an autosave polling interval, and an entry in the library's own internal instance registry, plus a sizeable internal buffer for the document model. Angular closing the dialog removes the component from its own view tree and DOM, but none of those three external references get released automatically, because Angular didn't create them — it can't clean up what it doesn't know about. Each of those three is independently enough to keep the whole component instance, and its now-detached DOM subtree, reachable to the garbage collector forever. Open and close the dialog 20 times and you get 20 such leaked instances.
+
+I'd confirm this via Chrome DevTools' Memory tab — take heap snapshots before and after repeating the open/close cycle, filter for 'Detached' nodes in the comparison view, and follow the retainers tree on one of them, which walks straight back to the listener/interval/registry entry causing it. The fix is to implement `ngOnDestroy` in the editor wrapper component and mirror every single thing `ngOnInit` set up: `document.removeEventListener` with the exact same handler reference, `clearInterval` on the timer handle, remove the instance from whatever registry it was added to — ideally by calling the library's official destroy/dispose API if one exists, since that usually also cleans up internal state I don't have direct access to — and null out any large buffers I'm holding onto directly. I verified this pattern live: with no `ngOnDestroy`, repeated open/close cycles show numbers climbing 1-for-1 and never returning to zero; with the mirrored cleanup in place, the exact same 20-cycle test ends with every counter back at zero."
+
+## 11. Quick Revision
+
+- Symptom = detached DOM / lingering-reference leak, not a rendering or change-detection issue.
+- Root cause: third-party libraries attach things outside Angular's lifecycle (document listeners, timers, internal instance registries) that Angular can't auto-clean.
+- Any ONE of {listener, timer, registry entry} referencing the component is enough to leak the whole instance + its DOM subtree.
+- Fix = implement `ngOnDestroy`, mirror every `ngOnInit` acquisition with a matching release, same reference used for both add/remove.
+- Prefer the library's official `.destroy()`/dispose API — it usually handles its own internal cleanup; you're responsible for anything you added on top.
+- Diagnose via Chrome DevTools Memory tab: heap snapshot comparison, filter "Detached", inspect the retainers tree.
+- `removeEventListener` requires the *same function reference* as `addEventListener` — inline arrow functions defeat this.
+- `takeUntilDestroyed()` (Angular 16+) is the RxJS-specific version of this same pattern.
+- OnPush/trackBy/`runOutsideAngular` do NOT fix this — they address performance, not GC reachability.
+
+## 12. Memory Trick
+
+**"Whatever you plug in, you unplug."**
+`ngOnInit` plugging something into `document`, a timer, or an external registry is like plugging an appliance into a wall socket that isn't part of the house's own wiring (Angular's DOM). If you unplug the house's power (destroy the component's Angular-managed bindings), that external socket doesn't care — it's still live, and the appliance (your component instance + DOM node) keeps drawing power (staying in memory) forever. `ngOnDestroy` is you walking around and physically unplugging every single thing `ngOnInit` plugged in, one cord at a time.
