@@ -87,11 +87,15 @@ Animal.prototype.speak = function () {
 };
 
 function Dog(name, breed) {
-  Animal.call(this, name);       // (1) borrow Animal's constructor logic
+  Animal.call(this, name);       // (1) borrow Animal's constructor logic -> Animal.call(this, name) runs the Animal constructor's code, but with this set to the new Dog object being created — instead of creating a new object of its own. So it's just borrowing the "set this.name = name" logic. Without this line, rex.name would be undefined.
   this.breed = breed;
 }
-Dog.prototype = Object.create(Animal.prototype); // (2) link Dog.prototype -> Animal.prototype
-Dog.prototype.constructor = Dog;                 // (3) fix constructor reference
+
+
+Dog.prototype = Object.create(Animal.prototype); // (2) link Dog.prototype -> Animal.prototype -> Setting up the prototype chain -> Object.create(Animal.prototype) creates a new, empty object whose internal prototype is Animal.prototype. Assigning this to Dog.prototype means: "when JS can't find a property on a Dog instance, look on Dog.prototype, and if it's not there either, look on Animal.prototype."
+                                                 // Why not just Dog.prototype = Animal.prototype? Because then Dog.prototype and Animal.prototype would be the literal same object — adding bark to Dog.prototype would add it to Animal.prototype too, so every Animal instance would suddenly have bark. Object.create avoids that by making a fresh link instead of sharing the object.
+
+Dog.prototype.constructor = Dog;                 // (3) fix constructor reference  -> fixes a side effect: by replacing Dog.prototype entirely with a new object, you lose the automatic constructor property that normally points back to Dog. Without this line, rex.constructor would incorrectly point to Animal.
 Dog.prototype.bark = function () {
   console.log(`${this.name} barks!`);
 };
