@@ -1,0 +1,259 @@
+# Scenario: Persisting and Sharing List Filters (Orders List → Detail → Back)
+
+## 1. What is it?
+
+The scenario has two complaints that sound like two separate features but actually have **one shared root cause and one shared fix**:
+
+1. Users set filters on an orders list, navigate to an order's detail page, come back — and the filters are gone.
+2. Users want to send a teammate a link that opens the orders list with the *exact same filters already applied*.
+
+The single design that satisfies both: **make the URL's query parameters the source of truth for filter state**, instead of storing filters only in a component field, a service, or local/session storage. If `status`, search text, page number, etc. all live in the URL (`/orders?status=shipped&q=acme`), then:
+
+- Navigating away and back preserves them automatically, because the URL is what defines the view — it doesn't get wiped just because a component instance was destroyed and recreated.
+- Sharing them is free: copying the address bar *is* copying the filtered view, because the filters are baked into the link itself.
+
+## 2. Why was it introduced?
+
+To understand why this is the fix, it helps to see why the *naive* implementations fail:
+
+- **Filters kept as a plain class field on the list component** (`selectedStatus = 'shipped'`): Angular's router, by default, destroys a component when you navigate away from its route and creates a brand-new instance when you navigate back. A plain field on the old instance is simply gone — this is exactly the bug the PMs are reporting.
+- **Filters kept in a shared Angular service** (a singleton with `providedIn: 'root'`): this actually *would* survive navigating to the detail page and back, since the service instance isn't destroyed when the component is. But it does **not** solve the sharing requirement — the filters live only in that one browser tab's memory. A teammate opening the list from a fresh tab, or the same user reloading the page, gets nothing.
+- **Filters kept in `localStorage`/`sessionStorage`**: survives reloads for the *same browser*, but still isn't shareable across people, and can cause a confusing surprise if a user opens the list expecting a clean slate and instead sees stale filters from three days ago.
+
+**The problem, stated plainly:** every "obvious" place to keep filter state solves at most one of the two complaints. The URL is the only place that inherently solves both at once, because a URL is simultaneously (a) part of the browser's navigation history, so browser back/forward and "return to this route" naturally restore it, and (b) a self-contained, copyable, shareable string by definition.
+
+**What it solves:** filters become part of *what page you're looking at*, not incidental UI state — which is arguably the more correct mental model anyway: `/orders?status=shipped` and `/orders?status=pending` are meaningfully different views, the same way `/orders/5` and `/orders/9` are different pages.
+
+## 3. How does it work?
+
+- The list component treats `ActivatedRoute.queryParamMap` as its **only** source of truth for what filters are currently active — it never keeps a separate local copy that could get out of sync.
+- When the user changes a filter (picks a status, types a search term), the component doesn't mutate local state directly — it calls `Router.navigate([], { queryParams: {...}, queryParamsHandling: 'merge' })`, which updates the URL. That URL change is what flows back into `queryParamMap` and re-renders the filtered list. This keeps the data flow one-directional and easy to reason about: **UI event → URL update → URL drives what's displayed** — the URL is never a passive mirror of separate state, it *is* the state.
+- `queryParamsHandling: 'merge'` means changing the status filter doesn't clobber an unrelated `page` or `q` param that's also in the URL.
+- `replaceUrl: true` on these filter-tweak navigations avoids flooding browser history with one entry per keystroke/selection — so the back button still behaves sensibly (one "step" back, not fifty).
+- For **carrying filters into the detail page and back**, Angular's router has a built-in, declarative mechanism for exactly this: the `routerLink` directive's `queryParamsHandling="preserve"` attribute. Putting it on the "View" link in the list carries the list's current query params onto the detail route's own URL (`/orders/1?status=shipped`); putting it on the "Back to Orders" link on the detail page carries those same params back onto `/orders`. No manual state-passing code is needed — it's two template attributes.
+- Because Angular's default `RouteReuseStrategy` destroys and recreates the list component on navigating away and back, this design doesn't fight that behavior — it makes it irrelevant. The component re-reads the URL on creation every time, so "recreated from scratch" and "state restored" become the same thing.
+
+## 4. Example
+
+**Live, working StackBlitz project:** https://stackblitz.com/edit/angular-zns9zuf7
+
+`src/app/app.routes.ts`:
+
+```ts
+import { Routes } from '@angular/router';
+import { OrdersListComponent } from './orders-list/orders-list.component';
+import { OrderDetailComponent } from './order-detail/order-detail.component';
+
+export const routes: Routes = [
+  { path: '', redirectTo: 'orders', pathMatch: 'full' },
+  { path: 'orders', component: OrdersListComponent },
+  { path: 'orders/:id', component: OrderDetailComponent },
+];
+```
+
+`src/app/orders-list/orders-list.component.ts`:
+
+```ts
+import { Component, computed, inject, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { ActivatedRoute, Router, RouterLink, NavigationEnd } from '@angular/router';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { filter } from 'rxjs';
+import { ORDERS } from '../models/order';
+
+@Component({
+  selector: 'app-orders-list',
+  standalone: true,
+  imports: [CommonModule, FormsModule, RouterLink],
+  templateUrl: './orders-list.component.html',
+})
+export class OrdersListComponent {
+  private route = inject(ActivatedRoute);
+  private router = inject(Router);
+
+  // SOURCE OF TRUTH for filters is the URL's query params -- NOT a plain
+  // class field. That is what makes the filters survive navigating away
+  // to the detail page and back: the URL never changes just because the
+  // component instance was destroyed and recreated by the router.
+  private queryParamMap = toSignal(this.route.queryParamMap, {
+    initialValue: this.route.snapshot.queryParamMap,
+  });
+
+  status = computed(() => this.queryParamMap().get('status') ?? 'all');
+  search = computed(() => this.queryParamMap().get('q') ?? '');
+
+  orders = ORDERS;
+
+  filteredOrders = computed(() => {
+    const status = this.status();
+    const search = this.search().toLowerCase();
+    return this.orders.filter((o) => {
+      const matchesStatus = status === 'all' || o.status === status;
+      const matchesSearch = !search || o.customer.toLowerCase().includes(search);
+      return matchesStatus && matchesSearch;
+    });
+  });
+
+  // Mirrors the address bar so users can visibly see/copy it. This IS the
+  // shareable filtered view -- nothing extra needs to be built for sharing.
+  shareableUrl = signal(window.location.href);
+
+  constructor() {
+    this.router.events
+      .pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd))
+      .subscribe(() => this.shareableUrl.set(window.location.href));
+  }
+
+  setStatus(status: string): void {
+    // queryParamsHandling: 'merge' keeps any OTHER query params untouched;
+    // replaceUrl: true avoids flooding browser history with one entry per
+    // filter tweak (so the back button still feels sane).
+    this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: { status: status === 'all' ? null : status },
+      queryParamsHandling: 'merge',
+      replaceUrl: true,
+    });
+  }
+
+  setSearch(value: string): void {
+    this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: { q: value || null },
+      queryParamsHandling: 'merge',
+      replaceUrl: true,
+    });
+  }
+}
+```
+
+`src/app/orders-list/orders-list.component.html` (relevant excerpt):
+
+```html
+<select [ngModel]="status()" (ngModelChange)="setStatus($event)">
+  <option value="all">All</option>
+  <option value="pending">Pending</option>
+  <option value="shipped">Shipped</option>
+  <option value="delivered">Delivered</option>
+  <option value="cancelled">Cancelled</option>
+</select>
+
+<input type="text" [ngModel]="search()" (ngModelChange)="setSearch($event)" placeholder="Search customer..." />
+
+<tr *ngFor="let order of filteredOrders()">
+  <td>{{ order.id }}</td>
+  <td>{{ order.customer }}</td>
+  <td>{{ order.status }}</td>
+  <td>
+    <!-- queryParamsHandling="preserve" carries the CURRENT filters
+         (status/q) onto the detail route's own URL. -->
+    <a [routerLink]="['/orders', order.id]" queryParamsHandling="preserve">View</a>
+  </td>
+</tr>
+
+<input type="text" [value]="shareableUrl()" readonly />
+```
+
+`src/app/order-detail/order-detail.component.ts`:
+
+```ts
+import { Component, computed, inject } from '@angular/core';
+import { ActivatedRoute } from '@angular/router';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { ORDERS } from '../models/order';
+
+@Component({ /* ... */ })
+export class OrderDetailComponent {
+  private route = inject(ActivatedRoute);
+
+  private paramMap = toSignal(this.route.paramMap, { initialValue: this.route.snapshot.paramMap });
+  private queryParamMap = toSignal(this.route.queryParamMap, { initialValue: this.route.snapshot.queryParamMap });
+
+  order = computed(() => ORDERS.find((o) => o.id === Number(this.paramMap().get('id'))));
+
+  // These are the SAME status/q values the list page was showing when the
+  // user clicked "View" -- carried over purely by queryParamsHandling="preserve"
+  // on the list's routerLink, with zero manual state passing.
+  preservedStatus = computed(() => this.queryParamMap().get('status'));
+  preservedSearch = computed(() => this.queryParamMap().get('q'));
+}
+```
+
+`src/app/order-detail/order-detail.component.html` (relevant excerpt):
+
+```html
+<a [routerLink]="['/orders']" queryParamsHandling="preserve">&larr; Back to Orders</a>
+```
+
+## 5. Example Explanation / Execution Flow
+
+Verified end to end in the live demo:
+
+1. Start at `/orders` — no filters, all 8 orders shown.
+2. Select "Shipped" in the Status dropdown → `setStatus('shipped')` calls `router.navigate` with `queryParamsHandling: 'merge'` → the URL becomes `/orders?status=shipped`. The table immediately re-filters to the 3 shipped orders, and the "shareable link" box updates to show the new URL — because `shareableUrl` is refreshed on every `NavigationEnd` event.
+3. Click "View" on order #1 → because that link has `queryParamsHandling="preserve"`, the router carries the *current* query params (`status=shipped`) onto the new route → the browser URL becomes `/orders/1?status=shipped`.
+4. The detail page reads `status` from its own `queryParamMap` and displays "Filters carried through navigation: status = shipped, q = (none)" — proving the value survived the navigation without any manual passing of state between components.
+5. Click "← Back to Orders" → that link *also* has `queryParamsHandling="preserve"`, so it carries the detail page's query params (which are still `status=shipped`, since they were never changed) back onto `/orders` → the URL becomes `/orders?status=shipped` again, and `OrdersListComponent` — even though it's a **brand-new component instance** — reads `status=shipped` straight from the URL on creation and renders the filtered list exactly as the user left it.
+6. If the user instead copies the URL from step 2 or step 3 and sends it to a teammate, opening that link reproduces the identical filtered (or filtered + detail) view — the sharing requirement is satisfied by the exact same mechanism, with no separate "share" feature to build.
+
+## 6. When should we use it?
+
+- Any list/table view with filters, search, sorting, or pagination that users reasonably expect to survive navigating away and back — order lists, search results, admin tables, dashboards.
+- Any view a product team wants to be **linkable/bookmarkable** — support tickets ("here's the exact filtered queue I'm looking at"), reports, saved searches.
+- It's a poor fit for state that's genuinely private or sensitive and shouldn't be shareable via a link (e.g., don't put an auth token or personally identifying search terms directly in a URL) — keep the query-param approach to filter/sort/pagination criteria, not credentials or sensitive free text.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- Solves persistence-across-navigation and shareability with one mechanism instead of two separate features.
+- Works with the browser's native back/forward buttons for free.
+- Makes the view bookmarkable and deep-linkable, which also helps with things like support requests ("go to this URL to see what I'm seeing").
+- No custom caching/state-restoration logic needed — Angular's default behavior of destroying/recreating routed components is no longer a problem, because state isn't stored on the component at all.
+
+**Disadvantages**
+
+- Query params are visible and user-editable, so they must be validated/defended (a malformed `?status=xyz` shouldn't crash the page — fall back gracefully to "all").
+- Not suitable for large or sensitive state (don't put an entire complex filter object as raw JSON in the URL if it contains anything sensitive; keep it to filter criteria).
+- Every filter interaction becomes a router navigation, which needs `replaceUrl: true` (and possibly debouncing free-text inputs) to avoid history spam or excessive change-detection churn on rapid typing.
+
+## 8. Common Interview Traps
+
+- Reaching for a shared service or `localStorage` as "the" fix — both address persistence-across-navigation, but **neither addresses shareability**, which is half of what the PMs asked for. A strong answer explicitly notices that these are two requirements with one common solution, not two.
+- Forgetting that `queryParamsHandling="preserve"` (or `"merge"`) exists as a built-in `routerLink` input — reinventing this manually (reading `route.snapshot.queryParams` and re-attaching them by hand on every link) works but is unnecessary code the router already handles declaratively.
+- Not considering **history pollution**: naively calling `router.navigate` on every keystroke of a search box without `replaceUrl: true` (or debouncing) fills the back-button history with dozens of near-identical entries.
+- Assuming Angular caches routed components by default (it doesn't, without a custom `RouteReuseStrategy`) — the correct reaction to "the component gets destroyed and recreated" is not to fight that by trying to preserve the instance, but to make the component stateless with respect to filters and re-derive everything from the URL on init.
+- Forgetting graceful handling of an invalid/missing query param (e.g., a shared link with a typo'd `status` value) — the filtering logic should default sensibly rather than throwing or showing a blank list.
+
+## 9. Interview Follow-up Questions
+
+**Q: What if the filter state is too complex to reasonably serialize into query params (e.g., a multi-select with 15 options, nested date ranges)?**
+Answer: Serialize a compact representation (comma-separated IDs, ISO date strings, or a short encoded token) rather than raw JSON — keep the URL readable and within reasonable length limits. For very complex saved views, a hybrid approach works too: store the full filter definition server-side against a short ID, and put only that ID in the URL (`?view=abc123`) — this is how many BI/reporting tools implement "saved views."
+
+**Q: How would you avoid spamming the router with a new navigation on every keystroke in the search box?**
+Answer: Debounce the input's `ngModelChange`/`valueChanges` (e.g., 300ms via RxJS `debounceTime`) before calling `router.navigate`, and continue using `replaceUrl: true` so even the debounced updates don't each create a new history entry.
+
+**Q: Does this approach work with server-side pagination/filtering (not just client-side array filtering like the demo)?**
+Answer: Yes — the same query-param-as-source-of-truth pattern works whether the filtering happens in a client-side `computed()` (as in this simplified demo) or the query params are used to construct an HTTP request to the backend (e.g., `GET /api/orders?status=shipped&page=2`). Either way, the URL remains the single source of truth that drives what's fetched or filtered.
+
+**Q: How do you keep the filter UI (the dropdown, the search box) in sync if the user navigates via browser back/forward rather than through the UI?**
+Answer: Because the component derives `status`/`search` from `route.queryParamMap` (via `toSignal`) rather than owning independent form state, any URL change — whether from the app's own navigation calls or the browser's back/forward buttons — automatically flows through and updates the displayed dropdown/input value. There's no separate sync step required.
+
+## 10. Interview-Ready Answer
+
+"Both complaints actually point to the same fix: make the URL's query parameters the source of truth for the list's filter state, instead of storing it in a component field or a service. When a user changes a filter, I don't just update local state — I call the router's navigate method with the new query params, using `queryParamsHandling: 'merge'` so unrelated params like page number aren't clobbered, and `replaceUrl: true` so we're not spamming browser history on every tweak. The list component reads its filters *from* `ActivatedRoute.queryParamMap`, not the other way around, so even though Angular destroys and recreates the component when you navigate to the detail page and back, it doesn't matter — the new instance just reads the same URL and reconstructs the same filtered view. For carrying the filters into the detail page and back, Angular's router already has a built-in way to do this declaratively: the `routerLink` directive's `queryParamsHandling="preserve"` attribute, put on both the 'View' link going into detail and the 'Back to Orders' link coming out — no manual state-passing needed. And because the filters live entirely in the URL, sharing a filtered view is literally just sharing that URL — a teammate opening it sees exactly the same filtered list, which solves the second complaint for free, using the same mechanism as the first."
+
+## 11. Quick Revision
+
+- **What:** Store list filters (status, search, page) in the URL's query params instead of component state, a service, or localStorage.
+- **Why:** Component state is destroyed/recreated on route navigation (loses filters); a service or localStorage persists within a session but isn't shareable across users.
+- **Problem solved:** One mechanism (URL as source of truth) fixes both "filters lost on navigate back" and "can't share a filtered view."
+- **How:** Read filters via `ActivatedRoute.queryParamMap`; write changes via `Router.navigate(..., { queryParamsHandling: 'merge', replaceUrl: true })`; carry filters into/out of detail routes via `routerLink`'s `queryParamsHandling="preserve"`.
+- **Use when:** Any filterable/sortable/paginated list view that should survive navigation and be bookmarkable/shareable.
+- **Important:** Query params are user-editable and visible — validate/default gracefully; don't put sensitive data in them; debounce free-text filters to avoid navigation spam.
+- **Remember:** `queryParamsHandling="preserve"` on a `routerLink` is a built-in, declarative way to carry the current URL's query params onto the next navigation — no manual code needed.
+
+## Think of it as:
+
+The URL is the "save file" for the view. Instead of the app trying to remember what the user was looking at (in memory, which gets wiped), the address bar itself IS the saved state — which is exactly why bookmarks and shared links work at all on the web, and why this scenario's two seemingly different asks collapse into one design.
