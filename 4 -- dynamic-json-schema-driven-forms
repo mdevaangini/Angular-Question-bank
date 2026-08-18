@@ -12,7 +12,7 @@ Server-driven forms solve a recurring problem: forms change often (new fields, n
 
 ## 3. How does it work?
 
-**The schema contract** (a TypeScript interface mirroring what the backend sends as JSON):
+**The schema contract** (a TypeScript interface mirroring what the backend sends as JSON):  --> https://stackblitz.com/edit/angular-qalbfrq5?file=src%2Fmain.ts,src%2Fapp%2Fapp.component.ts
 
 ```typescript
 export interface FieldSchema {
