@@ -1,0 +1,267 @@
+# Angular Signals — signal(), computed(), effect() and Why effect() Is a Last Resort
+
+## 1. What is it?
+
+A **Signal** is a wrapper around a value that knows *who is reading it* and can automatically notify those readers when the value changes. You read a signal by **calling it like a function** (`count()`), and you change it through explicit methods (`.set()`, `.update()`) — never by direct assignment.
+
+Angular gives you three core building blocks:
+
+- **`signal()`** — a writable, observable "box" holding a value.
+- **`computed()`** — a read-only, automatically-derived value calculated from other signals.
+- **`effect()`** — a side-effect function that automatically reruns whenever any signal it reads changes.
+
+Together they form Angular's **fine-grained reactivity system**, introduced as developer preview in Angular 16 and stabilized in Angular 17+.
+
+## 2. Why was it introduced?
+
+Before signals, Angular's change detection relied on **Zone.js**: Zone.js monkey-patches async browser APIs (`setTimeout`, `addEventListener`, promises, etc.) so that whenever *any* async event fires anywhere in the app, Angular re-checks the **entire component tree** (or at least every component not behind `OnPush`) to see what changed.
+
+This created real problems at scale:
+
+- It's **coarse-grained** — one button click can trigger a full-tree check even though only one small piece of UI actually changed.
+- It's **hard to reason about** — you often can't tell, just by reading a component, *why* it re-rendered or *when* exactly change detection ran.
+- Working around it required discipline: `ChangeDetectionStrategy.OnPush`, immutable data patterns, and manual `markForCheck()` calls — easy to get subtly wrong, especially in large teams.
+- Using RxJS for local component state (e.g. `BehaviorSubject` + `async` pipe) works, but comes with real boilerplate: subscription management, `takeUntil` cleanup, and a mental model (streams over time) that's overkill for "this component just needs to hold and derive some values."
+
+**Problem without signals:** you had two imperfect options — coarse, zone-driven change detection (simple but wasteful), or RxJS for everything (precise but heavy for simple synchronous state).
+
+**What it solves:** Signals track dependencies automatically and precisely. When a signal changes, Angular knows *exactly* which parts of the template actually depend on it and can update just those parts — without needing Zone.js to "poll" the whole tree. This is also the foundation for **zoneless Angular** (removing Zone.js entirely for better performance and smaller bundles), and it gives local component state a much lighter-weight API than reaching for RxJS every time.
+
+## 3. How does it work?
+
+### `signal()`   --> https://stackblitz.com/edit/angular-5srzjc1q-8gbmyf3t?file=src%2Fapp%2Fapp.component.ts
+
+```ts
+const count = signal(0);   // WritableSignal<number>
+count();                   // read: 0
+count.set(5);               // write: replace the value entirely
+count.update(v => v + 1);   // write: derive the new value from the old one
+```
+
+- Read it by **calling it as a function**. This is what lets Angular's reactivity system track "who read this."
+- `.set()` replaces the value outright; `.update()` computes the new value from the previous one — always prefer `.update()` when the new value depends on the current one, and always return a **new** object/array reference for objects/arrays (signals compare with `===` by default, so mutating in place won't trigger updates).
+
+### `computed()`
+
+```ts
+const doubleCount = computed(() => count() * 2);
+```
+
+- Angular automatically tracks which signals were read *during* the computed function's execution — no manual dependency array, no `distinctUntilChanged` boilerplate.
+- It's **lazy**: the function doesn't run until something actually reads `doubleCount()` for the first time.
+- It's **memoized**: it only recomputes when one of its dependencies (`count` here) actually changes value; reading it repeatedly without a dependency change just returns the cached result.
+- It's **read-only** — there's no `.set()` on a computed signal. If you need to write a derived value, that's a sign you should be deriving it with `computed()`, not manually keeping it in sync.
+
+### `effect()`
+
+```ts
+effect(() => {
+  console.log('count changed to', count());
+});
+```
+
+- Reruns automatically whenever any signal read inside it changes — same automatic dependency tracking as `computed()`.
+- Runs **once immediately** on creation (to establish its dependencies and do its first run), then again on every subsequent change to any signal it reads.
+- Must be created in an **injection context** — typically a component/service constructor, or a field initializer, or explicitly passed an `Injector`. You can't just call `effect()` from anywhere.
+- Unlike `computed()`, it doesn't return a value — it exists purely to *do something* (log, write to storage, call a non-Angular API), not to produce a piece of derived state.
+
+## 4. Example
+
+**Live, working StackBlitz project:** https://stackblitz.com/edit/angular-5srzjc1q
+
+`src/app/app.component.ts`:
+
+```ts
+import { Component, signal, computed, effect } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+interface CartItem {
+  name: string;
+  price: number;
+  qty: number;
+}
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule],
+  templateUrl: './app.component.html',
+})
+export class AppComponent {
+  // signal(): a writable, observable box holding a value.
+  // Read it by CALLING it: count() -- not count.
+  count = signal(0);
+
+  // computed(): a read-only DERIVED signal. Angular tracks that this
+  // function reads count(), so it automatically re-runs (and memoizes
+  // the result) only when count actually changes. It is lazy: it does
+  // NOT run until something reads doubleCount() for the first time.
+  doubleCount = computed(() => this.count() * 2);
+
+  cartItems = signal<CartItem[]>([
+    { name: 'Keyboard', price: 1200, qty: 1 },
+  ]);
+
+  // Two more computed signals, both derived from the SAME source signal.
+  // Neither recomputes unless cartItems() actually changes.
+  itemCount = computed(() => this.cartItems().reduce((sum, i) => sum + i.qty, 0));
+  cartTotal = computed(() => this.cartItems().reduce((sum, i) => sum + i.price * i.qty, 0));
+
+  constructor() {
+    // effect(): reruns automatically whenever any signal read inside it changes.
+    // GOOD USE: talking to something OUTSIDE Angular's reactivity system --
+    // here, the browser's document.title API. This is not "app state", so
+    // computed() would not make sense for it.
+    effect(() => {
+      document.title = 'Count: ' + this.count();
+    });
+
+    // GOOD USE #2: persistence side effect (localStorage is an external API).
+    effect(() => {
+      localStorage.setItem('cart', JSON.stringify(this.cartItems()));
+      console.log('[effect] cart synced to localStorage ->', this.cartItems());
+    });
+
+    // ANTI-PATTERN (commented out on purpose -- do NOT do this):
+    //
+    // effect(() => {
+    //   // Reading cartItems() and WRITING to another signal derived from it.
+    //   // This should be computed(), not effect(). Using effect() here:
+    //   //  - adds a redundant, hidden reactive hop (harder to trace than computed)
+    //   //  - risks an infinite loop if the written signal is ever read back
+    //   //    inside this same effect, or inside another effect that feeds back in
+    //   //  - runs AFTER change detection instead of being part of the synchronous
+    //   //    derivation graph, so consumers can transiently see a stale value
+    //   this.itemCountBad.set(this.cartItems().length);
+    // });
+  }
+
+  increment(): void {
+    this.count.update((v) => v + 1);
+  }
+
+  decrement(): void {
+    this.count.update((v) => v - 1);
+  }
+
+  addItem(): void {
+    const names = ['Mouse', 'Monitor', 'Cable', 'Webcam'];
+    const name = names[Math.floor(Math.random() * names.length)];
+    const price = Math.floor(Math.random() * 500) + 100;
+    // .update() gives you the previous value and expects a new value back --
+    // always return a NEW array/object so Angular's equality check sees a change.
+    this.cartItems.update((items) => [...items, { name, price, qty: 1 }]);
+  }
+}
+```
+
+`src/app/app.component.html`:
+
+```html
+<div class="card">
+  <h2>Angular Signals: signal() + computed() + effect()</h2>
+
+  <section>
+    <h3>1. signal() + computed()</h3>
+    <p>Count: <b>{{ count() }}</b></p>
+    <p>Double (computed): <b>{{ doubleCount() }}</b></p>
+    <button (click)="increment()">+1</button>
+    <button (click)="decrement()">-1</button>
+  </section>
+
+  <section>
+    <h3>2. computed() for derived cart totals</h3>
+    <ul>
+      <li *ngFor="let item of cartItems()">{{ item.name }} - {{ item.qty }} x Rs.{{ item.price }}</li>
+    </ul>
+    <p><b>Item count (computed):</b> {{ itemCount() }}</p>
+    <p><b>Total (computed):</b> Rs.{{ cartTotal() }}</p>
+    <button (click)="addItem()">Add random item</button>
+  </section>
+
+  <section>
+    <h3>3. effect() - side effects only, never app state</h3>
+    <p>Open devtools console and watch the browser tab title update - both are driven by
+       <code>effect()</code>, and the cart is also synced to <code>localStorage</code> on every change.
+       See the commented-out anti-pattern in <code>app.component.ts</code>.</p>
+  </section>
+</div>
+```
+
+## 5. Example Explanation / Execution Flow
+
+1. On component creation, `count = signal(0)` and `cartItems = signal([...])` initialize their values immediately.
+2. `doubleCount` and the two cart `computed()`s are **not evaluated yet** — they're lazy. The first time the template reads `doubleCount()` during rendering, it runs `count() * 2`, caches `0`, and remembers that it depends on `count`.
+3. In the constructor, both `effect()`s run **immediately once**: the first sets `document.title` to `"Count: 0"`, the second writes the initial cart to `localStorage` and logs it. Both effects also register themselves as dependents of the signals they read (`count`, `cartItems`).
+4. User clicks `+1` → `increment()` calls `this.count.update(v => v + 1)`. Angular's signal graph now knows `count` changed, so:
+   - Any template binding reading `count()` is scheduled to update.
+   - `doubleCount` is marked stale — it will recompute (`2`) the next time something reads it (lazily, not eagerly).
+   - The `document.title` effect reruns automatically, setting the title to `"Count: 1"`.
+   - The `localStorage` effect does **not** rerun, because it never read `count` — it only depends on `cartItems`. This is the precision fine-grained reactivity gives you: only the effects/computed values that actually depend on what changed are re-evaluated.
+5. User clicks `Add random item` → `cartItems.update(...)` replaces the array with a new array reference containing the new item. This marks `cartItems` changed, which cascades to `itemCount`, `cartTotal`, and the `localStorage` effect (but *not* the `document.title` effect, since it never reads `cartItems`).
+6. At no point does Angular need Zone.js to "guess" what might have changed by re-checking the whole tree — the signal graph tells it precisely.
+
+## 6. When should we use it?
+
+- **`signal()`** — for any piece of local, synchronous component/service state that used to be a plain class property or a `BehaviorSubject`.
+- **`computed()`** — anytime you'd otherwise write a plain method or getter called from the template (e.g. `getTotal()`), or anytime you're tempted to manually keep a second signal "in sync" with another. If a value can be *derived* from other signals, it should be a `computed()`, not something you update by hand in multiple places.
+- **`effect()`** — sparingly, only for genuine side effects that reach *outside* Angular's reactive graph: logging/analytics, syncing to `localStorage`/`sessionStorage`, imperatively driving a non-Angular third-party library (like a charting library or a native DOM API), or manually adjusting focus/scroll position.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- Fine-grained, precise updates instead of coarse Zone.js-driven tree checks.
+- No manual subscription/unsubscription management (unlike raw RxJS `Subscription`s).
+- Automatic, correct dependency tracking — you never declare dependencies yourself; the framework observes which signals were actually read.
+- `computed()` is memoized and lazy by default, which is easy to get wrong by hand with plain getters/methods (which rerun on every change-detection cycle regardless of whether their inputs changed).
+- Enables Angular's move toward **zoneless** change detection for smaller bundles and better performance.
+
+**Disadvantages**
+
+- Another reactive primitive to learn alongside RxJS — Angular apps that use both Observables (for async streams like HTTP) and Signals (for local state) need developers comfortable bridging between the two (`toSignal()` / `toObservable()`).
+- `effect()` is easy to misuse for state propagation, reintroducing hidden, hard-to-trace reactive chains — the exact problem signals were partly meant to avoid.
+- Overusing signals for things that are genuinely asynchronous streams (like HTTP responses with retry/debounce/cancellation logic) can be a worse fit than RxJS, which has purpose-built operators for exactly that.
+
+## 8. Common Interview Traps
+
+- Forgetting that a signal must be **called as a function** to read (`count()`), not accessed as a property (`count`) — a very common first-time mistake, and one interviewers like to probe.
+- Thinking `computed()` reruns "on every change detection cycle" like a plain method — it doesn't; it's memoized and only recomputes when a tracked dependency actually changes.
+- Mutating an array/object in place and calling `.set()`/`.update()` with the *same reference* — since signals use reference equality (`===`) by default, this silently fails to trigger updates. Always create a new array/object.
+- Calling `effect()` outside an injection context (e.g., inside a regular method triggered by a click, not in the constructor or a field initializer) — this throws a runtime error unless you explicitly pass an `Injector`.
+- **The big one this question is really testing:** using `effect()` to keep one signal in sync with another (`effect(() => otherSignal.set(...))`) instead of using `computed()`. This is explicitly called out as an anti-pattern in Angular's own documentation — it risks infinite loops, adds a hidden asynchronous hop into what should be a synchronous derivation, and reintroduces the "where did this value come from and when did it update" confusion that signals were designed to eliminate.
+
+## 9. Interview Follow-up Questions
+
+**Q: What's the difference between `computed()` and `effect()` — when would you use one over the other?**
+Answer: `computed()` *produces a value* — it's a pure derivation with no side effects, is lazy, and is meant to be read from a template or other computed/effect. `effect()` *does something* — it has no return value and exists purely for side effects (logging, storage, non-Angular APIs). If you find yourself wanting an effect to update another signal, that's almost always a sign you actually want `computed()`.
+
+**Q: Why does Angular explicitly warn against using `effect()` to propagate state changes?**
+Answer: Because it turns a synchronous, traceable derivation (`computed()`) into an asynchronous, hidden side channel. It can cause infinite update loops if the written-to signal is read back into the same or a connected effect, can cause consumers to briefly observe a stale value before the effect catches up, and makes the app's data flow harder to reason about — exactly the kind of implicit reactivity bug class signals were introduced to reduce.
+
+**Q: How do signals interact with RxJS Observables?**
+Answer: Angular provides interop functions — `toSignal()` converts an Observable into a signal (useful for consuming HTTP calls or other async streams in a template without an `async` pipe), and `toObservable()` converts a signal into an Observable (useful when you need RxJS operators like `debounceTime` or `switchMap` on top of signal-driven state).
+
+**Q: Is a signal synchronous or asynchronous?**
+Answer: Synchronous. Reading a signal always returns its current value immediately — there's no subscription delay or async scheduling involved in reading it, unlike an Observable which you must subscribe to and which may emit over time.
+
+**Q: Can `computed()` have side effects inside it?**
+Answer: It shouldn't — `computed()` is meant to be a pure function of its dependencies. Angular may call the computation function more or less often than you'd expect for a given "meaningful change" (e.g., due to how it batches and schedules), so side effects placed inside a `computed()` can run at unpredictable times. Side effects belong in `effect()`.
+
+## 10. Interview-Ready Answer
+
+"Signals are Angular's fine-grained reactivity primitive. `signal()` gives you a writable box for a value that you read by calling it as a function, and update through `.set()` or `.update()`. `computed()` gives you a read-only, derived signal — it automatically tracks whatever signals you read inside its function, and it's both lazy and memoized, so it only recalculates when one of those dependencies actually changes, not on every change-detection cycle like a plain template method would. `effect()` is different from both — it doesn't produce a value, it just reruns a side-effecting function whenever a signal it reads changes, and it has to run inside an injection context. Where this gets interesting in interviews is why `effect()` should be a last resort: it's meant for things outside Angular's reactive graph — logging, localStorage, talking to a non-Angular API — not for keeping one piece of app state in sync with another. If you use `effect()` to write to another signal, you've basically reinvented `computed()` but worse: it's asynchronous instead of part of the synchronous derivation graph, it can cause an infinite loop if that written signal ever feeds back into the effect, and it hides what should be an obvious, traceable relationship between two pieces of state. So the rule of thumb is: deriving a value from other signals is always `computed()`; only reach for `effect()` when you genuinely need to step outside Angular and touch the DOM, browser storage, or a third-party library."
+
+## 11. Quick Revision
+
+- **What:** `signal()` = writable reactive value; `computed()` = read-only derived value (lazy + memoized); `effect()` = auto-rerunning side-effect function.
+- **Why:** Zone.js-based change detection is coarse-grained and hard to reason about; signals give precise, automatic dependency tracking without RxJS's subscription boilerplate, and enable zoneless Angular.
+- **Problem solved:** Replaces "re-check the whole tree on any async event" with "update exactly what actually depends on what changed."
+- **How:** Read a signal by calling it (`count()`); dependencies are tracked automatically by observing what's read inside `computed()`/`effect()`; always create new references when updating objects/arrays.
+- **Use when:** `signal()` for local state, `computed()` for anything derived from other signals, `effect()` only for side effects reaching outside Angular (logging, storage, DOM/3rd-party APIs).
+- **Important:** Never use `effect()` to update another signal — that's what `computed()` is for; doing so risks infinite loops and hidden reactive chains.
+- **Remember:** `effect()` runs once immediately on creation, then again on every dependency change; `computed()` doesn't run until first read.
+
+## Think of it as:
+
+`signal()` is a labeled box you can open and swap contents in. `computed()` is a formula cell in a spreadsheet — it recalculates itself automatically whenever a cell it references changes, and you'd never manually type a value into a formula cell. `effect()` is a print statement wired to that spreadsheet — it watches cells and reacts, but it doesn't belong *in* a formula cell, and it should never be the thing writing into other cells.
