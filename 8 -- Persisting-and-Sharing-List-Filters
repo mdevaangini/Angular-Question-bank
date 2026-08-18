@@ -28,12 +28,40 @@ To understand why this is the fix, it helps to see why the *naive* implementatio
 
 - The list component treats `ActivatedRoute.queryParamMap` as its **only** source of truth for what filters are currently active — it never keeps a separate local copy that could get out of sync.
 - When the user changes a filter (picks a status, types a search term), the component doesn't mutate local state directly — it calls `Router.navigate([], { queryParams: {...}, queryParamsHandling: 'merge' })`, which updates the URL. That URL change is what flows back into `queryParamMap` and re-renders the filtered list. This keeps the data flow one-directional and easy to reason about: **UI event → URL update → URL drives what's displayed** — the URL is never a passive mirror of separate state, it *is* the state.
+
+//NOTE
+
+Normally you might think: "user picks a filter → save it in a variable → show the filtered list." Two separate things to keep in sync: the variable, and the URL.
+
+Instead, this design cuts out the middleman. There's no separate variable at all. The flow is just:
+
+User picks "Shipped" from the dropdown.
+Instead of saving that choice anywhere in the component, the code just changes the URL to /orders?status=shipped.
+The component is always "watching" the URL. The moment the URL says status=shipped, the component filters the table to shipped orders — because that's literally where it reads the filter value from.
+
+So the URL isn't a copy of the state, or a note the component leaves for itself — it's the actual state. There's only one place the filter lives, and it happens to be the address bar.
+
+Why that matters: if you kept a separate variable and the URL, you'd have to remember to update both, every time, in the right order — and if you ever forgot one, they'd disagree (e.g. the dropdown shows "Shipped" but the URL still says nothing, so a shared link would be wrong). By making the URL the only source, that whole class of bug just can't happen.
+//
+
+
+
 - `queryParamsHandling: 'merge'` means changing the status filter doesn't clobber an unrelated `page` or `q` param that's also in the URL.
 - `replaceUrl: true` on these filter-tweak navigations avoids flooding browser history with one entry per keystroke/selection — so the back button still behaves sensibly (one "step" back, not fifty).
 - For **carrying filters into the detail page and back**, Angular's router has a built-in, declarative mechanism for exactly this: the `routerLink` directive's `queryParamsHandling="preserve"` attribute. Putting it on the "View" link in the list carries the list's current query params onto the detail route's own URL (`/orders/1?status=shipped`); putting it on the "Back to Orders" link on the detail page carries those same params back onto `/orders`. No manual state-passing code is needed — it's two template attributes.
 - Because Angular's default `RouteReuseStrategy` destroys and recreates the list component on navigating away and back, this design doesn't fight that behavior — it makes it irrelevant. The component re-reads the URL on creation every time, so "recreated from scratch" and "state restored" become the same thing.
 
 ## 4. Example
+
+//NOTE
+toSignal() is there to bridge Angular's two reactivity systems — RxJS Observables and Signals — inside the same component.
+
+Here's the underlying issue: ActivatedRoute.queryParamMap is exposed by the Angular Router as an Observable, not a Signal. That's just how the Router API is built. But the rest of the component (status, search, shareableUrl) is designed around Signals, because signals let you compute derived state synchronously and read it directly in the template without needing the | async pipe or manual subscription management.
+
+So without toSignal(), you'd have two bad options:
+Manually .subscribe() to queryParamMap in ngOnInit, write the value into a plain signal yourself, and remember to .unsubscribe() in ngOnDestroy (this is exactly the kind of RxJS boilerplate + memory-leak risk signals were introduced to get rid of).
+//
+
 
 **Live, working StackBlitz project:** https://stackblitz.com/edit/angular-zns9zuf7
 
