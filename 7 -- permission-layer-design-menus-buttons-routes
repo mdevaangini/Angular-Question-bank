@@ -4,8 +4,8 @@
 
 A permission layer is the set of pieces that make an app's UI (and, critically, its route access) consistently respect a user's authorization — driven by data the backend returns after login, not hardcoded per screen. The question specifies the API returns "role and allowed menu items" after login; a robust design treats that as two related but distinct pieces of data:
 
-- **Coarse-grained access** — which menu items / routes / screens a user can reach at all (`menuItems: string[]`).
-- **Fine-grained access** — which individual actions/controls within a screen they're allowed to use (`actions: string[]`, e.g. `user.delete`, `report.export`).
+- **Coarse-grained access (Big, broad, all-or-nothing checks) ** — which menu items / routes / screens a user can reach at all (`menuItems: string[]`).
+- **Fine-grained access (Detailed, specific checks — down to individual actions, individual pieces of data, or individual fields/records)  ** — which individual actions/controls within a screen they're allowed to use (`actions: string[]`, e.g. `user.delete`, `report.export`).
 
 The permission layer needs exactly three enforcement points wired to a single shared source of truth: a **route guard** (blocks navigation), a **structural directive** (hides/shows individual UI controls), and a **dynamically rendered menu** (doesn't show links to places the user can't go in the first place).
 
@@ -200,6 +200,18 @@ template: `
 ## 5. Example Explanation — Execution Flow
 
 1. User submits login → `AuthService.login()` calls the API → response `{ role, menuItems, actions }` is passed straight into `PermissionsService.setPermissions()`, which updates the signal and persists a copy to `sessionStorage`. The whole permission layer is now populated before any authenticated screen renders.
+
+      What happens when the user navigates to /users
+
+     --->   /users isn't matched by one single route — it's matched by two nested route segments layered on top of each other:
+                        The parent shell route (matched at path '')
+                        The child users route (matched at path 'users', nested inside the shell)
+
+           Angular's router walks the whole matched tree, and for every segment in that tree that has a canActivate guard attached, it runs that guard — starting from the outermost (parent) and moving inward to the innermost (child):
+                Why this order/structure matters
+                Guards run parent → child, matching the nesting of the route tree — you can't reach a child's guard check until the parent's guard has already allowed access to reach that far down.
+                If the parent guard fails (isLoaded() returns false), the router stops right there — the child guard (hasMenu('users')) never even runs, and the navigation is cancelled/redirected.
+
 2. User navigates to `/users` (by clicking the sidebar, or typing the URL directly). Angular's router evaluates `permissionGuard` for every matched route segment that declares it — first the parent shell route (checks `isLoaded()` only), then the `users` child route (checks `hasMenu('users')`).
 3. If the check fails, the guard returns a `UrlTree` (`router.parseUrl('/unauthorized')`) instead of `true` — Angular treats this as "redirect here instead," cancelling the original navigation. This is why it works identically whether the user clicked a sidebar link or typed the URL: the guard runs on the *route*, not on how navigation was triggered.
 4. If the check passes, the route's component loads (lazily, via `loadComponent`) and renders. Inside it, every `*appHasPermission="'...'"` directive independently checks `hasAction()` against the same `PermissionsService` and creates or clears its embedded view accordingly — same pattern as `*ngIf`, just backed by permission data instead of a plain boolean.
