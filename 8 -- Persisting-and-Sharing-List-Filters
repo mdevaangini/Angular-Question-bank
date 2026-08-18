@@ -27,21 +27,6 @@ To understand why this is the fix, it helps to see why the *naive* implementatio
 ## 3. How does it work?
 
 - The list component treats `ActivatedRoute.queryParamMap` as its **only** source of truth for what filters are currently active — it never keeps a separate local copy that could get out of sync.
-
-
-// NOTE 
-Normally you might think: "user picks a filter → save it in a variable → show the filtered list." Two separate things to keep in sync: the variable, and the URL.
-Instead, this design cuts out the middleman. There's no separate variable at all. The flow is just:
-
-User picks "Shipped" from the dropdown.
-Instead of saving that choice anywhere in the component, the code just changes the URL to /orders?status=shipped.
-The component is always "watching" the URL. The moment the URL says status=shipped, the component filters the table to shipped orders — because that's literally where it reads the filter value from.
-
-So the URL isn't a copy of the state, or a note the component leaves for itself — it's the actual state. There's only one place the filter lives, and it happens to be the address bar.
-Why that matters: if you kept a separate variable and the URL, you'd have to remember to update both, every time, in the right order — and if you ever forgot one, they'd disagree (e.g. the dropdown shows "Shipped" but the URL still says nothing, so a shared link would be wrong). By making the URL the only source, that whole class of bug just can't happen.
-Think of it like a thermostat display: the display doesn't store its own separate "remembered temperature" — it just shows whatever the thermostat is currently set to. One source, no syncing needed.
-//
-
 - When the user changes a filter (picks a status, types a search term), the component doesn't mutate local state directly — it calls `Router.navigate([], { queryParams: {...}, queryParamsHandling: 'merge' })`, which updates the URL. That URL change is what flows back into `queryParamMap` and re-renders the filtered list. This keeps the data flow one-directional and easy to reason about: **UI event → URL update → URL drives what's displayed** — the URL is never a passive mirror of separate state, it *is* the state.
 - `queryParamsHandling: 'merge'` means changing the status filter doesn't clobber an unrelated `page` or `q` param that's also in the URL.
 - `replaceUrl: true` on these filter-tweak navigations avoids flooding browser history with one entry per keystroke/selection — so the back button still behaves sensibly (one "step" back, not fifty).
@@ -211,6 +196,116 @@ Verified end to end in the live demo:
 4. The detail page reads `status` from its own `queryParamMap` and displays "Filters carried through navigation: status = shipped, q = (none)" — proving the value survived the navigation without any manual passing of state between components.
 5. Click "← Back to Orders" → that link *also* has `queryParamsHandling="preserve"`, so it carries the detail page's query params (which are still `status=shipped`, since they were never changed) back onto `/orders` → the URL becomes `/orders?status=shipped` again, and `OrdersListComponent` — even though it's a **brand-new component instance** — reads `status=shipped` straight from the URL on creation and renders the filtered list exactly as the user left it.
 6. If the user instead copies the URL from step 2 or step 3 and sends it to a teammate, opening that link reproduces the identical filtered (or filtered + detail) view — the sharing requirement is satisfied by the exact same mechanism, with no separate "share" feature to build.
+
+## 5b. Alternative Implementation: Reactive Forms Instead of ngModel
+
+The example above uses individual `[ngModel]`/`(ngModelChange)` bindings and calls `router.navigate()` directly on every change. The exact same URL-as-source-of-truth design also works — and arguably works *better* for a real app — built with **Reactive Forms** instead. This matters because Reactive Forms give you `valueChanges` as a genuine RxJS Observable, which composes cleanly with operators like `debounceTime` (so free-text search doesn't trigger a navigation on every keystroke) in a way plain `ngModel` doesn't, without hand-rolling your own `Subject`.
+
+**Live, working StackBlitz project (Reactive Forms version):** https://stackblitz.com/edit/angular-xidl6gmg-zirnzrqs
+
+The key difference: now there are **two things to keep in sync** instead of one — the form and the URL — so the design needs an explicit two-directional wiring, with one critical detail (`emitEvent: false`) to avoid an infinite loop.
+
+```ts
+import { Component, OnDestroy, inject, signal } from '@angular/core';
+import { FormControl, FormGroup, ReactiveFormsModule } from '@angular/forms';
+import { ActivatedRoute, Router, NavigationEnd } from '@angular/router';
+import { Subject } from 'rxjs';
+import { debounceTime, distinctUntilChanged, filter, takeUntil } from 'rxjs/operators';
+import { ORDERS } from '../models/order';
+
+@Component({ /* ... */ })
+export class OrdersListComponent implements OnDestroy {
+  private route = inject(ActivatedRoute);
+  private router = inject(Router);
+  private destroy$ = new Subject<void>();
+
+  orders = ORDERS;
+
+  // The LIVE filter UI. Still not the ultimate source of truth by itself --
+  // it's kept in sync with the URL in both directions below.
+  filterForm = new FormGroup({
+    status: new FormControl<string>('all', { nonNullable: true }),
+    q: new FormControl<string>('', { nonNullable: true }),
+  });
+
+  filteredOrders = signal(this.orders);
+  shareableUrl = signal(window.location.href);
+
+  constructor() {
+    // URL -> Form. Fires immediately with the current URL on subscribe, and
+    // again on every future URL change (browser back/forward, a shared
+    // link, or our own navigate() calls below). emitEvent: false is
+    // CRITICAL: without it, this patch would itself fire valueChanges below
+    // and trigger another navigation -- an infinite loop.
+    this.route.queryParamMap
+      .pipe(takeUntil(this.destroy$))
+      .subscribe((params) => {
+        const status = params.get('status') ?? 'all';
+        const q = params.get('q') ?? '';
+        this.filterForm.patchValue({ status, q }, { emitEvent: false });
+        this.applyFilters(status, q);
+      });
+
+    // Form -> URL, split per control. Status is a discrete choice (select
+    // dropdown) so it navigates immediately. Free-text search is debounced
+    // so we're not calling the router on every keystroke.
+    this.filterForm.controls.status.valueChanges
+      .pipe(takeUntil(this.destroy$), distinctUntilChanged())
+      .subscribe(() => this.pushFiltersToUrl());
+
+    this.filterForm.controls.q.valueChanges
+      .pipe(takeUntil(this.destroy$), debounceTime(300), distinctUntilChanged())
+      .subscribe(() => this.pushFiltersToUrl());
+
+    this.router.events
+      .pipe(takeUntil(this.destroy$), filter((e): e is NavigationEnd => e instanceof NavigationEnd))
+      .subscribe(() => this.shareableUrl.set(window.location.href));
+  }
+
+  ngOnDestroy(): void {
+    this.destroy$.next();
+    this.destroy$.complete();
+  }
+
+  private pushFiltersToUrl(): void {
+    const { status, q } = this.filterForm.getRawValue();
+    this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: { status: status === 'all' ? null : status, q: q || null },
+      queryParamsHandling: 'merge',
+      replaceUrl: true,
+    });
+  }
+
+  private applyFilters(status: string, search: string): void {
+    const s = search.toLowerCase();
+    this.filteredOrders.set(
+      this.orders.filter((o) => {
+        const matchesStatus = status === 'all' || o.status === status;
+        const matchesSearch = !s || o.customer.toLowerCase().includes(s);
+        return matchesStatus && matchesSearch;
+      }),
+    );
+  }
+}
+```
+
+```html
+<form [formGroup]="filterForm">
+  <select formControlName="status">
+    <option value="all">All</option>
+    <option value="shipped">Shipped</option>
+    <!-- ... -->
+  </select>
+  <input type="text" formControlName="q" placeholder="Search customer..." />
+</form>
+```
+
+**Why this design avoids the feedback loop:** without `{ emitEvent: false }` on the `patchValue` call, syncing the URL *into* the form would itself count as a form "change," which would fire `valueChanges`, which would push a navigation, which would change the URL, which would patch the form again — forever. Passing `emitEvent: false` tells Angular "update these controls silently; don't notify subscribers," so only *genuine user edits* (typing, selecting) ever reach the `valueChanges` subscriptions that talk to the router. This is the one detail that makes bidirectional syncing between a form and the URL safe.
+
+**Why split the two controls' `valueChanges` instead of subscribing to the whole `FormGroup`:** it lets each control get the update behavior that actually fits it — the status dropdown is a single discrete action, so it should navigate immediately with no debounce; free-text search should debounce, or you'd fire a navigation (and a URL/history entry) on every keystroke.
+
+This Reactive Forms version behaves identically to the `ngModel` version from the user's point of view — same URL-driven persistence, same `queryParamsHandling="preserve"` round trip into and out of the detail page, same shareable link — it just does it through `FormGroup`/`valueChanges` instead of individual template event bindings, which scales better once there are more than two or three filter controls, or once any of them needs debouncing.
 
 ## 6. When should we use it?
 
