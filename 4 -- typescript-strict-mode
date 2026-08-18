@@ -1,0 +1,168 @@
+# TypeScript Strict Mode — What It Is and Why It Matters in Large Angular Apps
+
+## 1. What is it?
+
+Strict mode in TypeScript is not a single setting — it's a **bundle of compiler checks** that you turn on all at once with one flag in `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true
+  }
+}
+```
+
+Setting `"strict": true` enables a group of individually-toggleable type-checking rules (like `strictNullChecks`, `noImplicitAny`, etc.) that make the TypeScript compiler far less forgiving. Without it, TypeScript quietly lets a lot of unsafe JavaScript-style code through, even though it's technically a "typed" language.
+
+## 2. Why was it introduced?
+
+TypeScript's entire pitch is "catch bugs at compile time instead of runtime." But in **non-strict mode**, TypeScript is surprisingly loose:
+
+- A variable with no type annotation and no inferable type silently becomes `any` (which disables type checking for it entirely).
+- `null` and `undefined` are assignable to *every* type by default — so `let name: string = null` is perfectly legal.
+- Class properties can be declared without ever being initialized, and TypeScript won't complain.
+
+This meant teams could write TypeScript that *looked* type-safe but still crashed at runtime with the exact same errors JavaScript always had — most infamously `Cannot read property 'x' of undefined`. The type system was giving false confidence.
+
+**Problem without strict mode:** the compiler misses entire classes of bugs — implicit `any` variables that silently lose type safety, and null/undefined values flowing through code as if they were valid values of any type. In a large codebase with many contributors, this compounds: one function returns `User | undefined`, another assumes it's always `User`, and nothing catches the mismatch until a user hits it in production.
+
+**What it solves:** strict mode forces every one of these unsafe patterns to be handled explicitly and visibly in the code, at the point where the compiler can catch it — not months later in a stack trace.
+
+## 3. How does it work?
+
+`"strict": true` is shorthand for enabling this group of flags together (all default to `false` individually, and `true` when `strict` is on):
+
+- **`noImplicitAny`** — every variable, parameter, or return type must be inferable or explicitly typed. A function parameter with no type and no default becomes a compile error instead of silently becoming `any`.
+- **`strictNullChecks`** — `null` and `undefined` are no longer assignable to every type. A `string` can only hold a string unless you explicitly type it as `string | null` or `string | undefined`. This is the single most impactful flag for eliminating runtime null-reference crashes.
+- **`strictFunctionTypes`** — function parameter types are checked contravariantly (more sound checking of function assignability), catching subtle bugs when assigning one function type to another.
+- **`strictBindCallApply`** — `.bind()`, `.call()`, and `.apply()` are type-checked against the function's actual signature instead of accepting anything.
+- **`strictPropertyInitialization`** — class properties must be initialized in the constructor (or have a definite assignment assertion `!`, or be explicitly optional with `?`), preventing "declared but never assigned" properties from silently being `undefined`.
+- **`noImplicitThis`** — flags any usage of `this` whose type can't be inferred, which usually indicates a callback losing its intended context.
+- **`alwaysStrict`** — emits `"use strict"` in the compiled JS and parses the source in strict ECMAScript mode.
+- **`useUnknownInCatchVariables`** (TS 4.4+, on with strict) — `catch (err)` types `err` as `unknown` instead of `any`, forcing you to narrow it before use.
+
+Execution/compile flow:
+
+1. You write code and run `tsc` (or Angular CLI's build, which wraps `tsc`).
+2. With `strict: true`, the compiler applies all the above checks to every file in the project.
+3. Any code that skips a null check, leaves a property uninitialized, or lets a parameter fall back to `any` fails the build with a compile-time error — before the app ever ships.
+4. This shifts an entire category of bugs from "discovered by a user in production" to "discovered by a developer before merging the PR."
+
+## 4. Example
+
+```ts
+// --- Without strictNullChecks ---
+function getUserName(user: { name: string } | null): string {
+  return user.name; // Compiles fine WITHOUT strict mode — but crashes at
+                     // runtime if `user` is actually null.
+}
+
+// --- With strictNullChecks ---
+function getUserNameStrict(user: { name: string } | null): string {
+  return user.name;
+  // Compile-time error:
+  // "Object is possibly 'null'."
+  // Forces you to handle it explicitly:
+}
+
+function getUserNameFixed(user: { name: string } | null): string {
+  if (!user) {
+    return 'Guest';
+  }
+  return user.name; // TypeScript now knows `user` is non-null here (narrowing)
+}
+```
+
+```ts
+// --- noImplicitAny ---
+function double(x) {      // Error: "Parameter 'x' implicitly has an 'any' type."
+  return x * 2;
+}
+
+function doubleFixed(x: number) {  // Explicit type required
+  return x * 2;
+}
+```
+
+```ts
+// --- strictPropertyInitialization (common in Angular components/services) ---
+class UserProfileComponent {
+  user: User; // Error: "Property 'user' has no initializer and is not
+              // definitely assigned in the constructor."
+}
+
+class UserProfileComponentFixed {
+  user?: User;              // Option 1: mark it optional — you must null-check before use
+  user2!: User;             // Option 2: definite assignment assertion — "trust me, it'll be set"
+  user3: User = defaultUser; // Option 3: give it a real default value
+}
+```
+
+## 5. Example Explanation
+
+- In the first example, non-strict TypeScript happily compiles `user.name` even though `user`'s type includes `null` — because in non-strict mode, `null` is treated as assignable to (and readable through) any type, so the compiler doesn't flag the risk. The crash only shows up when a real `null` value hits that line in production.
+- With `strictNullChecks` on, the compiler tracks nullability as part of the type itself. `{ name: string } | null` is a genuinely different type from `{ name: string }`, and you cannot access `.name` on it until you've narrowed away the `null` case (via an `if` check, optional chaining `user?.name`, or a non-null assertion `user!.name` when you're certain).
+- In the second example, `noImplicitAny` refuses to let a parameter silently degrade to `any` — which would otherwise disable type checking for every subsequent use of `x`.
+- In the third example, `strictPropertyInitialization` catches a very common Angular mistake: declaring `@Input() user: User;` and assuming it will be set by the time the component renders, without ever actually enforcing that assumption.
+
+## 6. When should we use it?
+
+- On **every new project**, from day one — retrofitting strict mode onto a large, mature codebase is far more painful than starting with it. (Angular CLI has generated `strict: true` by default since Angular 12.)
+- Especially valuable in **large-scale, multi-contributor Angular apps**, where implicit contracts between components/services (what can be `null`, what's guaranteed to be set) are easy to violate without a compiler enforcing them.
+- Any codebase where **runtime null-reference errors** are a recurring source of production bugs — `strictNullChecks` alone eliminates most of these.
+- Migrating a legacy non-strict codebase: usually done incrementally, enabling one flag at a time (`noImplicitAny` first, then `strictNullChecks`), rather than flipping `strict: true` all at once and facing hundreds of errors immediately.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- Catches an entire class of runtime crashes (null/undefined access, uninitialized properties) before code ships.
+- Makes function signatures and component contracts honest — if a parameter can be `null`, the type says so, and every caller is forced to handle it.
+- Improves IDE autocomplete and refactoring safety, since the compiler has more precise type information to work with.
+- Forces better API design — you can't paper over "this might not exist" with an implicit `any`.
+
+**Disadvantages**
+
+- Enabling it on an existing large codebase can surface hundreds of pre-existing errors at once, requiring a real migration effort.
+- More verbose in places — you have to write null checks, default values, or definite assignment assertions instead of assuming things are always set.
+- Slightly steeper learning curve for developers coming from plain JavaScript, since `null`/`undefined` handling becomes a first-class concern rather than an afterthought.
+
+## 8. Common Interview Traps
+
+- Thinking `strict: true` is one setting rather than a bundle of ~8 individual flags — interviewers often ask you to name a few of them specifically.
+- Confusing `strictNullChecks` with optional chaining (`?.`) — optional chaining is a *syntax feature* for safely accessing possibly-null values; `strictNullChecks` is the *compiler setting* that makes the compiler care about nullability in the first place. They work together, but one doesn't require the other.
+- Assuming strict mode affects runtime behavior — it doesn't. It's purely a compile-time check; the emitted JavaScript is functionally the same (aside from `alwaysStrict` adding `"use strict"`). Strict mode catches bugs before runtime, it doesn't change what the code does at runtime.
+- Not knowing that `any` completely bypasses strict mode's protections — a codebase can technically have `strict: true` and still be full of runtime null crashes if developers overuse `any` or non-null assertions (`!`) to silence the compiler instead of actually handling the case.
+- Forgetting that `strictPropertyInitialization` specifically catches uninitialized class fields — a very common Angular `@Input()` / DI-related gotcha.
+
+## 9. Interview Follow-up Questions
+
+**Q: What's the difference between `strictNullChecks` and optional chaining (`?.`)?**
+Answer: `strictNullChecks` is a compiler setting that makes `null`/`undefined` part of the type system, so the compiler forces you to handle them. Optional chaining is a language feature that lets you *safely* access a property that might be null/undefined, short-circuiting to `undefined` instead of throwing. You typically use `?.` specifically because `strictNullChecks` is forcing you to acknowledge the null case.
+
+**Q: If strict mode is only a compile-time check, can a strict TypeScript app still crash at runtime with a null reference error?**
+Answer: Yes — if developers bypass the checks using the non-null assertion operator (`!`) or `any`, or if data crosses an untyped boundary (like an HTTP response cast with `as`), strict mode's guarantees don't extend past that boundary. It reduces risk significantly but isn't a runtime guarantee.
+
+**Q: How would you migrate a large non-strict Angular codebase to strict mode?**
+Answer: Incrementally — enable `noImplicitAny` first (usually the most mechanical to fix), then `strictNullChecks` (the biggest but most valuable effort), fixing errors file by file or module by module, often using `// @ts-expect-error` or a temporary `strict: false` override in a `tsconfig` for legacy folders while new code is held to the strict standard.
+
+**Q: Does strict mode affect the compiled JavaScript output size or performance?**
+Answer: No — strict mode is purely a type-checking layer removed during compilation (aside from `alwaysStrict` adding a `"use strict"` directive). It has no runtime performance cost.
+
+## 10. Interview-Ready Answer
+
+"Strict mode in TypeScript is enabled with `strict: true` in `tsconfig.json`, and it's actually a bundle of separate compiler checks rather than one setting — things like `noImplicitAny`, `strictNullChecks`, and `strictPropertyInitialization`. The reason it matters is that without it, TypeScript is a lot more permissive than people expect: a variable with no clear type silently becomes `any`, and `null` or `undefined` can be assigned to basically any type. So you can have code that type-checks perfectly fine and still crashes at runtime with the same `Cannot read property of undefined` errors you'd get in plain JavaScript. `strictNullChecks` is the big one — it makes nullability part of the type itself, so if a function can return `null`, every caller is forced by the compiler to handle that case before accessing properties on it. In a large Angular app with many contributors, that matters a lot, because it turns implicit assumptions — like 'this input will always be set by the time the component renders' — into something the compiler actually verifies, rather than something that only breaks in production when someone finally hits the edge case."
+
+## 11. Quick Revision
+
+- **What:** `strict: true` in `tsconfig.json` — a bundle of compiler flags (`noImplicitAny`, `strictNullChecks`, `strictPropertyInitialization`, etc.) that make TypeScript's type checking much stricter.
+- **Why:** Without it, TypeScript lets `any` and `null`/`undefined` slip through unchecked, so "type-safe" code can still crash at runtime the same way plain JS does.
+- **Problem solved:** Shifts null-reference and implicit-any bugs from runtime (production) to compile time (before merge).
+- **How:** Compiler tracks nullability and inferred types more precisely; code that doesn't handle `null`/`undefined` or leaves types implicit fails to compile.
+- **Use when:** Always, from project start; Angular CLI enables it by default since v12; critical for large multi-contributor codebases.
+- **Important:** It's compile-time only — `any` and non-null assertions (`!`) can still bypass its protections; it doesn't guarantee zero runtime null errors.
+- **Remember:** `strictNullChecks` is the single highest-value flag in the bundle — it's usually what people mean when they informally say "strict mode caught this."
+
+## Think of it as:
+
+A stricter proofreader for your code's promises. Non-strict TypeScript lets you say "this is always a `User`" without ever checking if that's true. Strict mode makes you prove it — or explicitly admit "this might be missing" — before the compiler lets you ship.
