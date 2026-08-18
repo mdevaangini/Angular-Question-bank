@@ -1,0 +1,262 @@
+# Scenario: Sharing a Logging Capability Across Multiple Angular Applications
+
+## 1. What is it?
+
+The scenario asks: several Angular applications inside the same organization all need the same logging capability (consistent formatting, log levels, maybe shipping logs to a monitoring backend). How do you avoid every team writing — and maintaining — their own copy of that logic?
+
+The answer is to build the logging logic **once**, as a **shared, versioned Angular library**, and have every application consume it through dependency injection instead of copy-pasting a `LoggerService` file from app to app.
+
+Concretely, this means:
+
+- Extracting the logging code into its own **publishable package** (built with `ng-packagr`, the tool the Angular CLI itself uses for `ng generate library`).
+- Publishing it to a **private package registry** (Verdaccio, GitHub Packages, Azure Artifacts, JFrog Artifactory, or a private npm scope).
+- Versioning it with **semver**, so consuming apps pull in fixes and features deliberately (`^2.1.0`) rather than being silently affected by every change.
+- Giving it a small, deliberate **public API** (an `InjectionToken` for configuration, a service class, and a `provideLogger()` function) so each consuming app can configure it differently without touching its internals.
+
+## 2. Why was it introduced?
+
+Without a shared library, the natural (and common) failure mode is: Team A writes a `LoggerService`, Team B needs the same thing and copies the file into their own app, Team C does the same. Now there are three near-identical implementations.
+
+This causes real, compounding problems:
+
+- **Bug fixes don't propagate.** If someone finds that log messages aren't being timestamped correctly, that fix has to be manually applied — and remembered — in every copy.
+- **Behavior drifts apart.** Over months, the three copies diverge: one team adds a feature, another doesn't, formats stop matching, and centralized log monitoring/alerting becomes unreliable because logs from different apps don't look the same.
+- **Wasted engineering effort.** Multiple teams independently solve the same problem (how do we batch and ship logs to our monitoring backend without blocking the UI thread?) instead of one team solving it once.
+- **Inconsistent observability for the org.** If there's a central logging/monitoring platform (e.g. an ELK stack, Datadog, Application Insights), inconsistent log formats and levels across apps make org-wide dashboards and alerts much harder to build.
+
+**What it solves:** a single, tested, versioned implementation that every application depends on the same way it depends on any other npm package — so a fix or improvement made once benefits every consuming app the next time they bump the version.
+
+## 3. How does it work?
+
+The overall architecture has a few concrete pieces:
+
+- **The library itself** — generated with `ng generate library @myorg/logger` (or, in an Nx monorepo, `nx g @nx/angular:library logger`). This scaffolds a package with its own `ng-package.json`, a `public-api.ts` barrel file (which explicitly controls what's exported — everything not re-exported there is a private implementation detail), and normal Angular building blocks (services, tokens, etc.) inside `src/lib/`.
+- **A minimal, deliberate public API** — typically an `InjectionToken` for configuration (so each app can set its own app name, minimum log level, remote endpoint) plus a single setup function (e.g. `provideLogger(config)`), mirroring how Angular's own APIs work (`provideHttpClient()`, `provideRouter()`).
+- **Build step** — `ng-packagr` compiles the library into the standard Angular Package Format: FESM bundles, `.d.ts` type definitions, and a `package.json`, ready to be published exactly like any other npm package.
+- **Publishing** — pushed to a registry the organization controls. Common choices: a self-hosted **Verdaccio** instance, **GitHub Packages**, **Azure Artifacts**, or **JFrog Artifactory** — anywhere that supports scoped private packages (`@myorg/logger`).
+- **Versioning** — semantic versioning (`MAJOR.MINOR.PATCH`). A patch release for a bug fix, a minor release for a backward-compatible feature, a major release for a breaking API change. Consuming apps declare a version range in their own `package.json` and upgrade deliberately.
+- **CI/CD** — a pipeline (often using `semantic-release` or a manual version bump + `npm publish` step) builds and publishes a new version whenever changes merge into the library's main branch, so consuming teams can pick up fixes on their own schedule.
+- **Monorepo alternative** — if the organization uses a single monorepo (e.g. via Nx) for multiple apps, you don't need to publish to a registry at all: the shared library lives in the same repo, is imported via TypeScript path mapping, and is built directly as part of each app's build. This trades "independent versioning/publishing" for "always-latest, single source of truth" — a valid choice depending on how tightly coupled the organization's release cycles are.
+
+## 4. Example
+
+**Live, working StackBlitz project:** https://stackblitz.com/edit/angular-putuxlmp
+
+Because StackBlitz can't simulate a real private npm registry, this demo keeps the "library" code in its own folder (`src/app/logger/`) inside a single app — but its public API (`LogLevel`, `LoggerConfig`, `LoggerService`, `provideLogger()`) is exactly what a real `@myorg/logger` package would export, and two sibling components (`TeamAComponent`, `TeamBComponent`) consume it independently, each with its own configuration, to stand in for two separate applications.
+
+`src/app/logger/log-level.ts`:   
+
+```ts
+export enum LogLevel {
+  Debug = 0,
+  Info = 1,
+  Warn = 2,
+  Error = 3,
+}
+```
+
+`src/app/logger/logger-config.ts`:
+
+```ts
+import { InjectionToken } from '@angular/core';
+import { LogLevel } from './log-level';
+
+export interface LoggerConfig {
+  appName: string;
+  minLevel: LogLevel;
+  remoteUrl?: string;
+}
+
+export const LOGGER_CONFIG = new InjectionToken<LoggerConfig>('LOGGER_CONFIG');
+```
+
+`src/app/logger/console-appender.ts` (pluggable transport — stateless, safe to share as one root singleton):
+
+```ts
+import { Injectable } from '@angular/core';
+import { LogLevel } from './log-level';
+
+@Injectable({ providedIn: 'root' })
+export class ConsoleAppender {
+  log(level: LogLevel, appName: string, message: string, meta?: unknown): void {
+    const prefix = '[' + appName + '] [' + LogLevel[level] + ']';
+    if (level === LogLevel.Debug) console.debug(prefix, message, meta ?? '');
+    else if (level === LogLevel.Info) console.info(prefix, message, meta ?? '');
+    else if (level === LogLevel.Warn) console.warn(prefix, message, meta ?? '');
+    else console.error(prefix, message, meta ?? '');
+  }
+}
+```
+
+`src/app/logger/logger.service.ts`:
+
+```ts
+import { Inject, Injectable } from '@angular/core';
+import { LOGGER_CONFIG, LoggerConfig } from './logger-config';
+import { LogLevel } from './log-level';
+import { ConsoleAppender } from './console-appender';
+
+// Deliberately NOT providedIn: 'root'. Each consuming app/team calls
+// provideLogger(config), which registers BOTH this service and its config
+// together -- so every injector subtree that calls provideLogger() gets
+// its OWN LoggerService instance wired to its OWN config, while still
+// reusing 100% of the same class and filtering logic.
+@Injectable()
+export class LoggerService {
+  constructor(
+    @Inject(LOGGER_CONFIG) private config: LoggerConfig,
+    private appender: ConsoleAppender,
+  ) {}
+
+  debug(message: string, meta?: unknown): void { this.write(LogLevel.Debug, message, meta); }
+  info(message: string, meta?: unknown): void { this.write(LogLevel.Info, message, meta); }
+  warn(message: string, meta?: unknown): void { this.write(LogLevel.Warn, message, meta); }
+  error(message: string, meta?: unknown): void { this.write(LogLevel.Error, message, meta); }
+
+  private write(level: LogLevel, message: string, meta?: unknown): void {
+    // Every consuming team gets level-filtering for free, driven purely by
+    // THEIR OWN config -- no if/else duplicated per app.
+    if (level < this.config.minLevel) return;
+    this.appender.log(level, this.config.appName, message, meta);
+    // A real shared library would batch + POST to config.remoteUrl here.
+  }
+}
+```
+
+`src/app/logger/provide-logger.ts` (the library's entire integration surface):
+
+```ts
+import { Provider } from '@angular/core';
+import { LOGGER_CONFIG, LoggerConfig } from './logger-config';
+import { LoggerService } from './logger.service';
+
+// IMPORTANT: returns a plain Provider[], NOT EnvironmentProviders (i.e. not
+// wrapped in makeEnvironmentProviders()). EnvironmentProviders can only be
+// supplied at an environment-injector boundary (bootstrapApplication's
+// providers, or a route's providers) -- NOT inside a component's own
+// @Component({ providers: [...] }) array. A plain Provider[] works at BOTH
+// levels, which is exactly what lets Team A and Team B below each get
+// their own LoggerService instance scoped to their own component subtree.
+export function provideLogger(config: LoggerConfig): Provider[] {
+  return [
+    { provide: LOGGER_CONFIG, useValue: config },
+    LoggerService,
+  ];
+}
+```
+
+`src/app/team-a.component.ts` ("Team A's application"):
+
+```ts
+import { Component, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { LoggerService, LogLevel, provideLogger } from './logger/public-api';
+
+@Component({
+  selector: 'app-team-a',
+  standalone: true,
+  imports: [CommonModule],
+  templateUrl: './team-a.component.html',
+  providers: [
+    provideLogger({ appName: 'TeamA-Orders', minLevel: LogLevel.Debug }),
+  ],
+})
+export class TeamAComponent {
+  entries = signal<string[]>([]);
+  constructor(private logger: LoggerService) {}
+
+  logInfo(): void {
+    this.logger.info('Order #4471 placed successfully');
+    this.entries.update((list) => [...list, '[Info] Order #4471 placed successfully']);
+  }
+  // ...logDebug / logWarn / logError follow the same pattern
+}
+```
+
+`src/app/team-b.component.ts` ("Team B's application" — same library, different config):
+
+```ts
+@Component({
+  selector: 'app-team-b',
+  standalone: true,
+  imports: [CommonModule],
+  templateUrl: './team-b.component.html',
+  providers: [
+    provideLogger({ appName: 'TeamB-Billing', minLevel: LogLevel.Warn }),
+  ],
+})
+export class TeamBComponent {
+  // Same LoggerService class. Debug/Info calls are silently filtered here
+  // because THIS team's minLevel is Warn, not Debug.
+}
+```
+
+## 5. Example Explanation
+
+- `LoggerService` is written **once**. It has no idea it will be used by two (or twenty) different teams — it just reads whatever `LoggerConfig` was injected into it.
+- `provideLogger(config)` is the only thing each consuming app/team writes: one function call with their own `appName` and `minLevel`. That's the entire integration cost of adopting the shared library.
+- Because `provideLogger()` returns a plain `Provider[]` (not `EnvironmentProviders`), it can be placed in a component's own `providers` array. Angular's hierarchical dependency injection then creates a **separate `LoggerService` instance** for Team A's component subtree and Team B's component subtree — each wired to its own `LOGGER_CONFIG` value, even though both instances come from the exact same class.
+- Click `log.debug()` in Team A's panel: since Team A configured `minLevel: LogLevel.Debug`, the message passes the `level < this.config.minLevel` check and gets logged.
+- Click `log.debug()` in Team B's panel: since Team B configured `minLevel: LogLevel.Warn`, `LogLevel.Debug < LogLevel.Warn` is true, so `write()` returns early — the message is silently filtered, proven by the same shared code, using only a different config value.
+- `ConsoleAppender` *is* `providedIn: 'root'` (unlike `LoggerService`) because it's stateless — there's no reason to give Team A and Team B separate instances of something that has no per-team state, so it's shared as a single root-level singleton.
+
+## 6. When should we use it?
+
+- Any capability that's genuinely **cross-cutting** and needed identically (or near-identically, with light configuration) by multiple applications: logging, authentication/token-refresh interceptors, a design-system component library, analytics tracking, feature-flag clients, a shared HTTP error-handling wrapper.
+- When the organization has (or is building toward) **multiple Angular applications** maintained by different teams, especially if those teams ship on independent release schedules — this is exactly when "copy the file" starts to visibly hurt.
+- If everything lives in a **single monorepo**, prefer an internal Nx/workspace library over a published npm package — you get the same code-reuse benefit without registry/versioning overhead, at the cost of all apps always building against the same (latest) version of the shared code.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- One implementation, one place to fix bugs — every consumer benefits from a fix by bumping a version.
+- Consistent behavior and log format across the organization, which is essential for centralized monitoring/alerting to actually work.
+- Each consuming app can still configure it (app name, log level, endpoint) without needing to modify the library's internals.
+- Semver gives consuming teams control over *when* they adopt changes, rather than being silently affected.
+
+**Disadvantages**
+
+- Publishing/versioning adds process overhead: someone has to own the library's release pipeline, changelog, and backward-compatibility discipline.
+- A poorly-designed public API can make the library rigid — if `LoggerConfig` doesn't anticipate a team's need (e.g. custom appenders), that team may be tempted to fork it instead of contributing back, recreating the original problem.
+- In a multi-repo setup, there's a coordination cost: a breaking change in the library means every consuming app needs to eventually migrate, which requires organizational discipline (deprecation warnings, migration guides, major-version windows).
+
+## 8. Common Interview Traps
+
+- Saying "just put it in a shared folder" without addressing **versioning** — a shared folder copied via some ad hoc process (or, worse, a git submodule with no semver) still causes the same "which version does each app have" confusion a real package avoids.
+- Not mentioning **`ng-packagr`** or the **Angular Package Format** — interviewers evaluating Angular-specific depth will want to hear that you know Angular has first-class tooling for exactly this (`ng generate library`), not just "publish it to npm" in the abstract.
+- Forgetting that **`EnvironmentProviders` (from `makeEnvironmentProviders()`) cannot be used inside a component's `providers:` array** — only at environment-injector boundaries (`bootstrapApplication`, or a route's `providers`). This is a genuinely common real-world gotcha when designing a library's `provideXyz()` function, especially if you want it usable at both the app root and at a per-feature/per-component level.
+- Assuming a single global `providedIn: 'root'` singleton is always right for a shared service — it isn't, when different consumers legitimately need different configuration (as this scenario requires). Understanding when to use `providedIn: 'root'` (stateless, one config for the whole app) versus per-injector-subtree providers (multiple configs coexisting) is exactly what this scenario is testing.
+- Not considering the **monorepo alternative** — a good answer acknowledges that if the org is single-repo (Nx workspace), publishing to a registry may be unnecessary overhead; a buildable library imported via TypeScript paths achieves the same reuse without the release-process cost.
+
+## 9. Interview Follow-up Questions
+
+**Q: How would you let each application send logs to a different backend (e.g. Datadog for one team, a custom endpoint for another) without modifying the library?**
+Answer: Keep the `LogAppender` transport as a swappable interface (as in the example) rather than hardcoding `console` or one HTTP endpoint inside `LoggerService`. Each app supplies its own appender implementation (or configuration) through the same `provideLogger()`-style setup, so the library depends only on the interface, not a concrete backend.
+
+**Q: How do you handle a breaking change to the library's public API without breaking every consuming app overnight?**
+Answer: Semantic versioning — ship the breaking change as a new major version, keep the previous major version available (and ideally maintained for critical fixes) for some deprecation window, and provide a migration guide/codemod if the change is mechanical. Consuming teams upgrade on their own schedule rather than being forced.
+
+**Q: Why not just use `providedIn: 'root'` on `LoggerService` directly instead of the `provideLogger()` + component-level `providers` pattern?**
+Answer: `providedIn: 'root'` creates exactly one instance for the whole application, tied to whatever it was constructed with the first time it's resolved. That works if every consumer of the service in a given app needs identical configuration. Here, different *teams/features within (or across) apps* need different configuration (different `appName`, different `minLevel`), so the service needs to be instantiable per injector subtree — which requires NOT using `providedIn: 'root'`, and instead providing the service (and its config) explicitly wherever it's needed.
+
+**Q: How would you test a shared library like this in isolation before publishing?**
+Answer: Standard unit tests within the library's own project (e.g. Jasmine/Karma or Jest, testing `LoggerService`'s filtering logic and appender delegation in isolation), plus either a demo/playground app inside the library's workspace or contract tests run against a couple of real consuming apps in CI before a release is cut.
+
+## 10. Interview-Ready Answer
+
+"I'd pull the logging logic out of any single application and turn it into its own shared Angular library — generated with `ng generate library`, built with `ng-packagr` into the standard Angular package format, and published to a private registry the organization controls, like Verdaccio or GitHub Packages, under a scoped name like `@myorg/logger`. The library exposes a small public API: an injection token for configuration — things like app name, minimum log level, maybe a remote endpoint — a `LoggerService`, and a single `provideLogger(config)` function that each consuming app calls once. Versioning it with semver means teams pull in fixes and improvements deliberately, on their own schedule, instead of every app maintaining a slightly different copy that drifts apart over time. One detail I'd get right in the design: I wouldn't make `provideLogger()` return `EnvironmentProviders` via `makeEnvironmentProviders()`, because that can only be used at the root or route level — I'd return a plain provider array instead, so it also works inside a specific component or feature module's own `providers` array. That matters here because different teams, or even different features within the same app, might legitimately want different log levels, and a plain provider array lets each one get its own scoped instance of the service without touching the library's internals. If the whole organization is actually one monorepo, I'd skip publishing entirely and just use a buildable Nx library instead — same reuse, without the registry and release-process overhead."
+
+## 11. Quick Revision
+
+- **What:** Extract the logging logic into a separately versioned, publishable Angular library instead of copy-pasting a `LoggerService` into every app.
+- **Why:** Copy-pasted logic drifts apart, bugs get fixed inconsistently, and org-wide log monitoring needs a consistent format across apps.
+- **Problem solved:** One implementation, fixed once, consumed by many apps via normal package dependency + semver upgrades.
+- **How:** `ng generate library` → `ng-packagr` build → publish to a private registry (Verdaccio / GitHub Packages / Artifactory) → consuming apps import via `InjectionToken` config + a `provideLogger()` setup function.
+- **Use when:** Any cross-cutting concern shared by multiple apps/teams — logging, auth interceptors, shared UI kit, analytics, feature flags.
+- **Important:** `EnvironmentProviders` (`makeEnvironmentProviders()`) only works at environment-injector boundaries (bootstrap/routes) — return a plain `Provider[]` if the library needs to be providable at the component level too, e.g. so different teams/features can have different configs.
+- **Remember:** In a single monorepo, an internal buildable library (no publishing) is often simpler than a published package — publishing is for when apps live in separate repos with independent release cycles.
+
+## Think of it as:
+
+Building the logging code like a **utility company**, not a **DIY generator**. Every "house" (app) plugs into the same wiring standard (the library's public API) and gets electricity (logging behavior) from one maintained source, instead of every house building and maintaining its own generator that slowly starts behaving differently from its neighbors'.
