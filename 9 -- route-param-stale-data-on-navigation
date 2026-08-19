@@ -1,0 +1,234 @@
+> Live demo (verified): https://stackblitz.com/edit/angular-sg1uofqz
+
+# /users/12 → "next user" → /users/13, But the Page Still Shows User 12
+
+## 1. What is it?
+
+This is a route-reuse bug: the URL changes correctly (`/users/12` → `/users/13`), the router genuinely navigated, but the component on screen keeps rendering the *previous* user's data. It happens because the component that reads the route parameter reads it exactly once — in `ngOnInit`, off `route.snapshot` — and Angular reuses the same component instance across the two navigations instead of destroying and recreating it, so `ngOnInit` (and that one-time read) never runs again.
+
+## 2. Why does this happen?
+
+Angular's default `RouteReuseStrategy` treats "navigate from `/users/12` to `/users/13`" as **the same route being reactivated with different parameters**, not as leaving one route and entering another. Both URLs resolve to the identical route config (`path: 'users/:id'`, same component). Since the route itself doesn't change — only its parameter does — Angular's optimization is to keep the already-instantiated component alive, skip tearing it down and rebuilding it, and just update the `ActivatedRoute`'s parameter data feeding into it. This is intentional and usually desirable (it avoids destroying/recreating potentially expensive component trees, forms, subscriptions, etc. on every param change) — but it silently breaks any component that assumes "a new id means a new component instance means `ngOnInit` will run again."
+
+## 3. How does it work?
+
+**The buggy pattern** — reading the id once, in a lifecycle hook, off a snapshot:
+
+```typescript
+export class UserDetailComponent implements OnInit {
+  private route = inject(ActivatedRoute);
+  private userService = inject(UserService);
+  user?: User;
+
+  ngOnInit() {
+    const id = this.route.snapshot.paramMap.get('id')!;
+    this.userService.getUser(id).subscribe((u) => (this.user = u));
+  }
+}
+```
+
+`route.snapshot` is a frozen, point-in-time view of the route's state *at the moment it's read*. `ngOnInit` only fires once, when Angular first constructs the component. The very first time the user lands on `/users/12`, this all works — a fresh component is created, `ngOnInit` runs, `id` is `'12'`, the right user loads. But when they click "next user" and the router activates `/users/13` on the *same route config*, Angular reuses the existing `UserDetailComponent` instance. `ngOnInit` does not run again. The component just sits there, still holding the user-12 data it fetched once, while the URL bar and the rest of the app correctly report `/users/13`.
+
+**The fix** — subscribe to the route's reactive parameter stream instead of reading a snapshot in a one-shot hook:
+
+```typescript
+export class UserDetailComponent implements OnInit {
+  private route = inject(ActivatedRoute);
+  private userService = inject(UserService);
+  user?: User;
+
+  ngOnInit() {
+    this.route.paramMap
+      .pipe(
+        map((params) => params.get('id')!),
+        distinctUntilChanged(),
+        switchMap((id) => this.userService.getUser(id))
+      )
+      .subscribe((u) => (this.user = u));
+  }
+}
+```
+
+`route.paramMap` is an `Observable` tied to the lifetime of the `ActivatedRoute` itself, not to a single execution of `ngOnInit`. It emits every time the route's parameters change — including when Angular reuses the component instance and just swaps in new params. `ngOnInit` still only runs once (to set up the subscription), but the subscription itself keeps firing on every relevant navigation. `switchMap` is what makes this safe under fast repeated navigation: if the user clicks "next user" again before the previous `getUser()` call resolves, `switchMap` cancels the stale in-flight request so a slow, outdated response can never arrive late and overwrite the data for the id the user is actually looking at now. `distinctUntilChanged()` just skips a redundant re-fetch if the same id is emitted twice in a row.
+
+**The detail that trips people up:** the fix is *not* "don't reuse the component" — it's "don't read route state in a hook that only runs once." The component instance being reused is fine and intentional; the bug was pairing a one-time read with a value that can change many times over that instance's life.
+
+## 4. Example (exactly the code verified live in the StackBlitz demo above)
+
+The demo puts the buggy and fixed versions side by side, each driven by its own named `<router-outlet>`, so both can be clicked independently while sharing the exact same route pattern and "Next user" trigger:
+
+```typescript
+// app.routes.ts — same path pattern, two outlets, so both panes are
+// genuinely subject to the same route-reuse behavior being demonstrated
+export const routes: Routes = [
+  { path: 'users/:id', component: BuggyUserDetailComponent, outlet: 'buggy' },
+  { path: 'users/:id', component: FixedUserDetailComponent, outlet: 'fixed' },
+];
+```
+
+```typescript
+// buggy-user-detail.component.ts
+@Component({
+  selector: 'app-buggy-user-detail',
+  standalone: true,
+  imports: [CommonModule],
+  template: `
+    <div class="user-card stale-warning">
+      <span class="badge">component instance created: {{ instanceCreatedAt }}</span>
+      <h3>{{ user?.name }}</h3>
+      <p>{{ user?.email }}</p>
+      <p class="hint">Fetched once in ngOnInit via route.snapshot.paramMap — never re-reads on navigation.</p>
+    </div>
+  `,
+})
+export class BuggyUserDetailComponent implements OnInit {
+  private route = inject(ActivatedRoute);
+  private userService = inject(UserService);
+  user?: User;
+  instanceCreatedAt = new Date().toLocaleTimeString();
+
+  ngOnInit() {
+    const id = this.route.snapshot.paramMap.get('id')!;
+    this.userService.getUser(id).subscribe((u) => (this.user = u));
+  }
+}
+```
+
+```typescript
+// fixed-user-detail.component.ts
+@Component({
+  selector: 'app-fixed-user-detail',
+  standalone: true,
+  imports: [CommonModule],
+  template: `
+    <div class="user-card">
+      <span class="badge">component instance created: {{ instanceCreatedAt }}</span>
+      <h3>{{ user?.name }}</h3>
+      <p>{{ user?.email }}</p>
+      <p class="hint">Subscribes to route.paramMap + switchMap — re-fetches on every navigation, same instance or not.</p>
+    </div>
+  `,
+})
+export class FixedUserDetailComponent implements OnInit {
+  private route = inject(ActivatedRoute);
+  private userService = inject(UserService);
+  user?: User;
+  instanceCreatedAt = new Date().toLocaleTimeString();
+
+  ngOnInit() {
+    this.route.paramMap
+      .pipe(
+        map((params) => params.get('id')!),
+        distinctUntilChanged(),
+        switchMap((id) => this.userService.getUser(id))
+      )
+      .subscribe((u) => (this.user = u));
+  }
+}
+```
+
+```typescript
+// app.component.ts — drives both panes; note the single combined
+// navigate() call in ngOnInit (see the interview trap on this below)
+export class AppComponent implements OnInit {
+  private router = inject(Router);
+  buggyTargetId = signal(12);
+  fixedTargetId = signal(12);
+
+  ngOnInit() {
+    this.router.navigate([{ outlets: { buggy: ['users', '12'], fixed: ['users', '12'] } }]);
+  }
+
+  buggyNext() {
+    const next = this.buggyTargetId() + 1;
+    this.buggyTargetId.set(next);
+    this.router.navigate([{ outlets: { buggy: ['users', String(next)] } }]);
+  }
+
+  fixedNext() {
+    const next = this.fixedTargetId() + 1;
+    this.fixedTargetId.set(next);
+    this.router.navigate([{ outlets: { fixed: ['users', String(next)] } }]);
+  }
+}
+```
+
+`instanceCreatedAt` is a timestamp captured once at construction, in both components. It stays frozen through every "next user" click in the demo — proof the same component instance really is being reused in both the buggy and fixed cases. Only the *data displayed* diverges, which is exactly the point: the bug isn't instance reuse, it's how the id is read.
+
+## 5. Example Explanation — Execution Flow
+
+1. On load, `AppComponent.ngOnInit()` fires a single navigate call activating both the `buggy` and `fixed` outlets at `users/12`. (A single combined call matters here — see the interview trap below.)
+2. Both `BuggyUserDetailComponent` and `FixedUserDetailComponent` are constructed for the first time; both `ngOnInit`s run; both fetch and display Alice Johnson (user 12); both stamp the same `instanceCreatedAt`.
+3. The user clicks "Next user →" on the buggy pane. `AppComponent.buggyNext()` calls `router.navigate` targeting `users/13` on the `buggy` outlet only. The router matches the same route config (`'users/:id'` on outlet `buggy`) and, per the default reuse strategy, reuses the existing `BuggyUserDetailComponent` instance rather than destroying and recreating it.
+4. Because the instance is reused, `ngOnInit` does not run again. The component's `user` field still holds Alice Johnson from step 2. The URL correctly updates to reflect `/users/13`, but the rendered UI is now lying about which user it's showing.
+5. The user clicks "Next user →" on the fixed pane. Same reuse happens — `FixedUserDetailComponent`'s instance is also kept alive, `ngOnInit` also doesn't re-run. But its `ngOnInit` set up a subscription to `route.paramMap` back in step 2, and that subscription is still alive and listening. The route's param map emits `{ id: '13' }`, `switchMap` fires `getUser('13')`, and the pane correctly updates to Bob Martinez.
+6. Both instances have identical, frozen `instanceCreatedAt` timestamps throughout — demonstrating the fix has nothing to do with forcing Angular to create a new component; it's entirely about not tying a value that changes over the component's lifetime to a hook that only runs once.
+
+## 6. When does this show up?
+
+Any detail/edit page reached via a route param, where users can navigate between sibling records without leaving the route: "next/previous" pagination controls (exactly this scenario), a sidebar list where clicking a different row updates a param without route teardown, breadcrumb or tab navigation between records of the same type, or deep-linking from search results into a shared detail route. It's especially easy to miss in code review because the bug is invisible in the common case: it can't be seen by simply loading `/users/12` fresh (that always works — the first load always constructs a real, new instance) — it only appears once you navigate a *second* time within the same session, which manual testing often overlooks if the test always starts from a cold load.
+
+## 7. Advantages / Disadvantages
+
+**Advantages (of Angular's default reuse behavior):**
+- Avoids the cost of destroying and reconstructing a component tree (and any forms, subscriptions, or child components inside it) on every param-only navigation — meaningfully better performance for detail/edit pages with expensive setup.
+- Preserves component-local UI state (like scroll position or an open accordion) across param changes when that's actually desirable.
+- It's the correct default for the common case: components that read route data reactively work correctly and *benefit* from not being torn down.
+
+**Disadvantages:**
+- It's a silent trap for the equally common pattern of reading route data via `ActivatedRoute.snapshot` inside `ngOnInit` — that pattern is what most tutorials and quick prototypes reach for first, and it's correct right up until the same route is reactivated with different params.
+- The failure mode is silent and easy to miss in testing: no error, no console warning, just wrong data on screen — and only on the *second* navigation within a session, not the first.
+- Debugging it requires knowing about `RouteReuseStrategy` internals; someone unfamiliar with the concept will often chase the bug in the wrong place (assuming a caching or backend issue) before realizing the frontend never re-fetched at all.
+
+## 8. Common Interview Traps
+
+- Assuming Angular always creates a fresh component per navigation — it doesn't, by default, when the route config is the same and only params differ. This is the root cause and the detail most candidates miss.
+- "Fixing" this by forcing Angular to destroy/recreate the component (e.g., via a custom `RouteReuseStrategy` that never reuses, or keying the component with `*ngIf` tricks) — this works but throws away the actual benefit of reuse and is the wrong lever for this specific bug; the idiomatic fix is reading route state reactively, not disabling reuse.
+- Reading `route.params` or `route.paramMap` correctly, but doing it inside a method that itself only runs once (e.g., subscribing inside a function called from a `click` handler rather than in `ngOnInit`, or subscribing but never actually re-triggering the fetch because of a missing `switchMap`/`map` chain).
+- Forgetting `switchMap` (or using `mergeMap` instead) when chasing route params into an HTTP call — under fast repeated navigation, a slower earlier response can resolve after a faster later one and silently overwrite the correct, newer data with stale data. This is a *second*, subtler version of the same "stale data" symptom, caused by response ordering instead of missed re-fetching.
+- Firing multiple independent `router.navigate()` calls back-to-back and expecting all of them to take effect — a later `navigate()` call can cancel an earlier one that hasn't finished resolving yet if they're not combined into a single navigation (relevant for multi-outlet navigation, and for any code that calls `navigate` more than once in quick succession, e.g. in `ngOnInit`).
+
+## 9. Interview Follow-up Questions
+
+**Q1: Would this bug happen if `/users/12` and `/users/13` were both hit via a hard page reload (not a client-side navigation)?**
+No — a full page reload tears down the entire Angular application and rebuilds it from scratch, so the component is always freshly constructed and `ngOnInit` always runs with the correct id. The bug only exists within a single running Angular app instance doing client-side routing, which is exactly why it's easy to miss in casual manual testing (most people test by loading URLs directly rather than clicking in-app navigation controls repeatedly).
+
+**Q2: How would you write an automated test that catches this class of bug?**
+Render the component, navigate via the router's `navigate()` (not by reloading or recreating the fixture) to change only the route param, and assert the displayed data updated — specifically avoid recreating the component/fixture between the two navigations, since recreating it would mask the bug by accidentally doing what `RouteReuseStrategy` doesn't do in production. The test needs to exercise the *same* component instance across two navigations to be a faithful reproduction.
+
+**Q3: Is there a way to detect "the route reused my component and I need to react to that" without RxJS, e.g. using signals-based or lifecycle-based patterns?**
+Yes — since Angular 16+, standalone route configs support binding route params directly to component `@Input()`s via `withComponentInputBinding()` on `provideRouter()`; Angular then keeps that input updated across reused-instance navigations automatically (it's implemented internally via the same paramMap-style reactivity, just exposed as a plain `@Input()` instead of a manual subscription). You'd still typically pair it with an `ngOnChanges` (or a signal `effect`) to react to the input changing and trigger a re-fetch, but it removes the need to manually inject `ActivatedRoute` and subscribe for this specific case.
+
+**Q4: What if the "next user" button used `[routerLink]` in the template instead of an imperative `router.navigate()` call — does the bug still happen?**
+Yes, identically — `routerLink` and `router.navigate()` both go through the same `Router`/`RouteReuseStrategy` machinery under the hood. The bug is about how the *destination* component reads its route data, not about which mechanism triggered the navigation.
+
+**Q5: Could implementing a custom `RouteReuseStrategy` that reuses across sibling routes (not just same-route-different-params) make this worse or introduce new categories of this bug?**
+Yes — a custom strategy that reuses component instances across genuinely different routes (not just param changes on the same route) would need every affected component to reactively handle *route changes*, not just param changes, via `this.route.url` or similar, or the same stale-data symptom appears whenever the strategy decides to reuse. This is a good example of why route-reuse customization needs to be paired with an audit of every component's assumptions about when it gets reconstructed.
+
+## 10. Quick Answer (say this first)
+
+"The URL updates because the router genuinely navigates, but the component gets reused — same route config, only the `:id` param changed — so `ngOnInit` doesn't fire again. If the component read the id once via `route.snapshot.paramMap` inside `ngOnInit`, it's stuck holding the old data forever. The fix is to subscribe to `route.paramMap` reactively with `switchMap` instead of reading a one-time snapshot, so it re-fetches on every param change regardless of whether the instance was reused."
+
+## 11. Interview-Ready Answer (full)
+
+"This is a route-reuse bug, and the key fact to know is that Angular's default `RouteReuseStrategy` doesn't destroy and recreate a component just because a route parameter changed — if the URL goes from `/users/12` to `/users/13` and both match the exact same route config, Angular reuses the already-active component instance and just updates the underlying `ActivatedRoute`'s data. That's a deliberate performance optimization, but it silently breaks any component that reads route data the naive way: grabbing `route.snapshot.paramMap.get('id')` inside `ngOnInit`. `ngOnInit` only runs once per component instance, and since the instance is being reused rather than recreated, that one-time read never happens again — the component keeps whatever data it fetched the first time, while the URL and the rest of the app have moved on.
+
+The fix isn't to prevent reuse — it's to stop relying on a lifecycle hook that only fires once for data that can change many times over the component's life. Instead, subscribe to `route.paramMap`, which is a long-lived Observable tied to the `ActivatedRoute` itself and re-emits on every relevant navigation, reused instance or not. Pipe that through `switchMap` into the actual data fetch — that's what makes it safe under fast repeated navigation, since `switchMap` cancels a slow, still-in-flight request from an earlier id if a newer navigation happens before it resolves, so an outdated response can never arrive late and clobber newer data. A `distinctUntilChanged()` before the `switchMap` avoids a redundant re-fetch if the same id gets emitted twice.
+
+The thing I'd flag as the real 'gotcha' here for anyone debugging this live: it's completely invisible on the first page load — a fresh `/users/12` load always constructs a real new component, so it works. It only shows up on the second navigation onward within the same session, which is exactly the kind of thing that's easy to miss if your manual or automated testing only ever starts from a cold load instead of clicking through the app's own navigation controls."
+
+## 12. Quick Revision
+
+- Default `RouteReuseStrategy` reuses the component instance when the *same route config* is reactivated with different params — it does not tear down and rebuild.
+- `ngOnInit` only runs once per instance — reading route data there via `route.snapshot` is a one-time read that goes stale the moment the instance is reused.
+- Fix: subscribe to `route.paramMap` (long-lived Observable, tied to the route not the component's construction) instead of `route.snapshot`.
+- Pipe through `switchMap` to re-fetch per emission and cancel stale in-flight requests; add `distinctUntilChanged()` to skip redundant re-fetches on identical ids.
+- The bug is invisible on first/cold load — it only appears on the second in-app navigation onward, which is why it's easy to miss in casual testing.
+- The fix is *not* disabling route reuse (e.g. via a custom `RouteReuseStrategy`) — that throws away a real performance benefit for the wrong reason; the correct fix targets how route data is read, not whether the instance is reused.
+- Newer alternative: `withComponentInputBinding()` on `provideRouter()` binds route params to `@Input()`s and keeps them updated across reused instances automatically, removing the need for a manual `ActivatedRoute` subscription for this specific case.
+- Multi-outlet gotcha: combine multiple outlet updates into a single `router.navigate()` call — separate back-to-back calls can race and cancel each other.
+
+## 13. Memory Trick
+
+**"Same seat, new passenger — but the driver only checks ID once."**
+The component instance is the seat — Angular doesn't replace the whole car (destroy/recreate) just because a new passenger (a new `:id`) sits down; that's the efficient part, and it's fine. The bug is the driver (a snapshot read in `ngOnInit`) who only checks the passenger's ID once, when the car first pulled up, and then just keeps driving toward the original destination no matter who's actually in the seat now. The fix is to keep checking — subscribe to `paramMap`, don't snapshot it once — so the driver always knows who's really in the car.
