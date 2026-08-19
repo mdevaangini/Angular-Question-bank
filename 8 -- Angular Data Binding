@@ -1,0 +1,250 @@
+# Angular Data Binding — Interpolation, Property, Event, Two-way
+
+## 1. What is it?
+
+Data binding is how Angular keeps the component class (TypeScript) and the template (HTML) automatically in sync, without you manually touching the DOM. Angular has four binding forms:
+
+- **Interpolation** — `{{ expression }}` — component → view.
+- **Property binding** — `[property]="expression"` — component → view.
+- **Event binding** — `(event)="handler($event)"` — view → component.
+- **Two-way binding** — `[(ngModel)]="property"` — component ↔ view, both directions at once.
+
+## 2. Why was it introduced?
+
+Before frameworks like Angular, keeping the UI in sync with application state meant manually querying the DOM (`document.getElementById(...)`) and writing to it every time data changed, and manually attaching/removing event listeners to read user input back into your data. This was verbose, easy to get out of sync, and a common source of bugs — you'd update a variable in JS but forget to update the three places in the DOM that displayed it.
+
+**Problem without it:** state and UI drift apart because syncing them is a manual, imperative, error-prone chore repeated everywhere in the codebase.
+
+**What it solves:** Angular's binding syntax lets you *declare* the relationship between a template and a component property once — `{{ count }}`, `[disabled]="isDisabled"`, `(click)="save()"` — and Angular's change detection keeps them in sync automatically, in both directions where needed. You stop writing DOM manipulation code entirely for the common case.
+
+## 3. How does it work?
+
+**Interpolation — `{{ expression }}`**
+
+- One-way: component → view only.
+- Used for text content (and rarely, attribute-position string interpolation).
+- The expression is evaluated on every change detection cycle and the result is stringified into the DOM.
+
+**Property binding — `[property]="expression"`**
+
+- One-way: component → view only.
+- Binds to the target's actual **DOM property** (a JavaScript object property, e.g. `inputElement.disabled`), not the HTML attribute. This distinction matters: some attributes (like `disabled`, `value`, `checked`) have a corresponding DOM property that Angular sets directly, which is why `[disabled]="isDisabled"` works even though `disabled` "attribute" semantics in raw HTML are different (presence-based, not value-based).
+- For things that don't have a DOM property equivalent — ARIA attributes, `colspan`, SVG attributes — you use explicit attribute binding: `[attr.colspan]="2"`.
+- Special forms: `[class.active]="isActive"`, `[style.color]="color"`.
+
+**Event binding — `(event)="handler($event)"`**
+
+- One-way: view → component only.
+- Listens for a native DOM event (`click`, `input`, `keyup`) or a custom event emitted by a child component (via `@Output()`), and calls a component method when it fires.
+- `$event` gives you the native `Event` object for DOM events, or whatever value the child component's `EventEmitter` emitted for custom events.
+
+**Two-way binding — `[(x)]="property"` ("banana in a box")**
+
+- Combines property binding and event binding into one syntax. `[(ngModel)]="searchTerm"` is literally shorthand for:
+
+  ```html
+  <input [ngModel]="searchTerm" (ngModelChange)="searchTerm = $event" />
+  ```
+
+- Requires `FormsModule` to be imported for `ngModel` specifically (a very common "why isn't this working" gotcha — without the import, Angular throws `Can't bind to 'ngModel' since it isn't a known property`).
+- You can create the same pattern on your **own** components: define `@Input() rating` and `@Output() ratingChange = new EventEmitter<number>()`. Angular's compiler recognizes the `Input`/`InputChange` naming convention and lets a parent write `[(rating)]="userRating"`, which desugars to `[rating]="userRating" (ratingChange)="userRating = $event"` exactly the same way `ngModel` does.
+- (Newer Angular versions also offer `model()` — a signal-based input that generates the paired input/output automatically — as a more modern alternative to the manual `@Input`/`@Output` pair.)
+
+## 4. Example
+
+**Live demo (all four binding types + the performance trap below):** [https://stackblitz.com/edit/angular-jtr5ecfb](https://stackblitz.com/edit/angular-jtr5ecfb)
+
+```ts
+// app.component.ts
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { StarRatingComponent } from './star-rating.component';
+
+interface Product {
+  id: number;
+  name: string;
+}
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule, FormsModule, StarRatingComponent],
+  templateUrl: './app.component.html',
+  styleUrls: ['./app.component.css']
+})
+export class AppComponent {
+  // --- Interpolation + Event binding demo ---
+  count = 0;
+  increment(): void {
+    this.count++;
+  }
+
+  // --- Property binding demo ---
+  isDisabled = false;
+  toggleDisabled(): void {
+    this.isDisabled = !this.isDisabled;
+  }
+
+  // --- Two-way binding (ngModel) demo ---
+  searchTerm = '';
+
+  products: Product[] = [
+    { id: 1, name: 'Laptop' },
+    { id: 2, name: 'Mouse' },
+    { id: 3, name: 'Keyboard' },
+    { id: 4, name: 'Monitor' }
+  ];
+
+  // PERFORMANCE TRAP: this getter re-runs on EVERY change detection cycle,
+  // not just when searchTerm changes -- every keystroke, every click
+  // anywhere in this component, re-executes this filter.
+  get filteredProducts(): Product[] {
+    console.log('filteredProducts recalculated');
+    return this.products.filter(p =>
+      p.name.toLowerCase().includes(this.searchTerm.toLowerCase())
+    );
+  }
+
+  // --- Custom two-way binding demo ---
+  userRating = 3;
+}
+```
+
+```html
+<!-- app.component.html -->
+<h2>1. Interpolation</h2>
+<p>Button clicked {{ count }} times</p>
+
+<h2>2. Property Binding</h2>
+<button [disabled]="isDisabled">Submit</button>
+<button (click)="toggleDisabled()">Toggle disabled state</button>
+
+<h2>3. Event Binding</h2>
+<button (click)="increment()">Click me</button>
+
+<h2>4. Two-way Binding (ngModel)</h2>
+<input [(ngModel)]="searchTerm" placeholder="Search products..." />
+<p>Typed: {{ searchTerm }}</p>
+<ul>
+  <li *ngFor="let product of filteredProducts">{{ product.name }}</li>
+</ul>
+
+<h2>Custom Two-way Binding (banana in a box)</h2>
+<app-star-rating [(rating)]="userRating"></app-star-rating>
+<p>Current rating: {{ userRating }}</p>
+```
+
+```ts
+// star-rating.component.ts — a custom two-way-bindable component
+import { Component, EventEmitter, Input, Output } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+@Component({
+  selector: 'app-star-rating',
+  standalone: true,
+  imports: [CommonModule],
+  templateUrl: './star-rating.component.html'
+})
+export class StarRatingComponent {
+  @Input() rating = 0;
+  @Output() ratingChange = new EventEmitter<number>();
+
+  stars = [1, 2, 3, 4, 5];
+
+  setRating(value: number): void {
+    this.rating = value;
+    this.ratingChange.emit(value);
+  }
+}
+```
+
+## 5. Example Explanation / Execution Flow
+
+- **Interpolation:** `{{ count }}` is re-evaluated by Angular every change detection cycle and the text node is updated if the stringified value changed.
+- **Property binding:** `[disabled]="isDisabled"` sets the actual `disabled` DOM property on the `<button>` element directly — toggling `isDisabled` in the class immediately reflects in the button's enabled/disabled state, no manual `element.disabled = ...` needed.
+- **Event binding:** clicking "Click me" fires the native `click` event, which Angular has wired to call `increment()`; `count` changes, and because `count` is read via interpolation, the view updates on the next change detection pass.
+- **Two-way binding:** typing in the search input fires `ngModel`'s underlying `input` event, which pushes the new value into `searchTerm` (view → component), and the `[ngModel]` property binding half immediately reflects `searchTerm` back into the input's `value` (component → view) — both directions, wired by one `[(ngModel)]` expression.
+- **Custom two-way binding:** clicking a star calls `setRating(3)` inside `StarRatingComponent`, which updates its own `rating` **and** emits `ratingChange`. Because the parent wrote `[(rating)]="userRating"`, Angular's desugared event binding (`(ratingChange)="userRating = $event"`) catches that emission and updates `userRating` in `AppComponent` — the exact same mechanism `ngModel` uses, just applied to a component you wrote yourself.
+- **The performance trap:** `filteredProducts` is a **getter**, and it's called from `*ngFor="let product of filteredProducts"` — every single time Angular runs a change detection pass anywhere in this component (which happens on the `increment()` click, the `toggleDisabled()` click, *and* every keystroke in the search box), `filteredProducts` runs again and re-filters the array from scratch, even if `searchTerm` never changed. This is visible directly in the console log.
+
+## 6. When should we use it?
+
+- **Interpolation** — displaying computed or component text content in the DOM.
+- **Property binding** — setting a DOM property from component state: `disabled`, `src`, `[class.x]`, `[style.x]`, passing data into a child's `@Input()`.
+- **Event binding** — responding to user interaction: clicks, form submission, keystrokes, or a child component's custom `@Output()` event.
+- **Two-way binding** — simple form fields where you genuinely want the component property to always mirror the input's value with minimal boilerplate — quick prototypes, small forms, filter/search boxes, toggles. For anything with validation, cross-field logic, or many controls, Reactive Forms is usually the better choice (see the follow-up on performance below).
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- Declarative — the template describes *what* should be synced, not *how* to sync it.
+- Removes manual DOM query/update code almost entirely.
+- Two-way binding in particular collapses "read value + write value" into one line, which is genuinely convenient for small forms.
+
+**Disadvantages**
+
+- Two-way binding hides two operations (a property binding and an event binding) behind one syntax, which can make it less obvious what's actually happening — especially to someone debugging unexpected re-renders.
+- Overusing two-way binding across a large form (many `[(ngModel)]`s) couples the template tightly to component state in a way that's harder to validate, test, and reason about compared to Reactive Forms.
+- Any binding — not just two-way — that calls a method or getter in the template is a performance risk, because Angular's default change detection re-evaluates template expressions on every CD cycle, not only when their dependencies change.
+
+## When can two-way binding hurt performance?
+
+Two-way binding itself isn't inherently slow — the real issue is combining it with Angular's **default change detection strategy** and **template method/getter calls**, and it happens to be an easy trap to fall into with `ngModel` specifically:
+
+- **`ngModel` fires on every keystroke**, not debounced. Each keystroke triggers Angular's change detection for the *entire component tree* rooted at that component (under the default `ChangeDetectionStrategy.Default`), not just the input itself.
+- If any binding elsewhere in that tree calls a **method or getter** in the template — like `*ngFor="let x of filteredProducts"` where `filteredProducts` is a getter that filters an array — that method re-runs on *every single change detection cycle*, including ones triggered by completely unrelated events (another button's click, another input's keystroke). With a large list or an expensive computation, this becomes real, measurable jank as the user types.
+- **Two-way binding inside `*ngFor`** compounds this: if you have `[(ngModel)]` on an input inside each row of a long list, every keystroke in *any* row triggers change detection across the whole list (again, under default CD), not just that row — unless you explicitly opt each row component into `ChangeDetectionStrategy.OnPush` and use `trackBy` so Angular can skip unaffected rows.
+- **Binding to a function call that returns a new object/array reference each time** (rather than a stable reference) can also trigger `ExpressionChangedAfterItHasBeenCheckedError` in dev mode, and forces downstream bindings depending on that reference (like `*ngFor` diffing) to redo more work than necessary.
+
+**The fix isn't "avoid two-way binding" — it's:**
+
+1. Use `ChangeDetectionStrategy.OnPush` on components so Angular only re-checks them when an `@Input()` reference actually changes, an event originates from within them, or an observable they're subscribed to (via the `async` pipe) emits.
+2. Avoid calling methods/getters directly in templates for anything non-trivial — precompute the value into a plain property, or use a `computed()` signal / a memoized RxJS pipe (`distinctUntilChanged`, `debounceTime`) instead.
+3. For high-frequency inputs like search boxes, prefer Reactive Forms with `valueChanges.pipe(debounceTime(300), distinctUntilChanged())` over raw `ngModel`, so expensive downstream work (filtering, HTTP calls) doesn't run on every keystroke.
+4. Use `trackBy` with `*ngFor` so Angular doesn't tear down and recreate DOM nodes unnecessarily when the underlying array reference changes.
+
+## 8. Common Interview Traps
+
+- Confusing HTML **attribute** vs DOM **property** — `[disabled]` binds the property; `[attr.colspan]` binds the attribute. Not every attribute has a corresponding property (hence `attr.` bindings for ARIA attributes, `colspan`, SVG attributes).
+- Thinking interpolation is bidirectional — it isn't; it's one-way, component → view, same direction as property binding, just for text content.
+- Not knowing `[(ngModel)]` is literally sugar for `[ngModel]` + `(ngModelChange)` — a very common follow-up question is to ask the candidate to write out the desugared form.
+- Forgetting `ngModel` requires importing `FormsModule` — a genuinely common Angular compile error for beginners.
+- Blaming "two-way binding" itself for performance issues instead of identifying the real cause: default change detection re-running expensive template expressions (methods/getters) on every cycle, which two-way binding's high-frequency triggering (every keystroke) simply exposes more often.
+- Not knowing how to implement a **custom** two-way binding on your own component (`@Input`/`@Output` with the `xChange` naming convention).
+
+## 9. Interview Follow-up Questions
+
+**Q: What does `[(ngModel)]="value"` desugar to?**
+Answer: `[ngModel]="value" (ngModelChange)="value = $event"` — a property binding paired with an event binding, combined into one syntax.
+
+**Q: How do you create a two-way binding on your own custom component?**
+Answer: Define `@Input() x` and a paired `@Output() xChange = new EventEmitter<T>()`. When you update `x` internally and emit `xChange`, a parent can then use `[(x)]="someProperty"` and Angular expands it to `[x]="someProperty" (xChange)="someProperty = $event"` automatically, because Angular's compiler recognizes the `xChange` naming convention.
+
+**Q: What's the difference between `[colspan]` and `[attr.colspan]`?**
+Answer: `colspan` has no corresponding DOM property on most elements in the way `disabled` or `value` do, so `[colspan]` alone wouldn't reliably work — you need `[attr.colspan]` to explicitly set the HTML attribute itself. This distinction generally applies to attributes without a JS property equivalent: ARIA attributes, SVG attributes, `colspan`/`rowspan`.
+
+**Q: Why can excessive two-way binding hurt performance in a large form?**
+Answer: Because `ngModel` triggers change detection on every keystroke by default, and under `ChangeDetectionStrategy.Default` that re-checks the whole component tree, including any methods or getters called from templates. In a large form or list, that means expensive work re-runs far more often than necessary — the fix is `OnPush` change detection, `trackBy`, and avoiding method calls in templates, or switching to debounced Reactive Forms for high-frequency inputs.
+
+**Q: Is two-way binding compatible with Reactive Forms?**
+Answer: Not directly — Reactive Forms uses `formControlName`/`[formControl]` plus explicit `valueChanges` subscriptions instead of `ngModel`. You *can* still build a two-way-binding-like custom component using `@Input`/`@Output`, independent of which form approach the parent uses.
+
+## 10. Interview-Ready Answer
+
+"Angular has four core binding types. Interpolation, `{{ }}`, and property binding, `[prop]`, are both one-way, component to view — interpolation is for text content, property binding sets the actual DOM property, like `[disabled]`. Event binding, `(event)`, is one-way the other direction, view to component, for reacting to clicks or custom outputs. And two-way binding, `[(ngModel)]`, is really just property binding and event binding combined into one syntax — under the hood it's `[ngModel]` plus `(ngModelChange)`. You can even build the same pattern on your own components with a paired `@Input` and `@Output` named `xChange`. Where two-way binding can hurt performance is that `ngModel` fires on every keystroke, and under Angular's default change detection that re-checks the whole component tree each time — so if a template anywhere in that tree calls a method or a getter, like filtering a list, that work re-runs on every keystroke even if it has nothing to do with the input. It's not that two-way binding is inherently slow, it's that it triggers change detection frequently, which exposes any expensive template expression elsewhere. The fix is `OnPush` change detection, avoiding method calls in templates, and for anything high-frequency like search inputs, using Reactive Forms with `debounceTime` instead of raw `ngModel`."
+
+## 11. Quick Revision
+
+- **What:** Interpolation `{{ }}` and property binding `[x]` — component → view. Event binding `(x)` — view → component. Two-way binding `[(x)]` — both, at once.
+- **Why:** Removes manual DOM read/write code; declares the sync relationship once instead of imperatively keeping UI and state in sync by hand.
+- **Problem solved:** State/UI drift and repetitive manual DOM manipulation.
+- **How:** `[(ngModel)]` = `[ngModel]` + `(ngModelChange)` under the hood; same pattern buildable on custom components via `@Input()`/`@Output() xChange`.
+- **Use when:** Interpolation for text; property binding for DOM properties/`@Input`s; event binding for user interaction/`@Output`s; two-way binding for small, simple forms.
+- **Important:** Two-way binding's performance risk comes from triggering full-tree change detection on every keystroke under the default strategy, not from two-way binding itself — fix with `OnPush`, avoid method calls in templates, debounce high-frequency inputs.
+- **Remember:** `[attr.x]` vs `[x]` — attribute binding vs property binding are not the same thing.
+
+## Think of it as:
+
+Interpolation and property binding are a one-way loudspeaker — component shouting state into the view. Event binding is a one-way microphone — view reporting user actions back to the component. Two-way binding is a walkie-talkie: both sides talking through the same channel, which is exactly why "banana in a box" `[( )]` looks like brackets wrapped around parentheses — property binding's brackets wrapped around event binding's parentheses.
