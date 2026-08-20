@@ -217,6 +217,22 @@ The fix isn't to prevent reuse — it's to stop relying on a lifecycle hook that
 
 The thing I'd flag as the real 'gotcha' here for anyone debugging this live: it's completely invisible on the first page load — a fresh `/users/12` load always constructs a real new component, so it works. It only shows up on the second navigation onward within the same session, which is exactly the kind of thing that's easy to miss if your manual or automated testing only ever starts from a cold load instead of clicking through the app's own navigation controls."
 
+
+
+// for the mental model 
+
+The key distinction here is between reading a value once and subscribing to a stream that keeps emitting, and which object each one is actually tied to.
+route.snapshot.paramMap.get('id') is a synchronous read of a frozen object. route.snapshot is a plain data snapshot — it represents the route's params at the exact instant you read it, and it never changes after that. So the moment you call .get('id') inside ngOnInit, you get a single string back, use it, and that's it. Nothing about that value is "live" — there's no mechanism for it to notify you later that the id changed, because it's not an Observable, it's just an object.
+route.paramMap (without .snapshot) is different — it's an Observable. And the important part is whose Observable it is. Angular creates one ActivatedRoute object per routed position in the component tree (per outlet), and that ActivatedRoute is what actually persists across a reuse-eligible navigation — not just the component. When you navigate from /users/12 to /users/13 and Angular decides to reuse the component instance, it's also reusing that same ActivatedRoute instance and just pushing new param data through it. The ActivatedRoute doesn't get destroyed and recreated — it just keeps emitting new values on its paramMap Observable every time the router reactivates that route entry with different params.
+So when the fixed component does this inside ngOnInit:
+
+typescript
+this.route.paramMap.pipe(...).subscribe((u) => (this.user = u));
+
+it's not asking "what's the id right now" (a one-time question with a one-time answer). It's saying "keep telling me whenever this changes, for as long as I'm subscribed." ngOnInit still only runs once — but all it's doing there is setting up a subscription, not reading a value. The subscription itself is a standing instruction that stays active for the component's entire life, and it keeps firing every time the underlying ActivatedRoute (the thing tied to the route, not the component) emits a new param map — which happens on every relevant navigation, whether or not the component instance was recreated.
+
+A useful mental model: route.snapshot is a photograph — accurate the moment it's taken, frozen forever after. route.paramMap is a live camera feed — you only have to point it (subscribe) once, but you keep getting new frames indefinitely. The bug in the original code wasn't that it used ngOnInit — the fix uses ngOnInit too. The bug was pairing ngOnInit with a photograph instead of a camera feed.
+//
 ## 12. Quick Revision
 
 - Default `RouteReuseStrategy` reuses the component instance when the *same route config* is reactivated with different params — it does not tear down and rebuild.
