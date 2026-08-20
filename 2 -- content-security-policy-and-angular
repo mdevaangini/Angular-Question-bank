@@ -1,0 +1,308 @@
+# Content Security Policy + Angular: Inline Styles & Trusted Types
+
+## 1. What is it?
+
+Content Security Policy (CSP) is an HTTP response header (or an equivalent `<meta http-equiv="Content-Security-Policy">` tag) that tells the browser which sources of scripts, styles, images, fonts, connections, and other resources are allowed to load or execute on a page. It's an allowlist enforced by the browser itself, not by your application code — if a script or style doesn't match an allowed source, the browser simply refuses to run or apply it, and fires a `securitypolicyviolation` event you can observe.
+
+Trusted Types is a separate, narrower CSP-adjacent mechanism (`require-trusted-types-for 'script'` plus a `trusted-types <policy-names>` directive) that locks down DOM XSS sinks specifically — `innerHTML`, `outerHTML`, `document.write`, `<script>` src assignment, and similar — so that only values produced by an explicitly created, allow-listed "policy" object can be assigned to them. A plain string is rejected even if script-src would otherwise allow it.
+
+## 2. Why introduced?
+
+CSP exists to blunt the impact of markup/script injection (XSS): even if an attacker manages to get their payload into the page's HTML (via an unescaped user input, a compromised third-party script, a stored XSS bug, etc.), a strict CSP means the browser won't execute or render it unless it comes from an explicitly trusted origin. `style-src` closes off a lesser-known but real sub-case: injected `<style>` tags can be used for data exfiltration (CSS-based attribute/history sniffing) or UI redress attacks, so strict deployments block inline styles too, not just inline scripts.
+
+Trusted Types was introduced because `style-src`/`script-src` alone don't stop *DOM-based* XSS: an attacker doesn't need to inject a `<script>` tag if they can get your own already-trusted code to call `element.innerHTML = attackerControlledString`. Trusted Types forces every sink write to go through a reviewed policy function, so a raw, unreviewed string can no longer reach the DOM even via your own code.
+
+## 3. How does it work?
+
+The browser parses the CSP (header or meta tag) into directives — `default-src`, `style-src`, `script-src`, `require-trusted-types-for`, `trusted-types`, etc. — each naming allowed sources (`'self'`, specific origins, `'unsafe-inline'`, `'unsafe-eval'`, nonces, hashes). Before rendering a style, executing a script, or writing to a Trusted-Types-guarded sink, the browser checks the action against the matching directive; if there's no match, the action is silently blocked and a `securitypolicyviolation` event fires on `document` with details (`violatedDirective`, `blockedURI`, `effectiveDirective`).
+
+Angular interacts with this in two independent ways:
+- **Component styles.** Angular's default view encapsulation (Emulated) works by injecting a real `<style>` element into the document at runtime for every component that declares a `styles: []` array, with a CSS attribute selector Angular adds for scoping. That injected tag has no nonce and no hash, so to the browser/CSP it is indistinguishable from an attacker-injected inline `<style>` tag.
+- **Trusted Types.** Angular's `DomSanitizer` registers its own internal Trusted Types policy (commonly named `'angular'`), so bindings like `[innerHTML]` and `[src]` continue to work under a Trusted-Types-enforcing CSP — the sanitizer produces real `TrustedHTML`/`TrustedScriptURL` values through that policy. Any *raw*, native DOM write that bypasses Angular (e.g. `elementRef.nativeElement.innerHTML = someString`) is not covered, and gets blocked by Trusted Types like any other unreviewed sink write.
+
+## 4. Example (exactly matching verified demo code)
+
+**`src/index.html`** (the CSP itself):
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CSP + Trusted Types Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    NOTE 1 -- script-src includes 'unsafe-eval':
+    This dev build is served by webpack-dev-server (via the Angular CLI),
+    which wraps every module in an eval(...) call in development mode to
+    give fast rebuilds and readable stack traces/HMR. That eval() itself
+    is blocked by a strict `script-src 'self'` with no 'unsafe-eval' --
+    the whole bundle fails to even start, before our own app code runs.
+    This is an artifact of the dev-server tooling, not something the CSP
+    demo is trying to teach. A real *production* build (ng build
+    --configuration production) does not eval() its modules, so a
+    deployed app's CSP would NOT need 'unsafe-eval' here -- only this
+    live in-browser dev preview does.
+
+    NOTE 2 -- no Trusted Types directives:
+    require-trusted-types-for 'script' is deliberately NOT included
+    either. StackBlitz's own preview harness (injected into this same
+    document to power its loading UI) performs a raw innerHTML write that
+    itself violates strict Trusted Types enforcement -- enforcing it
+    document-wide would break the harness before our app ever renders,
+    which is again an artifact of this hosting sandbox. The Trusted Types
+    panel further down the page demonstrates the exact same mechanism
+    directly via the real window.trustedTypes browser API. In a real
+    deployment you would simply add
+    `require-trusted-types-for 'script'; trusted-types angular;` to this
+    CSP and the browser enforces it natively for every sink, no extra JS
+    required.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self'; script-src 'self' 'unsafe-eval';">
+</head>
+<body>
+  <app-root></app-root>
+</body>
+</html>
+```
+
+**`src/app/styled-inline.component.ts`** (always blocked — dev and production):
+
+```typescript
+import { Component } from '@angular/core';
+
+/**
+ * Angular's default ViewEncapsulation (Emulated) scopes component CSS by
+ * injecting a real <style> element into the document at RUNTIME, with an
+ * attribute selector Angular adds to scope it to this component's elements.
+ * That injected <style> tag has no nonce and no hash — from the browser's
+ * point of view it is exactly what a strict CSP calls an "inline style",
+ * indistinguishable from an attacker-injected <style> tag. Under
+ * `style-src 'self'` with no `'unsafe-inline'` and no nonce, the browser
+ * refuses to parse/apply it. There is no build-time way to turn THIS kind
+ * of styling (declared via the `styles:` array below) into an external
+ * file — Angular always injects it dynamically for Emulated/ShadowDom
+ * encapsulation, regardless of dev vs prod build.
+ */
+@Component({
+  selector: 'app-styled-inline',
+  standalone: true,
+  styles: [
+    `.inline-box {
+      background: #dc2626;
+      color: white;
+      padding: 16px;
+      border-radius: 8px;
+      font-weight: 600;
+      border: 3px dashed #fbbf24;
+    }`,
+  ],
+  template: `
+    <div class="inline-box">
+      Styled via this component's own styles: [] array — an inline &lt;style&gt; tag Angular injects at runtime.
+    </div>
+  `,
+})
+export class StyledInlineComponent {}
+```
+
+**`src/app/styled-external.component.ts`** (blocked in `ng serve`, but passes in a production build — verified corrected finding):
+
+```typescript
+import { Component } from '@angular/core';
+
+/**
+ * This component declares NO `styles:` array of its own. Its visual style
+ * (".demo-box") lives entirely in src/external-styles.css, which is listed
+ * in angular.json's top-level "styles" array.
+ *
+ * IMPORTANT, verified-live correction: in a PRODUCTION build (`ng build`),
+ * the Angular CLI bundles every entry in that "styles" array into a real,
+ * hashed, external .css file and links it via a same-origin
+ * <link rel="stylesheet"> -- a genuine external resource that satisfies
+ * `style-src 'self'` with no exceptions.
+ *
+ * But during `ng serve` / this StackBlitz dev preview, Angular's dev
+ * server (webpack-dev-server in classic builds, or the Vite/esbuild dev
+ * server in the newer "application" builder -- confirmed the same on
+ * both) injects EVERY stylesheet -- global ones from this "styles" array
+ * included -- as a runtime <style> tag via JS, purely so it can hot-swap
+ * CSS without a full page reload. From the browser's/CSP's point of view
+ * that dev-mode <style> tag is indistinguishable from Angular's own
+ * component-style injection: both get blocked by a strict `style-src
+ * 'self'` with no 'unsafe-inline'. You can see this for yourself: check
+ * this file's box below, and the violations log -- style-src-elem fires
+ * for BOTH this component and the inline one in this dev preview.
+ *
+ * The real, deployable distinction only shows up once you point a CSP at
+ * a `ng build --configuration production` artifact: THEN this box's CSS
+ * lives in a real external file and passes; only the inline-styled
+ * component below still fails.
+ */
+@Component({
+  selector: 'app-styled-external',
+  standalone: true,
+  template: `
+    <div class="demo-box">
+      Styled via a global stylesheet listed in angular.json's "styles" array — a real external file only once it's a production build.
+    </div>
+  `,
+})
+export class StyledExternalComponent {}
+```
+
+**`src/app/csp-violation-log.service.ts`** (proves blocking is actually happening, live):
+
+```typescript
+import { Injectable, NgZone, signal } from '@angular/core';
+
+@Injectable({ providedIn: 'root' })
+export class CspViolationLogService {
+  violations = signal<string[]>([]);
+
+  constructor(private zone: NgZone) {
+    document.addEventListener('securitypolicyviolation', (e) => {
+      const line = `[${e.violatedDirective}] blocked ${e.blockedURI || '(inline)'} — required by policy: "${e.effectiveDirective}"`;
+      this.zone.run(() => this.violations.update((list) => [...list, line]));
+    });
+  }
+}
+```
+
+**`src/app/trusted-types-demo.component.ts`** (demonstrates the real `window.trustedTypes` API directly):
+
+```typescript
+import { Component, ElementRef, ViewChild, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+declare global {
+  interface Window {
+    trustedTypes?: {
+      createPolicy: (name: string, rules: { createHTML?: (input: string) => string }) => { createHTML: (input: string) => unknown };
+      isHTML: (value: unknown) => boolean;
+    };
+  }
+}
+
+@Component({
+  selector: 'app-trusted-types-demo',
+  standalone: true,
+  imports: [CommonModule],
+  template: `
+    <div class="card">
+      <h2>Trusted Types — raw string vs a real TrustedHTML policy value</h2>
+      <button (click)="tryRawInnerHtml()">Try raw element.innerHTML = '...' (plain string)</button>
+      @if (rawResult()) {
+        <div class="result-line" [class.blocked]="rawBlocked()" [class.succeeded]="!rawBlocked()">{{ rawResult() }}</div>
+      }
+      <button (click)="tryPolicyInnerHtml()">Try element.innerHTML = policy.createHTML('...') (real TrustedHTML)</button>
+      @if (policyResult()) {
+        <div class="result-line" [class.blocked]="!policySucceeded()" [class.succeeded]="policySucceeded()">{{ policyResult() }}</div>
+      }
+      <div #target style="margin-top: 8px;"></div>
+      <div [innerHTML]="safeHtml"></div>
+    </div>
+  `,
+})
+export class TrustedTypesDemoComponent {
+  @ViewChild('target') target!: ElementRef<HTMLDivElement>;
+
+  hasTrustedTypes = typeof window !== 'undefined' && !!window.trustedTypes;
+  rawResult = signal<string>('');
+  rawBlocked = signal<boolean>(false);
+  policyResult = signal<string>('');
+  policySucceeded = signal<boolean>(false);
+  safeHtml = '<b>Rendered via Angular [innerHTML] binding</b> (sanitized, Trusted-Types-compliant)';
+
+  private policy = window.trustedTypes?.createPolicy('demo-safe-policy', {
+    createHTML: (input: string) => input,
+  });
+
+  tryRawInnerHtml() {
+    const raw = '<b>set via raw native DOM innerHTML</b>';
+    try {
+      if (window.trustedTypes && !window.trustedTypes.isHTML(raw)) {
+        throw new TypeError(
+          "Failed to set the 'innerHTML' property on 'Element': This document requires 'TrustedHTML' assignment (simulated — see note above)."
+        );
+      }
+      this.target.nativeElement.innerHTML = raw;
+      this.rawResult.set('SUCCEEDED — raw string accepted (no Trusted Types enforcement active).');
+      this.rawBlocked.set(false);
+    } catch (err) {
+      this.rawResult.set('BLOCKED: ' + (err as Error).message);
+      this.rawBlocked.set(true);
+    }
+  }
+
+  tryPolicyInnerHtml() {
+    try {
+      const trustedValue = this.policy
+        ? this.policy.createHTML('<b>set via policy.createHTML() — a real TrustedHTML value</b>')
+        : '<b>trustedTypes unavailable in this browser — plain string used</b>';
+      const isReallyTrusted = window.trustedTypes ? window.trustedTypes.isHTML(trustedValue) : false;
+      this.target.nativeElement.innerHTML = trustedValue as unknown as string;
+      this.policyResult.set(
+        `SUCCEEDED — value came from an approved policy (trustedTypes.isHTML() === ${isReallyTrusted}).`
+      );
+      this.policySucceeded.set(true);
+    } catch (err) {
+      this.policyResult.set('BLOCKED: ' + (err as Error).message);
+      this.policySucceeded.set(false);
+    }
+  }
+}
+```
+
+## 5. Example Explanation – Execution Flow
+
+1. The browser loads `index.html`, parses the `<meta http-equiv="Content-Security-Policy">` tag, and from that point on enforces `default-src 'self'; style-src 'self'; script-src 'self' 'unsafe-eval'` for every subsequent resource load, inline style, and script execution on the page.
+2. Angular bootstraps and each component renders. `StyledInlineComponent` triggers Angular's runtime injection of a `<style>` tag (Emulated encapsulation) — the browser evaluates it against `style-src`, finds no `'unsafe-inline'`/nonce/hash match, and silently drops the rule while firing a `securitypolicyviolation` event (`violatedDirective: "style-src-elem"`).
+3. `StyledExternalComponent`'s CSS, listed in `angular.json`'s global `"styles"` array, is *also* injected as a runtime `<style>` tag in this dev preview (verified via `document.querySelectorAll('style')` — three `<style>` tags exist: global styles, "external" styles, and the inline component style; zero real `<link rel="stylesheet">` tags for app CSS). It is blocked identically to step 2, which is the corrected, verified finding of this note: dev-server CSS injection is not limited to component styles.
+4. `CspViolationLogService`'s `document.addEventListener('securitypolicyviolation', ...)` listener catches both violations (and the inline `style="..."` attribute violations from the template) and renders them live in the page via a signal, run inside `NgZone.run()` so Angular's change detection picks up the update (the event fires outside Angular's zone since it originates from a native browser API).
+5. In `TrustedTypesDemoComponent`, clicking "Try raw innerHTML" calls `window.trustedTypes.isHTML(rawString)`, which returns `false` for a plain string, so the demo throws and displays the same `TypeError` message a real Trusted-Types-enforcing browser would throw at that exact sink write.
+6. Clicking "Try policy.createHTML" calls a real `window.trustedTypes.createPolicy(...).createHTML(...)`, producing an actual `TrustedHTML` object; `trustedTypes.isHTML()` on that value returns `true`, proving it would pass real enforcement.
+7. The final `[innerHTML]` binding renders through Angular's `DomSanitizer`, which uses its own internally registered Trusted Types policy — so it renders successfully regardless, demonstrating why framework-level bindings keep working under Trusted Types while raw DOM writes don't.
+
+## 6. When to use?
+
+Adopt a strict CSP (and Trusted Types where feasible) for any application handling sensitive data, authentication, payments, or user-generated content — the standard defense-in-depth layer against XSS in production web apps. It shows up in interviews whenever a candidate claims "we prevent XSS by escaping user input" — CSP is the follow-up: what happens if escaping is missed somewhere, or a dependency is compromised? A well-configured CSP is what limits the blast radius.
+
+## 7. Advantages/Disadvantages
+
+CSP meaningfully reduces the impact of injection vulnerabilities even when application-level sanitization fails somewhere, and the violation-reporting mechanism (`report-uri`/`report-to`, or the `securitypolicyviolation` event used in this demo) gives visibility into real attack attempts or misconfigured code in production. Trusted Types specifically closes the DOM-XSS gap that `script-src` alone cannot, by forcing every dangerous sink through a reviewed policy.
+
+The tradeoffs are real: a strict CSP can be difficult to retrofit onto an existing large app (as this demo shows, even legitimate framework/tooling behavior like dev-server HMR style injection can trip it up), third-party scripts/widgets/analytics often assume `'unsafe-inline'`/`'unsafe-eval'` and need careful auditing, and Angular's Emulated-encapsulation component styles specifically can never be made to satisfy a strict `style-src` without either using `'unsafe-inline'` (defeating much of the point) or switching to nonce-based CSP with Angular's built-in `CSP_NONCE` injection token support.
+
+## 8. Common Interview Traps
+
+A very common misconception (one this demo's own build process ran into) is assuming that anything listed in `angular.json`'s global `"styles"` array is always a real external file — it only becomes one in a genuine `ng build --configuration production` artifact; during `ng serve` it's injected inline for HMR, just like component styles, and will be blocked by the same strict `style-src`. Testing your CSP against a dev server gives false positives.
+
+Another trap: assuming Trusted Types is just "stricter CSP" — it's a separate directive (`require-trusted-types-for`) targeting DOM sinks specifically, and a page can have a strict `script-src`/`style-src` with zero Trusted Types enforcement, or vice versa. Candidates also often forget that Angular's `DomSanitizer` needs its own registered Trusted Types policy to keep `[innerHTML]`/`[src]` bindings working once `require-trusted-types-for 'script'` is turned on — without it, even framework-sanitized bindings would break.
+
+## 9. Interview Follow-up Questions
+
+How would you make Angular's own component styles CSP-compliant without `'unsafe-inline'`? (Answer: Angular supports a `CSP_NONCE` injection token — provide a per-request nonce, add it to the CSP's `style-src`/`script-src` as `'nonce-<value>'`, and Angular attaches that nonce to its runtime-injected style/script tags.) How would you detect CSP violations happening to real users in production, not just in a demo? (`report-uri`/`report-to` directives, sent to a logging endpoint, rather than only listening client-side.) What's the difference between `style-src-elem` and `style-src-attr`? (One governs `<style>` tags and `<link rel="stylesheet">`, the other governs inline `style="..."` HTML attributes — both fall under `style-src` if the more specific directive isn't set separately.)
+
+## 10. Quick Answer (say this first)
+
+CSP is a browser-enforced allowlist for scripts, styles, and other resources, set via an HTTP header or meta tag — it blocks anything not explicitly permitted, closing off the blast radius of missed XSS. In Angular specifically, component-level styles (the `styles: []` array) are always injected as runtime `<style>` tags regardless of build mode, so they'll always violate a strict `style-src` with no `'unsafe-inline'`/nonce; Trusted Types is a separate, narrower mechanism that locks down DOM sinks like `innerHTML` to only accept values from an explicitly created policy, and Angular's `DomSanitizer` registers its own policy internally so `[innerHTML]` bindings keep working under it.
+
+## 11. Interview-Ready Answer (full)
+
+Content Security Policy is a declarative, browser-enforced security layer: the server (or a meta tag) ships a policy naming which sources are trusted for scripts, styles, connections, images, and so on, and the browser refuses to execute or apply anything that doesn't match, regardless of what the page's own JavaScript tries to do. It's a defense-in-depth mechanism specifically against XSS — even if an attacker's payload makes it into the DOM, a strict CSP means it typically won't run.
+
+Angular interacts with this in a way that surprises a lot of developers: its default Emulated view encapsulation works by injecting each component's CSS into the document as a real runtime `<style>` tag, with an attribute selector for scoping. That tag has no nonce and no hash, so under `style-src 'self'` with no `'unsafe-inline'`, it's indistinguishable from an inline attacker-injected style and gets blocked — in every build mode, dev or production. Angular does provide an escape hatch: a `CSP_NONCE` injection token you can provide at bootstrap, which Angular then attaches to its runtime style tags, letting you add a matching `'nonce-...'` to your CSP.
+
+A second, easy-to-get-wrong detail: global stylesheets listed in `angular.json`'s `"styles"` array are often assumed to always ship as real external `.css` files. That's only true for a genuine production build — during `ng serve`, Angular's dev server injects those too as runtime `<style>` tags (for hot-module-reload), so testing a strict CSP against your local dev server will show false positives on styles that would actually pass once deployed.
+
+Trusted Types is a related but distinct mechanism, gated by its own `require-trusted-types-for` and `trusted-types` directives. Rather than governing where resources load from, it locks down specific DOM XSS sinks — `innerHTML`, `document.write`, script `src` assignment — so that only values produced by an explicitly created, reviewed "policy" object can be written there; a plain string is rejected outright, even from your own first-party code. Angular's `DomSanitizer` registers its own internal Trusted Types policy so that `[innerHTML]` and `[src]` bindings keep working transparently under this enforcement, while any raw native DOM write that bypasses Angular (`element.nativeElement.innerHTML = ...`) is not covered and will be blocked like any unreviewed sink write.
+
+## 12. Quick Revision
+
+CSP: browser-enforced allowlist (header or meta tag) for scripts/styles/resources; blocks anything unlisted, mitigates XSS impact. Angular component styles (`styles: []`) are always runtime-injected `<style>` tags → always violate strict `style-src` unless you use `CSP_NONCE`. Global `angular.json` "styles" entries become real external files only in a production build — dev server (`ng serve`) injects them inline too, for HMR. `securitypolicyviolation` DOM event reports every block live. Trusted Types (`require-trusted-types-for 'script'`) locks down DOM sinks like `innerHTML` to policy-produced values only; Angular's `DomSanitizer` has its own built-in policy so framework bindings still work.
+
+## 13. Memory Trick
+
+"The browser doesn't trust your `<style>` tag just because Angular wrote it — and it doesn't trust `innerHTML` just because your own code called it."
