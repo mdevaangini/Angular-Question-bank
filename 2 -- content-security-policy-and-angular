@@ -20,7 +20,7 @@ Angular interacts with this in two independent ways:
 - **Component styles.** Angular's default view encapsulation (Emulated) works by injecting a real `<style>` element into the document at runtime for every component that declares a `styles: []` array, with a CSS attribute selector Angular adds for scoping. That injected tag has no nonce and no hash, so to the browser/CSP it is indistinguishable from an attacker-injected inline `<style>` tag.
 - **Trusted Types.** Angular's `DomSanitizer` registers its own internal Trusted Types policy (commonly named `'angular'`), so bindings like `[innerHTML]` and `[src]` continue to work under a Trusted-Types-enforcing CSP — the sanitizer produces real `TrustedHTML`/`TrustedScriptURL` values through that policy. Any *raw*, native DOM write that bypasses Angular (e.g. `elementRef.nativeElement.innerHTML = someString`) is not covered, and gets blocked by Trusted Types like any other unreviewed sink write.
 
-## 4. Example (exactly matching verified demo code)
+## 4. Example (exactly matching verified demo code) -> https://stackblitz.com/edit/angular-lduosi4g-diikedch?file=src%2Fapp%2Fapp.component.ts
 
 **`src/index.html`** (the CSP itself):
 
