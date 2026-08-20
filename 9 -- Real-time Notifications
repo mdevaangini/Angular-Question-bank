@@ -1,0 +1,293 @@
+# Real-time Notifications — Bell Icon, Urgent Toasts, Correct Count Across Tabs
+
+## 1. What is it?
+
+The scenario: Product wants a notification bell icon that updates live as new notifications arrive, shows a toast popup immediately for "urgent" notifications, and — critically — keeps the unread count **correct and in sync** even when the user has the app open in several browser tabs at once.
+
+The design has three moving parts:
+
+1. **A live transport** — a WebSocket (or Server-Sent Events) connection that pushes new notifications from the server the moment they happen, instead of polling.
+2. **A single shared connection across tabs** — using **leader election** (Web Locks API) so only *one* tab actually holds the live connection, no matter how many tabs the user has open.
+3. **Cross-tab state sync** — using the **BroadcastChannel API** so every tab's bell count, notification list, and read/unread state stay identical, regardless of which tab actually received the update.
+
+## 2. Why was it introduced?
+
+**The naive approach and why it breaks:**
+
+The obvious first design is: each tab opens its own WebSocket connection directly to the server, and each tab keeps its own local notification state. This seems fine until you actually think through what happens with multiple tabs open:
+
+- If a user has 5 tabs open, that's 5 separate WebSocket connections to the server, all for the same logical user. At scale, this multiplies your server's connection count by however many tabs your average user keeps open — a real, avoidable cost.
+- Worse: if the user marks a notification as read in Tab A, Tab B has no idea. Tab B's bell still shows the old, now-wrong unread count until it independently learns about the change — which it never will, unless you build something for that specifically.
+- Toasts can also misbehave: if urgent notifications are only shown by whichever tab happens to be focused, or shown independently and inconsistently, urgent alerts can get missed or duplicated confusingly.
+
+**Problem without this design:** unread counts drift out of sync across tabs, urgent alerts are unreliable, and the server pays for far more open connections than there are actual users.
+
+**What this design solves:** exactly one live connection per user session (not per tab), and a state-sync mechanism so every open tab reflects the same truth the instant anything changes — a new notification arrives, or an existing one gets marked read — anywhere.
+
+## 3. How does it work?
+
+**Step 1 — Leader election, so only one tab owns the live connection**
+
+Every tab, on load, competes for an exclusive lock using the **Web Locks API**:
+
+```ts
+navigator.locks.request('notifications-leader-lock', () => {
+  // Only the tab that wins this lock runs this callback.
+  becomeLeader();
+  return new Promise(() => {}); // never resolves -> lock stays held
+});
+```
+
+- Only one tab can hold `'notifications-leader-lock'` at a time — the browser enforces this atomically, so there's no race condition between two tabs both thinking they're the leader.
+- The winning tab is the **leader**: it's the only one that opens the real WebSocket/SSE connection to the server.
+- Every other tab is a **follower** — it doesn't open its own connection at all.
+- When the leader tab is closed, the browser automatically releases the lock, and whichever follower tab was waiting immediately acquires it and becomes the new leader, opening its own connection. No manual handoff logic needed.
+
+**Step 2 — Fan-out to all tabs via BroadcastChannel**
+
+The leader tab is the only one receiving live events from the server. To get that data to every other open tab, it uses the **BroadcastChannel API**:
+
+```ts
+const channel = new BroadcastChannel('notifications-channel');
+
+// Leader, on receiving a new notification from the server:
+channel.postMessage({ type: 'NEW_NOTIFICATION', notification });
+
+// Every tab (including the leader itself, applied separately -- see the trap below):
+channel.onmessage = (event) => applyMessage(event.data);
+```
+
+- Every tab — leader and followers alike — listens on the same channel name and reacts identically. This means the state-update logic lives in exactly one place (`applyMessage`), regardless of whether a tab is the leader or a follower.
+- The same channel is used for the reverse direction too: when a user marks a notification read in any tab, that tab broadcasts a `MARK_READ` message so every other tab updates its count immediately — this is what actually keeps the count "correct across tabs," not just the incoming notification stream.
+
+**Step 3 — Urgent notifications trigger a toast, in every tab**
+
+Each notification carries a `priority` field. The shared `applyMessage` logic checks it:
+
+```ts
+if (notification.priority === 'urgent') {
+  toastService.show(notification.message);
+}
+```
+
+Because every tab runs this same logic off the same broadcast message, an urgent notification pops a toast in **every open tab** — which is the correct behavior; if the server has something urgent to say, every window the user is looking at should say it.
+
+**Step 4 — Initial load reconciliation**
+
+When a tab opens, it doesn't just wait passively for broadcasts (it might have missed everything that happened before it existed). It first does a normal `GET /notifications` REST call to fetch the current authoritative state from the server, then layers live updates on top from that point forward. This also covers the leader's own reconnect case: if the live connection drops and reconnects, refetching (or having the server resend a resync payload) closes any gap in the stream.
+
+## 4. Example
+
+**Live demo:** [https://stackblitz.com/edit/angular-nrj9sr63](https://stackblitz.com/edit/angular-nrj9sr63)
+
+> The demo simulates the server push with a `setInterval` (since a real WebSocket server isn't available in this sandbox) — everything else (leader election, BroadcastChannel fan-out, toast triggering, unread count) is the real mechanism. Open the link in two separate browser tabs to see one become "LEADER" and the other "FOLLOWER," and watch the bell count stay identical in both as notifications arrive.
+
+```ts
+// notification.service.ts
+import { Injectable, NgZone, computed, signal } from '@angular/core';
+import { ToastService } from './toast.service';
+
+export interface AppNotification {
+  id: string;
+  message: string;
+  priority: 'normal' | 'urgent';
+  createdAt: number;
+  read: boolean;
+}
+
+type BroadcastMessage =
+  | { type: 'NEW_NOTIFICATION'; notification: AppNotification }
+  | { type: 'MARK_READ'; id: string }
+  | { type: 'MARK_ALL_READ' };
+
+@Injectable({ providedIn: 'root' })
+export class NotificationService {
+  private notificationsState = signal<AppNotification[]>([]);
+  notifications = this.notificationsState.asReadonly();
+  unreadCount = computed(() => this.notificationsState().filter(n => !n.read).length);
+
+  isLeader = signal(false);
+
+  private channel = new BroadcastChannel('notifications-channel');
+  private mockServerTimer: any = null;
+  private mockIdCounter = 0;
+
+  constructor(private toast: ToastService, private zone: NgZone) {
+    // Every tab listens for broadcasts sent by OTHER tabs.
+    // (BroadcastChannel never delivers a message back to its own sender.)
+    this.channel.onmessage = (event: MessageEvent<BroadcastMessage>) => {
+      this.zone.run(() => this.applyMessage(event.data));
+    };
+
+    // Simulates the initial REST fetch: GET /notifications on app load.
+    this.notificationsState.set([
+      { id: 'seed-1', message: 'Your invoice #4021 was approved', priority: 'normal', createdAt: Date.now() - 60000, read: false }
+    ]);
+
+    this.electLeader();
+  }
+
+  private electLeader(): void {
+    if (!('locks' in navigator)) {
+      this.zone.run(() => this.becomeLeader());
+      return;
+    }
+
+    (navigator as any).locks.request('notifications-leader-lock', () => {
+      // IMPORTANT: navigator.locks is NOT patched by zone.js, so this
+      // callback runs OUTSIDE Angular's zone. Signal writes here need
+      // an explicit NgZone.run() or the UI silently won't update.
+      this.zone.run(() => this.becomeLeader());
+      return new Promise(() => {}); // keeps the lock (and leadership) held
+    });
+  }
+
+  private becomeLeader(): void {
+    this.isLeader.set(true);
+
+    // Stands in for the real WebSocket/SSE connection.
+    this.mockServerTimer = setInterval(() => {
+      this.mockIdCounter++;
+      const isUrgent = this.mockIdCounter % 3 === 0;
+      const notification: AppNotification = {
+        id: 'live-' + Date.now() + '-' + this.mockIdCounter,
+        message: isUrgent
+          ? 'Urgent: Payment failed on order #' + (8000 + this.mockIdCounter)
+          : 'New comment on your ticket #' + (1000 + this.mockIdCounter),
+        priority: isUrgent ? 'urgent' : 'normal',
+        createdAt: Date.now(),
+        read: false
+      };
+
+      const message: BroadcastMessage = { type: 'NEW_NOTIFICATION', notification };
+      this.applyMessage(message);       // apply locally -- see trap below
+      this.channel.postMessage(message); // fan out to every other tab
+    }, 8000);
+  }
+
+  markAsRead(id: string): void {
+    const message: BroadcastMessage = { type: 'MARK_READ', id };
+    this.applyMessage(message);
+    this.channel.postMessage(message);
+    // In production: also PATCH /notifications/:id/read to persist it.
+  }
+
+  private applyMessage(message: BroadcastMessage): void {
+    switch (message.type) {
+      case 'NEW_NOTIFICATION':
+        this.notificationsState.update(list => [message.notification, ...list]);
+        if (message.notification.priority === 'urgent') {
+          this.toast.show(message.notification.message);
+        }
+        break;
+      case 'MARK_READ':
+        this.notificationsState.update(list =>
+          list.map(n => (n.id === message.id ? { ...n, read: true } : n))
+        );
+        break;
+      case 'MARK_ALL_READ':
+        this.notificationsState.update(list => list.map(n => ({ ...n, read: true })));
+        break;
+    }
+  }
+}
+```
+
+```html
+<!-- bell.component.html -->
+<div class="bell-wrapper">
+  <button class="bell-button" (click)="toggle()">
+    🔔
+    <span class="badge" *ngIf="notifications.unreadCount() > 0">{{ notifications.unreadCount() }}</span>
+  </button>
+
+  <div class="dropdown" *ngIf="open">
+    <div class="dropdown-header">
+      <span>Notifications</span>
+      <button (click)="notifications.markAllAsRead()">Mark all read</button>
+    </div>
+    <div
+      class="notification-item"
+      *ngFor="let n of notifications.notifications()"
+      [class.unread]="!n.read"
+      (click)="onMarkAsRead(n.id)"
+    >
+      <span class="priority-dot" [class.urgent]="n.priority === 'urgent'"></span>
+      {{ n.message }}
+    </div>
+  </div>
+</div>
+```
+
+## 5. Example Explanation / Execution Flow
+
+1. **Tab 1 opens.** It fetches initial state (simulated as a seeded array), then races for the leader lock — wins it (nobody else is competing) — becomes leader, and starts "receiving" live notifications every 8 seconds.
+2. **Tab 2 opens** (same app, second browser tab). It also fetches initial state, then also tries for the leader lock — but Tab 1 already holds it, so Tab 2's callback simply never runs; it stays a follower and never opens its own connection.
+3. **A new notification arrives** in Tab 1 (the leader). Tab 1 applies it to its own local state directly (updates its signal, shows a toast if urgent) **and** posts it on the BroadcastChannel.
+4. **Tab 2 receives the broadcast** via its `channel.onmessage` listener, and runs the exact same `applyMessage` logic — its bell count increments identically, and if the notification was urgent, Tab 2 also shows its own toast.
+5. **User marks a notification as read in Tab 2.** Tab 2 updates its own state, then broadcasts `MARK_READ`. Tab 1 receives it and marks that same notification read too — both tabs' unread counts drop by one, together.
+6. **User closes Tab 1 (the leader).** The browser automatically releases the lock. Tab 2, which was waiting on the same lock request, now acquires it, becomes the new leader, and starts its own live connection — with zero manual intervention.
+
+## 6. When should we use it?
+
+- Any feature where multiple browser tabs of the same app need to agree on shared, frequently-changing state: notification bells, unread message counts, live collaborative indicators ("3 people viewing this doc"), shopping cart counts, session/auth state changes.
+- Any real-time feature backed by a persistent connection (WebSocket/SSE) where users commonly keep multiple tabs of your app open — reducing connection count matters for server cost and scalability at that point.
+- Less necessary for data that's cheap to just refetch per tab, or for apps where users essentially never have more than one tab open at a time (multi-tab correctness stops being worth the added complexity).
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- One live connection per user session, not per tab — meaningfully reduces server-side connection load for users who keep several tabs open.
+- Every tab is always internally consistent with every other tab — no user-visible drift ("why does tab A say 3 unread and tab B says 5").
+- Leader handoff on tab close is automatic and race-free, thanks to the browser-enforced exclusivity of the Web Locks API.
+
+**Disadvantages**
+
+- Meaningfully more complex than "just open a socket per tab" — leader election, a message protocol, and the BroadcastChannel self-message gotcha (below) all have to be understood correctly by whoever maintains this code.
+- If a tab is aggressively frozen/throttled by the browser (e.g. background tab power-saving), there's a brief window where leadership handoff might lag — acceptable in practice, but worth knowing as an edge case.
+- An alternative architecture — a **SharedWorker** holding the single connection, with every tab talking to it over a `MessagePort` — avoids leader election entirely, since the browser gives you exactly one shared worker instance per origin automatically. It's arguably more elegant, but SharedWorker has patchier browser support history and is harder to debug (no direct devtools access to its console in some browsers), which is why Web Locks + BroadcastChannel is often the more practical choice today.
+
+## 8. Common Interview Traps
+
+- **The BroadcastChannel self-message trap** (a very real, very common bug): `channel.postMessage(...)` does **not** deliver the message back to the same channel instance that sent it — only to *other* browsing contexts. If you write code assuming the sending tab will also react via its own `onmessage` listener, that tab's own UI silently never updates. The sender must apply the state change locally *and* broadcast it, as separate steps.
+- **The zone.js / Web Locks trap** (a genuinely subtle Angular-specific issue, and exactly what showed up while building this demo): `navigator.locks.request()`'s callback is not one of the async APIs zone.js patches, so code inside it runs *outside* Angular's zone. A signal or property written in there won't trigger change detection automatically — wrap it in `NgZone.run(() => ...)`, or the UI will silently be stale even though the underlying state is technically correct.
+- Opening one WebSocket connection per tab and treating that as "done" — technically works, but is the anti-pattern this whole design exists to avoid; a senior-level answer should flag the N-tabs-means-N-connections cost even if a simpler implementation is what ships first.
+- Forgetting the initial REST reconciliation fetch — a tab opened after some notifications already exist (or reopened after being offline) has no way to learn about them from BroadcastChannel alone, since it only carries messages sent *while that tab is listening*.
+- Assuming `localStorage`'s `'storage'` event is a simpler substitute for BroadcastChannel — it has the exact same "doesn't fire in the tab that wrote the value" limitation, plus it's easy to accidentally trigger unrelated storage-quota or serialization issues; BroadcastChannel is the more purpose-built tool for this.
+- Not persisting "mark as read" to the backend — broadcasting keeps open tabs in sync with each other, but a page refresh (or a brand-new tab) still needs the server's authoritative read-state, so the read action must also be persisted via an API call, not just broadcast locally.
+
+## 9. Interview Follow-up Questions
+
+**Q: Why not just have every tab open its own WebSocket connection?**
+Answer: It works, but it multiplies server-side connection count by however many tabs a user keeps open, and it does nothing to keep "read" state in sync across tabs — you'd still need a cross-tab sync mechanism for that part regardless, so you may as well also avoid the duplicate connections.
+
+**Q: What happens if the leader tab crashes or is force-closed rather than closed normally?**
+Answer: The Web Locks API is tied to the browsing context's lifetime at the browser level, not to any JavaScript cleanup code — so the lock is released by the browser itself as soon as that tab/process is gone, regardless of whether `beforeunload` or any other JS handler ran. A waiting follower picks it up automatically.
+
+**Q: How would you avoid the BroadcastChannel self-message bug in a real codebase?**
+Answer: Route every state mutation through one function (like `applyMessage`) that's called both locally, right after the action happens, and from the `onmessage` handler for messages from other tabs — never rely on a tab receiving its own broadcast.
+
+**Q: Could you use a SharedWorker instead of leader election?**
+Answer: Yes — a SharedWorker naturally gives you one shared instance per origin across all tabs, so it could own the WebSocket connection directly and message every connected tab over its own `MessagePort`, without needing explicit leader election at all. The trade-off is weaker debugging tooling and some historical browser support gaps, which is why Web Locks + BroadcastChannel is often preferred in practice.
+
+**Q: How do you make sure a newly opened tab isn't missing notifications that arrived before it existed?**
+Answer: It does its own initial REST fetch (`GET /notifications`) on load to get the current authoritative state from the server, and only relies on BroadcastChannel/the live connection for updates from that point forward.
+
+## 10. Interview-Ready Answer
+
+"For a bell icon with live updates and correct counts across tabs, I wouldn't just open a WebSocket per tab — that multiplies connections per user and does nothing to keep read-state in sync across tabs anyway. Instead I'd use leader election with the Web Locks API, so only one tab actually holds the live WebSocket or SSE connection at a time; every other tab is a follower. The leader fans out every event — new notifications, read-state changes — over a BroadcastChannel, and every tab, leader included, runs the same state-update function off those messages, so they can never drift out of sync. Urgent notifications trigger a toast through that same shared logic, so every open tab shows it. If the leader tab closes, the browser releases the lock automatically and another tab picks it up with zero manual handoff code. One real gotcha worth knowing: BroadcastChannel never delivers a message back to its own sender, so the leader has to apply its own state change locally in addition to broadcasting it — that's an easy bug to miss. On top of that, each tab does an initial REST fetch on load so it's not starting from nothing, and read-state changes get persisted to the server too, not just broadcast locally, so a fresh tab or a page refresh still gets the correct state."
+
+## 11. Quick Revision
+
+- **What:** Bell icon + live updates + urgent toasts, with the unread count staying correct across every open tab.
+- **Why:** A WebSocket per tab wastes server connections and does nothing to keep "read" state in sync between tabs — count drift and duplicated/missed alerts follow.
+- **Problem solved:** One live connection per user session (not per tab) via leader election, with every tab's state kept identical via BroadcastChannel.
+- **How:** Web Locks API elects one leader tab to own the connection; leader fans out every event over BroadcastChannel; every tab (leader included) applies state through one shared function; urgent notifications trigger toasts off that same shared path.
+- **Use when:** Any multi-tab-common app needing shared live state — notifications, unread counts, presence, live collaboration indicators.
+- **Important:** BroadcastChannel never delivers a message back to its own sender — the leader must apply state locally *and* broadcast it. Async work inside `navigator.locks.request()` runs outside Angular's zone — wrap signal writes in `NgZone.run()`.
+- **Remember:** New/refreshed tabs need an initial REST fetch — BroadcastChannel only carries messages sent while that tab is already open and listening.
+
+## Memory Trick
+
+Think of it as **one radio station, many radios**: only one tab (the leader) has the antenna plugged into the real broadcast tower (the WebSocket). Every tab — including the leader — is just a radio tuned to the same local station (BroadcastChannel), so they all play the exact same thing at the exact same time. If the antenna-radio gets unplugged (tab closes), the next radio in line automatically grows an antenna and takes over.
