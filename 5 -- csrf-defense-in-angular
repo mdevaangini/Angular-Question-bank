@@ -1,0 +1,194 @@
+# CSRF and How to Defend an Angular App
+> Live demo (verified): https://stackblitz.com/edit/angular-3txqgg4e
+
+## 1. What is it?
+
+Cross-Site Request Forgery (CSRF) is an attack where a malicious site tricks a victim's browser into sending an unwanted, state-changing request to a site the victim is already authenticated on — using the victim's own ambient credentials (session cookies) without the victim's knowledge or consent. The attacker never sees the victim's session token; they just get the victim's browser to "spend" it.
+
+Defending against it in Angular rests on three complementary layers: the `SameSite` cookie attribute (a browser-level defense that decides whether a cookie is even sent on a cross-site request in the first place), the XSRF-TOKEN double-submit cookie pattern (an application-level defense where the server checks a header against a cookie), and Angular's built-in `HttpClient` support for automating that header-attachment (`provideHttpClient(withXsrfConfiguration(...))`).
+
+## 2. Why does this happen?
+
+Browsers attach cookies to requests based on the target domain, not based on which page or origin initiated the request. If `bank.com` sets a session cookie after login, then *any* page — including `evil.com` — can cause the victim's browser to send a request to `bank.com` (via an auto-submitting `<form>`, an `<img>` tag, or a fetch call) and the browser will still attach `bank.com`'s cookies to it, because cookie attachment is scoped to the target origin, not the initiating one. If the server's only check is "does this request have a valid session cookie," a forged cross-site request passes that check exactly like a legitimate one — the server has no way to tell where the request actually originated from cookies alone.
+
+## 3. How does it work?
+
+**SameSite cookies** close the gap at the browser level: a cookie set with `SameSite=Strict` is withheld entirely from any request that doesn't originate from the same site (including the classic cross-site `<form>` POST attack); `SameSite=Lax` (the modern default in most browsers) is looser — it still sends the cookie on top-level GET navigations from another site but withholds it on cross-site POSTs, image loads, and other subresource requests, which covers the most common CSRF vector.
+
+**The XSRF-TOKEN double-submit cookie pattern** is a second, independent layer that doesn't rely on the server keeping any session-side state: the server sets a random token as a *readable* (non-HttpOnly) cookie. Because that cookie is readable by JavaScript, same-origin application code can read its value and echo it back as a custom request header on state-changing calls. The server then just checks: does the header value match the cookie value? A forged cross-site page cannot pass this check even if `SameSite` didn't block its request outright, because the Same-Origin Policy prevents that page's JavaScript from ever reading `bank.com`'s cookie value to construct a matching header — it can only guess.
+
+**Angular's built-in support** (`provideHttpClient(withXsrfConfiguration({ cookieName, headerName }))`) automates exactly this: it reads the named cookie (default `XSRF-TOKEN`) and automatically attaches it as the named header (default `X-XSRF-TOKEN`) on every outgoing `HttpClient` request — but only under specific conditions verified in the demo below: the request method must be state-changing (not `GET`/`HEAD`), the URL must be a relative, same-origin URL (Angular skips any absolute `http://`/`https://` URL), and the header must not already be set on the request.
+
+## 4. Example (exactly matching verified demo code)
+
+**`src/app/csrf-token.service.ts`** (simulates the server's `Set-Cookie`):
+
+```typescript
+import { Injectable } from '@angular/core';
+
+/**
+ * Simulates what a real backend would do: on first load, "the server" sets
+ * a non-HttpOnly cookie containing a random CSRF token. Angular's built-in
+ * XSRF machinery (configured via withXsrfConfiguration in app.config.ts)
+ * reads this exact cookie name and echoes its value back as a request
+ * header on same-origin, state-changing requests -- the "double-submit
+ * cookie" pattern: the server just checks that the header matches the
+ * cookie it set, no server-side session storage needed.
+ *
+ * SameSite=Strict here is the modern, primary CSRF defense: it tells the
+ * browser to withhold this cookie entirely on requests that originate from
+ * a different site, so a forged cross-site request wouldn't even carry
+ * this cookie in the first place -- independent of the XSRF-TOKEN header
+ * trick below, which exists as defense-in-depth.
+ */
+@Injectable({ providedIn: 'root' })
+export class CsrfTokenService {
+  constructor() {
+    if (!this.readCookie('XSRF-TOKEN')) {
+      const token = this.generateToken();
+      document.cookie = `XSRF-TOKEN=${token}; Path=/; SameSite=Strict`;
+    }
+  }
+
+  readCookie(name: string): string | null {
+    const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  private generateToken(): string {
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+}
+```
+
+**`src/app/app.config.ts`** (Angular's built-in XSRF wiring):
+
+```typescript
+import { ApplicationConfig } from '@angular/core';
+import { provideHttpClient, withInterceptors, withXsrfConfiguration } from '@angular/common/http';
+import { mockBackendInterceptor } from './mock-backend.interceptor';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideHttpClient(
+      withXsrfConfiguration({ cookieName: 'XSRF-TOKEN', headerName: 'X-XSRF-TOKEN' }),
+      withInterceptors([mockBackendInterceptor]),
+    ),
+  ],
+};
+```
+
+**`src/app/mock-backend.interceptor.ts`** (stands in for a real server's CSRF guard, checks whatever Angular actually sent):
+
+```typescript
+import { HttpErrorResponse, HttpInterceptorFn, HttpResponse } from '@angular/common/http';
+import { inject } from '@angular/core';
+import { delay, of, throwError } from 'rxjs';
+import { CsrfTokenService } from './csrf-token.service';
+import { RequestLogService } from './request-log.service';
+
+export const mockBackendInterceptor: HttpInterceptorFn = (req, next) => {
+  const csrf = inject(CsrfTokenService);
+  const log = inject(RequestLogService);
+  const sentHeader = req.headers.get('X-XSRF-TOKEN');
+
+  if (req.method === 'GET') {
+    log.add({ method: req.method, url: req.url, sentHeader, outcome: 'allowed', detail: 'Safe method, no CSRF check needed.' });
+    return of(new HttpResponse({ status: 200, body: { name: 'Ada Lovelace', email: 'ada@example.com' } })).pipe(delay(300));
+  }
+
+  const realCookieValue = csrf.readCookie('XSRF-TOKEN');
+  const isSameOriginRelativeUrl = !/^https?:\/\//i.test(req.url);
+
+  if (isSameOriginRelativeUrl && sentHeader && realCookieValue && sentHeader === realCookieValue) {
+    log.add({ method: req.method, url: req.url, sentHeader, outcome: 'allowed', detail: 'X-XSRF-TOKEN header matches the XSRF-TOKEN cookie -- request accepted.' });
+    return of(new HttpResponse({ status: 200, body: { transferred: true } })).pipe(delay(300));
+  }
+
+  const reason = !isSameOriginRelativeUrl
+    ? "Absolute cross-origin URL -- Angular's built-in XSRF interceptor deliberately does NOT attach the header to absolute URLs, so it never reached here."
+    : !sentHeader
+      ? 'No X-XSRF-TOKEN header present on the request at all.'
+      : 'X-XSRF-TOKEN header present but does not match the real XSRF-TOKEN cookie value.';
+
+  log.add({ method: req.method, url: req.url, sentHeader, outcome: 'blocked', detail: reason });
+  return throwError(() => new HttpErrorResponse({ status: 403, statusText: 'Forbidden', error: { message: 'CSRF check failed: ' + reason } })).pipe(delay(300));
+};
+```
+
+**`src/app/app.component.ts`** (the four request scenarios, exactly as run in the demo):
+
+```typescript
+getProfile() {
+  this.http.get('/api/profile').subscribe({ error: () => {} });
+}
+
+postTransferRelative() {
+  // Relative, same-origin URL: Angular's built-in XSRF interceptor WILL
+  // automatically attach X-XSRF-TOKEN here, read straight from the cookie.
+  this.http.post('/api/transfer-funds', { amount: 100 }).subscribe({ error: () => {} });
+}
+
+postTransferAbsolute() {
+  // Absolute URL: Angular's built-in XSRF interceptor skips attaching the
+  // header for any absolute http(s):// URL.
+  this.http.post('https://external-api.example.com/transfer-funds', { amount: 100 }).subscribe({ error: () => {} });
+}
+
+postTransferForged() {
+  // Simulates what an attacker's cross-site page could actually pull off:
+  // it cannot read our XSRF-TOKEN cookie's value via JS (Same-Origin
+  // Policy), so the best it can do is guess/fabricate a header value.
+  this.http
+    .post('/api/transfer-funds', { amount: 100 }, { headers: { 'X-XSRF-TOKEN': 'forged-guess-1234' } })
+    .subscribe({ error: () => {} });
+}
+```
+
+## 5. Example Explanation – Execution Flow
+
+1. On app bootstrap, `CsrfTokenService`'s constructor runs, finds no existing `XSRF-TOKEN` cookie, and sets one with a random 32-character token and `SameSite=Strict`.
+2. Clicking "GET /api/profile" sends a safe-method request; the mock backend interceptor sees `req.method === 'GET'` and allows it immediately, with no `X-XSRF-TOKEN` header sent at all — verified live in the log: `X-XSRF-TOKEN sent: (none)`, `Outcome: ALLOWED`.
+3. Clicking "POST /api/transfer-funds" (relative URL) triggers Angular's built-in XSRF interceptor (registered via `withXsrfConfiguration`), which reads the `XSRF-TOKEN` cookie and attaches it as `X-XSRF-TOKEN` before the request reaches our mock backend interceptor. The mock backend reads the real cookie itself and confirms the two match — verified live: `X-XSRF-TOKEN sent: 022900d1afe568e8608c82586cd3f2ac`, `Outcome: ALLOWED`.
+4. Clicking "POST https://external-api.example.com/..." (absolute URL) triggers the same mutating-method logic, but because the URL is absolute, Angular's built-in interceptor deliberately skips attaching any header — verified live: `X-XSRF-TOKEN sent: (none)`, `Outcome: BLOCKED`, with the log explicitly attributing this to the absolute-URL skip rule, not a missing cookie.
+5. Clicking "Simulate forged request" manually sets `X-XSRF-TOKEN: forged-guess-1234` on the request options. Because the header is already present, Angular's built-in interceptor does not overwrite it (it only sets the header if absent). The mock backend compares `forged-guess-1234` against the real cookie value and rejects it — verified live: `Outcome: BLOCKED — X-XSRF-TOKEN header present but does not match the real XSRF-TOKEN cookie value.` This step stands in for exactly what a real attacker's cross-site page is limited to: it can trigger a request, but it cannot read the real cookie value to forge a matching header.
+
+## 6. When does this show up?
+
+Any Angular app performing authenticated, state-changing operations (fund transfers, password changes, account settings, purchases, deletions) needs CSRF protection whenever session state is carried via cookies — token-based auth stored in memory/localStorage and sent via `Authorization` headers is naturally CSRF-resistant on its own (a cross-site page can't read that token to attach the header), but cookie-based session auth is the classic vulnerable case this defense targets. It comes up constantly in interviews as the natural companion question to XSS/CSP topics — "you've secured against script injection, but how do you stop a forged request from another tab?"
+
+## 7. Advantages/Disadvantages
+
+`SameSite=Strict`/`Lax` is a strong default-on defense requiring zero application code, but it can break legitimate cross-site flows (e.g., a payment redirect back to your site, or an embedded widget) if applied too broadly — this is why many real systems combine it with `SameSite=Lax` plus the double-submit token as defense-in-depth rather than relying on `SameSite` alone. The double-submit cookie pattern needs no server-side session storage of tokens (stateless, scales easily) and Angular automates its client side almost entirely — but as this demo proves, it only applies automatically to same-origin relative URLs; any SPA calling an API on a different subdomain or origin (common in real deployments) must explicitly reconfigure `withXsrfConfiguration` or manually attach the header, or CSRF protection silently does nothing for those calls.
+
+## 8. Common Interview Traps
+
+The most common one — directly demonstrated in this build — is assuming Angular's `withXsrfConfiguration` automatically protects *all* API calls. It does not: absolute URLs are skipped by design, so a common real-world setup (SPA on `app.example.com`, API on `api.example.com`) gets zero automatic protection unless explicitly configured. A second trap is treating the XSRF-TOKEN cookie as if it needs to be `HttpOnly` — it must NOT be `HttpOnly`, specifically because client-side JavaScript needs to read it to echo it back as a header; the security here comes from the Same-Origin Policy preventing other sites from reading it, not from hiding it from your own JS. A third: assuming `SameSite=Lax` alone is a complete CSRF defense — it blocks cross-site POSTs but still allows the cookie on top-level GET navigations, which is enough for some CSRF variants (e.g., state-changing GET endpoints, which shouldn't exist per HTTP semantics but sometimes do in legacy code).
+
+## 9. Interview Follow-up Questions
+
+How would you protect an Angular SPA calling an API on a completely different origin, given Angular's default XSRF interceptor skips absolute URLs? (Answer: either serve the API through the same origin via a reverse proxy, or manually read the cookie and attach the header yourself in a custom interceptor, since Angular's automatic mechanism won't help.) Why must the XSRF-TOKEN cookie be readable by JavaScript instead of HttpOnly? (Because the whole point of the double-submit pattern is that only same-origin JS can read it to construct the matching header — an attacker's cross-origin JS cannot, which is the actual security boundary, not the cookie's HttpOnly flag.) What's the difference in protection between `SameSite=Strict` and `SameSite=Lax`, and why do most browsers default to Lax? (Strict blocks the cookie on essentially all cross-site requests including top-level navigations, which breaks common flows like clicking an email link into a logged-in state; Lax is the practical default that still blocks the dangerous cross-site POST/subresource cases while preserving usability.)
+
+## 10. Quick Answer (say this first)
+
+CSRF tricks a victim's authenticated browser into sending a state-changing request to a site it's already logged into, exploiting the fact that cookies are attached based on the target domain, not the request's origin. Angular defends against it with `provideHttpClient(withXsrfConfiguration(...))`, which reads a readable `XSRF-TOKEN` cookie set by the server and automatically echoes it as an `X-XSRF-TOKEN` header on same-origin, state-changing requests — the server then just checks the header matches the cookie, which a cross-site attacker can't forge since Same-Origin Policy blocks it from reading that cookie. `SameSite=Strict`/`Lax` on the cookie is the complementary, more fundamental browser-level defense that withholds the cookie from cross-site requests entirely.
+
+## 11. Interview-Ready Answer (full)
+
+CSRF (Cross-Site Request Forgery) exploits a simple mismatch: browsers decide whether to attach a cookie to a request based on the target domain, completely independent of which page initiated that request. So if a user is logged into `bank.com`, any other tab or malicious site can cause the browser to fire a request at `bank.com` and the session cookie rides along automatically — the server sees what looks like a perfectly authenticated request and has no inherent way to know it didn't originate from the user's own intentional action on the real site.
+
+Angular addresses this with a layered approach. The foundational layer is the `SameSite` cookie attribute, set on the server's session cookie: `SameSite=Strict` withholds the cookie from any cross-site request entirely, and `SameSite=Lax` — the modern browser default — still allows it on top-level cross-site navigations but blocks it on cross-site POSTs and subresource loads, covering the classic attack vector with no application code required.
+
+The second layer, which is what Angular has direct, built-in support for, is the double-submit cookie pattern using an XSRF-TOKEN. The server sets a random token as a cookie that is deliberately *not* HttpOnly, so client-side JavaScript can read it. Angular's `HttpClient`, configured via `provideHttpClient(withXsrfConfiguration({ cookieName, headerName }))`, automatically reads that cookie and echoes its value as a custom header (`X-XSRF-TOKEN` by default) on every state-changing request. The server's check is then trivial: does the header match the cookie? A forged request from another origin fails this check because that origin's JavaScript is blocked by the Same-Origin Policy from ever reading the real cookie value — it can send a request, but it can't read the secret needed to pass the check.
+
+The detail most people miss, and the one I'd flag as a real deployment gotcha: Angular's built-in interceptor only attaches this header automatically for relative, same-origin URLs and state-changing methods — it deliberately skips absolute `http://`/`https://` URLs, since a cookie valid for the app's own origin isn't necessarily meant for a separate API origin. So if your SPA calls an API hosted on a different subdomain, you don't get this protection for free; you either need to route the API through the same origin, or manually configure and attach the token yourself.
+
+## 12. Quick Revision
+
+CSRF: forged authenticated cross-site request, exploiting that cookies attach based on target domain, not origin. `SameSite=Strict`/`Lax`: browser-level defense, withholds cookies on cross-site requests. XSRF-TOKEN double-submit: server sets a *readable* (non-HttpOnly) cookie; client echoes it as a header on mutating requests; server checks header === cookie. Angular: `provideHttpClient(withXsrfConfiguration({ cookieName, headerName }))` automates this — but ONLY for relative same-origin URLs and non-safe methods (GET/HEAD skipped, absolute URLs skipped). Cross-origin APIs need manual configuration or a same-origin proxy.
+
+## 13. Memory Trick
+
+"The cookie rides along for free — the header is the secret handshake only your own page can whisper."
