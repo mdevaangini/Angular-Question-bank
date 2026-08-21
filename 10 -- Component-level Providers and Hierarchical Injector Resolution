@@ -44,7 +44,7 @@ Angular actually maintains **two** injector hierarchies at once:
 
 ## 4. Example
 
-**Live demo:** [https://stackblitz.com/edit/angular-zcd83fhw](https://stackblitz.com/edit/angular-zcd83fhw)
+**Live demo:** https://stackblitz.com/edit/angular-zcd83fhw-jwzy8bwx?file=src%2Fapp%2Fapp.component.ts
 
 ```ts
 // counter.service.ts
