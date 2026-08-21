@@ -1,0 +1,110 @@
+# `css-specificity-and-important.md`
+**Suggested folder:** `interview-prep/css/specificity/`
+
+---
+
+## 1. What is it?
+
+CSS specificity is the algorithm the browser uses to decide which of several conflicting rules "wins" when more than one selector matches the same element and sets the same property. It's a scoring system, not a simple last-rule-wins ordering — though rule order only acts as the final tiebreaker when specificity scores are exactly equal.
+
+## 2. Why introduced?
+
+Stylesheets are cascading by design: multiple selectors can legitimately target the same element (a base type style, a class-based component style, a one-off ID override). Without a deterministic scoring rule, the browser would have no principled way to pick a winner among conflicting declarations, and small stylesheet reorderings would unpredictably flip which style applies. Specificity gives authors a predictable, calculable way to reason about which rule renders, independent of file order in most cases.
+
+## 3. How does it work?
+
+Specificity is calculated as a 4-part tuple, often written `(a, b, c, d)`, compared left to right:
+
+- **a — inline styles**: 1 if the declaration comes from a `style="..."` attribute directly on the element, else 0.
+- **b — ID selectors**: count of `#id` selectors in the selector.
+- **c — classes, attribute selectors, pseudo-classes**: count of `.class`, `[attr=value]`, and `:hover`/`:nth-child()`-style pseudo-classes.
+- **d — elements and pseudo-elements**: count of type selectors (`div`, `p`) and pseudo-elements (`::before`).
+
+Comparison is lexicographic: a higher `a` always wins regardless of `b`/`c`/`d`; if `a` ties, compare `b`; and so on. Note this means specificity is **not** a single decimal number you can add up (`0,1,0,0` is not "100" and 11 classes never equal 1 ID) — treat each column independently.
+
+The universal selector `*`, combinators (`>`, `+`, `~`, space), and `:where()` contribute **zero** to specificity. `:not()`, `:is()`, and `:has()` contribute the specificity of their *most specific* argument, not an extra count for the pseudo-class itself.
+
+When two rules have identical specificity, the **last one declared** (in source/import order, with later `<link>`/`<style>` blocks and later rules within a block winning) applies.
+
+`!important` short-circuits this whole system: an `!important` declaration wins over any normal declaration regardless of specificity score, and among competing `!important` declarations, specificity (then source order) is used to break the tie exactly as before. Only another `!important` (or a browser/user-agent `!important`, or inline `style` combined with `!important` from certain contexts) can override it.
+
+## 4. Example
+
+```css
+/* (0,0,0,1) — one element selector */
+p { color: blue; }
+
+/* (0,0,1,0) — one class selector */
+.highlight { color: green; }
+
+/* (0,0,1,1) — one class + one element */
+p.highlight { color: orange; }
+
+/* (0,1,0,0) — one ID selector */
+#note { color: purple; }
+
+/* (0,1,1,1) — id + class + element */
+p#note.highlight { color: red; }
+
+/* (0,0,4,0) — four classes, no ID */
+.a.b.c.d { color: teal; }
+```
+
+```html
+<p id="note" class="highlight a b c d" style="color: black;">Which color wins?</p>
+```
+
+Applying the algorithm: inline `style="color: black"` has `a=1`, which beats every rule above (`a=0` for all of them) — so the text renders **black**, regardless of the ID selector, the four chained classes, or anything else, purely because inline styles occupy the highest specificity tier. If the inline style were removed, `p#note.highlight` at `(0,1,1,1)` would win next — the ID rule beats `.a.b.c.d` at `(0,0,4,0)` because `b` (1) beats `b` (0), even though the class-chain rule has more individual selectors.
+
+```css
+/* Now suppose someone "fixes" a losing style with !important instead of fixing specificity: */
+.highlight { color: green !important; }
+```
+
+This now beats even the inline `black` and the ID rule, because `!important` is checked *before* specificity at all. It "wins" the immediate bug, but now anyone who legitimately needs to override `.highlight`'s color anywhere else in the app must either add their own `!important` (escalating the problem) or increase selector specificity to no effect, since `!important` outranks specificity entirely.
+
+## 5. Example Explanation – Execution Flow
+
+The browser collects every declaration that matches the element for a given property, then: first, partitions them into `!important` vs. normal; `!important` wins that partition outright. Second, within whichever partition wins, it compares the 4-part specificity tuple column by column (`a` then `b` then `c` then `d`). Third, if the tuple is fully tied, the declaration that appears later in the effective stylesheet order wins. In the example above: inline (`a=1`) beats the ID rule (`a=0,b=1`) beats the four-class rule (`a=0,b=0,c=4`) beats the single-class rule (`a=0,b=0,c=1`) beats the plain element rule (`a=0,b=0,c=0,d=1`) — until `!important` is introduced on `.highlight`, which jumps straight to the front regardless of any of that.
+
+## 6. When does this show up?
+
+Any time overlapping selectors target the same element — utility-class systems (Tailwind-style) fighting component-scoped classes, third-party component library styles being overridden by app styles, deeply nested BEM/SCSS selectors accidentally out-specificity-ing a simpler intended override, or Angular's view-encapsulation-generated attribute selectors (`[_ngcontent-xxx]`) adding an extra attribute-selector specificity point per rule that isn't visible just by reading the source template.
+
+## 7. Advantages/Disadvantages
+
+A clear, calculable specificity model means styles are predictable and debuggable purely from selector text, without needing to trace `!important` chains — this is the entire advantage. The disadvantage shows up once `!important` or deeply nested/ID-heavy selectors creep in: specificity wars, where later stylesheets need ever-more-specific (or ever-more `!important`) rules just to override earlier ones, making the cascade effectively unmaintainable and turning every style change into an archaeology exercise across the whole codebase.
+
+## 8. Common Interview Traps
+
+Treating specificity as one summed number (saying "10 classes beat 1 ID" — false; `b` always dominates `c` regardless of count). Forgetting that combinators and the universal selector add zero specificity. Forgetting `:not()`/`:is()` take the specificity of their most specific argument rather than adding a flat pseudo-class point. Saying `!important` "increases specificity" — it doesn't touch the specificity calculation at all; it's a separate, higher-priority tier that's checked first. Forgetting that among tied specificities, source order (not file order alone — the *effective cascade* order, including `@import` and `<link>` order) breaks the tie.
+
+## 9. Interview Follow-up Questions
+
+How does the CSS cascade layer (`@layer`) interact with specificity — does it override it?
+
+How does `:where()` differ from `:is()` in terms of specificity contribution?
+
+How do Angular's `ViewEncapsulation.Emulated` attribute selectors affect specificity math in practice?
+
+When, if ever, is using `!important` actually justified (e.g., overriding third-party inline styles you don't control, or user-stylesheet accessibility overrides)?
+
+How would you refactor a codebase that has accumulated dozens of `!important` overrides?
+
+## 10. Quick Answer (say this first)
+
+Specificity is a 4-part tuple — inline styles, ID count, class/attribute/pseudo-class count, element count — compared left to right, with ties broken by source order; it's never a single additive number. `!important` is a code smell because it sits entirely outside that tuple, overriding specificity rather than participating in it, which means the only way to override an `!important` rule later is another `!important` (or higher-specificity `!important`), starting a specificity/importance arms race instead of a clean, calculable cascade.
+
+## 11. Interview-Ready Answer (full)
+
+Specificity is calculated as a four-part tuple compared lexicographically, not summed: first, whether the declaration is an inline `style` attribute; second, the count of ID selectors; third, the count of classes, attribute selectors, and pseudo-classes; fourth, the count of element type selectors and pseudo-elements. A higher score in an earlier column always wins outright, regardless of how many selectors pile up in a later column — so one ID selector beats any number of chained classes, and one inline style beats any number of IDs. Combinators, the universal selector, and `:where()` contribute nothing; `:not()`, `:is()`, and `:has()` inherit the specificity of their most specific internal argument rather than adding their own point. When two selectors tie on the full tuple, the declaration that appears later in the effective cascade order (accounting for `@import` and stylesheet load order) wins.
+
+`!important` is considered a code smell because it doesn't participate in this calculation at all — it's a separate, higher-priority tier checked before specificity is even consulted. That means once one rule uses `!important` to force a win, the *only* way to legitimately override it later is another, higher (or later-declared, equal-specificity) `!important` declaration — there's no way to "out-specify" it with a more specific normal selector. In a growing codebase this becomes a ratchet: each new override adds another `!important`, and eventually nobody can predict which style applies without grepping for every `!important` in the codebase and manually tracing declaration order. The healthier fix is almost always to address the actual specificity conflict directly — using a class-based override at the correct specificity level, adjusting selector nesting, or reaching for cascade layers (`@layer`) to control precedence structurally instead of forcing it with `!important`.
+
+## 12. Quick Revision
+
+Specificity tuple: `(inline, #id count, .class/[attr]/:pseudo-class count, element count)` — compare left to right, never sum. Tie → later declaration in cascade order wins. `*`, combinators, `:where()` = zero specificity. `:not()/:is()/:has()` = specificity of their most specific argument. `!important` bypasses the tuple entirely — checked first, tie-broken by specificity then source order among other `!important` rules. Code smell because overriding it later requires another `!important`, not a more specific selector — leads to specificity/importance wars.
+
+## 13. Memory Trick
+
+**"Inline beats ID beats Class beats Element — never add, always compare left to right. `!important` doesn't play the specificity game at all; it just cuts the line."**
