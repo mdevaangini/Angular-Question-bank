@@ -1,8 +1,3 @@
-# `css-specificity-and-important.md`
-**Suggested folder:** `interview-prep/css/specificity/`
-
----
-
 ## 1. What is it?
 
 CSS specificity is the algorithm the browser uses to decide which of several conflicting rules "wins" when more than one selector matches the same element and sets the same property. It's a scoring system, not a simple last-rule-wins ordering — though rule order only acts as the final tiebreaker when specificity scores are exactly equal.
