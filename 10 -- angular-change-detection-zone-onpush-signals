@@ -1,0 +1,242 @@
+## 1. What is it?
+
+Change detection is the mechanism Angular uses to keep the DOM in sync with component state. After any async operation Angular cares about, it walks the entire component tree once and re-evaluates every template expression to see if the rendered DOM needs updating. Three cooperating pieces make this work: **Zone.js** (detects *when* to run), the **default dirty-checking algorithm** (decides *what* to check), and **`OnPush` / Signals** (let you *opt individual components out* of unconditional checking).
+
+## 2. Why introduced?
+
+Angular needed an automatic way to know when application state might have changed, without the developer manually calling `render()` after every event, timer, or HTTP response. Zone.js solves the "when" problem by monkey-patching the browser's async APIs so Angular gets a hook after literally anything asynchronous finishes. The full-tree dirty-check solves "what changed" by brute force — check everything, since diffing an arbitrary object graph would be at least as expensive and far more error-prone. `OnPush` and Signals were introduced later purely for **performance**: as apps grow, checking every component on every tick becomes wasteful, so Angular added ways to let a component tell the framework "you can skip me unless X happens."
+
+## 3. How does it work?
+
+**Zone.js** patches `setTimeout`, `setInterval`, `addEventListener`, `Promise.then`, `XMLHttpRequest`, and `fetch` at load time. Every one of these, when it fires, now runs *inside* Angular's zone. When the zone becomes "stable" (its task queue is empty — no pending macrotask/microtask it's tracking), Angular's `NgZone` emits `onMicrotaskEmpty`, and `ApplicationRef.tick()` runs.
+
+**`tick()`** walks the component tree depth-first, starting at the root, calling `detectChanges()` on each component's view. For each component, Angular runs the **compiled template's update function**, which re-evaluates every bound expression (`{{ expr }}`, `[prop]="expr"`, etc.) and compares each individual expression's new value to the value it recorded last time, using `===` (`Object.is`). This is "dirty checking" — it is expression-by-expression, not a deep diff of any object. If a value differs, Angular patches just that DOM node/attribute.
+
+**`OnPush`** changes only one thing: whether Angular *enters* a component's subtree during a given tick at all. An `OnPush` component's view is skipped unless one of these marks it dirty first:
+- An `@Input` reference changed (`!==` comparison against the previous reference — mutating the object in place does **not** count).
+- A DOM event listener bound in that component's *own* template fired (click, input, etc. — Angular marks the local view path dirty regardless of whether any `@Input` changed).
+- An `Observable` bound through the `async` pipe emitted (`AsyncPipe` calls `ChangeDetectorRef.markForCheck()` internally on every emission).
+- Something manually calls `markForCheck()` (marks dirty, waits for next tick) or `detectChanges()` (checks immediately).
+
+**Signals** add an independent, finer-grained trigger: reading a `signal()` inside a template registers that specific view as a subscriber of that signal. Writing to the signal directly marks *that view* dirty — completely bypassing the classic Input/event gate. This is why a component with **no `@Input` at all** can still update under `OnPush`, driven purely by a signal write that happened somewhere else entirely.
+
+## 4. Example
+
+Verified live at `https://stackblitz.com/edit/angular-z2b5xbga`. Five components, one shared signal store, and five buttons that each isolate a single trigger.
+
+```typescript
+// counter-store.service.ts
+@Injectable({ providedIn: 'root' })
+export class CounterStore {
+  sharedCount = signal(0);
+}
+```
+
+```typescript
+// default-check.component.ts
+@Component({
+  selector: 'app-default-check',
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.Default,
+  template: `
+    <div class="card">
+      <h2>Default strategy — always checked</h2>
+      <div class="value">data.value = <strong>{{ data.value }}</strong></div>
+      <div class="check-count">Checked {{ checkCount }}×</div>
+      <p class="hint">Updates and increments on EVERY tick anywhere on the page — mutated object, replaced object, or a totally unrelated setTimeout.</p>
+    </div>
+  `,
+})
+export class DefaultCheckComponent {
+  @Input() data!: { value: number };
+  private checks = 0;
+  get checkCount(): number { return ++this.checks; }
+}
+```
+
+```typescript
+// onpush-check.component.ts
+@Component({
+  selector: 'app-onpush-check',
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div class="card">
+      <h2>OnPush strategy — bound to the same data object</h2>
+      <div class="value">data.value = <strong>{{ data.value }}</strong></div>
+      <div class="value">localCount (own state) = <strong>{{ localCount }}</strong></div>
+      <button class="local" (click)="increment()">+1 local (event originates HERE)</button>
+      <div class="check-count">Checked {{ checkCount }}×</div>
+      <p class="hint">
+        Skipped on: mutating data.value in place (no new reference), and on unrelated
+        setTimeout ticks. Runs on: replacing data with a new object reference, AND on the
+        local button above -- because the click event originates inside this component's
+        own template, regardless of any input.
+      </p>
+    </div>
+  `,
+})
+export class OnPushCheckComponent {
+  @Input() data!: { value: number };
+  localCount = 0;
+  increment() { this.localCount++; }
+  private checks = 0;
+  get checkCount(): number { return ++this.checks; }
+}
+```
+
+```typescript
+// signal-check.component.ts
+@Component({
+  selector: 'app-signal-check',
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div class="card">
+      <h2>OnPush strategy — reads a shared Signal (no component input at all)</h2>
+      <div class="value">store.sharedCount() = <strong>{{ store.sharedCount() }}</strong></div>
+      <div class="check-count">Checked {{ checkCount }}×</div>
+      <p class="hint">
+        Updates when the ROOT component increments the shared signal — even though there's
+        no input here to compare, and the click didn't originate in this component. The
+        signal write itself marks this view dirty.
+      </p>
+    </div>
+  `,
+})
+export class SignalCheckComponent {
+  store = inject(CounterStore);
+  private checks = 0;
+  get checkCount(): number { return ++this.checks; }
+}
+```
+
+```typescript
+// async-pipe-check.component.ts
+@Component({
+  selector: 'app-async-pipe-check',
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [CommonModule],
+  template: `
+    <div class="card">
+      <h2>OnPush strategy — Observable input read via async pipe</h2>
+      <div class="value">(data$ | async)?.value = <strong>{{ (data$ | async)?.value }}</strong></div>
+      <div class="check-count">Checked {{ checkCount }}×</div>
+      <p class="hint">
+        The Observable reference itself never changes, only its emissions do — but AsyncPipe
+        calls markForCheck() on every emission, so this updates on "Push via Subject" only.
+      </p>
+    </div>
+  `,
+})
+export class AsyncPipeCheckComponent {
+  @Input() data$!: Observable<{ value: number }>;
+  private checks = 0;
+  get checkCount(): number { return ++this.checks; }
+}
+```
+
+```typescript
+// app.component.ts (root)
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule, DefaultCheckComponent, OnPushCheckComponent, SignalCheckComponent, AsyncPipeCheckComponent],
+  template: `
+    <div class="container">
+      <h1>Angular Change Detection: Zone.js, Dirty Checking, OnPush &amp; Signals</h1>
+      <div class="global-actions">
+        <button (click)="mutateInPlace()">① Mutate data.value++ (no new object reference)</button>
+        <button (click)="replaceReference()">② Replace data with a NEW object (new reference)</button>
+        <button (click)="incrementSharedSignal()">③ Increment shared signal (click originates HERE, not in the signal component)</button>
+        <button (click)="pushViaSubject()">④ Push new value via Subject (async pipe)</button>
+        <button (click)="triggerUnrelatedTick()">⑤ Trigger unrelated async event (empty setTimeout)</button>
+      </div>
+      <div class="grid">
+        <app-default-check [data]="data"></app-default-check>
+        <app-onpush-check [data]="data"></app-onpush-check>
+        <app-signal-check></app-signal-check>
+        <app-async-pipe-check [data$]="data$"></app-async-pipe-check>
+      </div>
+    </div>
+  `,
+})
+export class AppComponent {
+  store = inject(CounterStore);
+  data = { value: 0 };
+  private dataSubject = new BehaviorSubject({ value: 0 });
+  data$ = this.dataSubject.asObservable();
+  mutateInPlace() { this.data.value++; }
+  replaceReference() { this.data = { value: this.data.value + 1 }; }
+  incrementSharedSignal() { this.store.sharedCount.update((v) => v + 1); }
+  pushViaSubject() { this.dataSubject.next({ value: this.dataSubject.value.value + 1 }); }
+  triggerUnrelatedTick() { setTimeout(() => {}, 0); }
+}
+```
+
+## 5. Example Explanation – Execution Flow
+
+Verified live, button by button:
+
+- **Baseline (page load):** Default `Checked 3×`; OnPush `Checked 1×`; Signal `Checked 1×` (`sharedCount=0`); AsyncPipe `Checked 1×` (`value=0`).
+- **① Mutate in place** (`data.value++`, same object reference): Default updates to `data.value=1`, `Checked 5×`. OnPush stays completely frozen — `data.value=0`, `Checked 1×` — because the `@Input` reference never changed.
+- **② Replace with new reference**: Default `data.value=2`, `Checked 7×`. OnPush *now* updates too — `data.value=2`, `Checked 2×` — because the new object fails the `!==` reference check, marking OnPush dirty.
+- **③ Increment shared signal** (click handled in the *root* component, not inside the Signal card): Signal card updates — `sharedCount()=1`, `Checked 2×` — with zero `@Input` and zero local click. OnPush and AsyncPipe are untouched.
+- **④ Push via Subject**: AsyncPipe updates — `value=1`, `Checked 2×` — because `AsyncPipe` called `markForCheck()` on emission. Signal card is untouched (`Checked 2×`, same as before).
+- **OnPush's own local button** (`+1 local`, click originates *inside* OnPush's template): `localCount=1`, `Checked 3×` — even though `data` didn't change at all. The event's local origin alone is what marked it dirty.
+- **⑤ Unrelated setTimeout tick** (no state touched at all): Default still increments — `Checked 17×` — because Zone.js flags *any* stabilized async task as a reason to run a full-tree tick, and Default has no gate. OnPush, Signal, and AsyncPipe are all completely unchanged (`Checked 3×`, `Checked 2×`, `Checked 2×` respectively) — proving OnPush skips a tick entirely when none of its specific triggers fired.
+
+## 6. When does this show up?
+
+Any Angular app past a trivial size, especially ones with large lists, dashboards, or deeply nested component trees, where the cost of re-checking every component on every keystroke/timer/HTTP response becomes measurable. It also shows up directly in interviews whenever someone asks "why isn't my component updating" (usually a missing `OnPush` trigger) or "why is my app slow" (usually too many `Default` components deep in the tree).
+
+## 7. Advantages/Disadvantages
+
+**Default strategy** — simple, never surprises you (everything always reflects current state), but doesn't scale: every component gets checked on every zone tick, anywhere in the app.
+
+**OnPush** — dramatically cuts unnecessary checks in large trees, forces good practice (immutable data patterns, explicit event/observable flows), but has a real learning curve: mutating an object in place silently fails to update the view, which is the single most common OnPush bug.
+
+**Signals** — solve OnPush's biggest ergonomic problem (no more remembering to replace references) by tracking fine-grained reactive dependencies automatically, and they compose cleanly with `OnPush` since they don't rely on Input identity at all. The tradeoff is a second reactivity model layered on top of the classic one, which is more to explain and more to keep straight in a codebase that mixes both styles.
+
+## 8. Common Interview Traps
+
+Claiming Angular does a "deep diff" of objects — it does not; it's per-expression reference/value comparison via the compiled template function, one bound expression at a time.
+
+Claiming `OnPush` means a component "never updates automatically" — it does update automatically, just only on its specific trigger set (Input reference change, local event, async-pipe emission, explicit `markForCheck`/`detectChanges`, or a signal write).
+
+Forgetting that a DOM event bound in an OnPush component's own template marks it dirty regardless of whether any Input changed — this is the exact mechanism behind the follow-up question below.
+
+Assuming Zone.js is required for change detection to exist at all — it's required for the *automatic* trigger; Angular can run zoneless (manually or via Signals-based reactivity), calling `tick()`/`markForCheck()` explicitly instead.
+
+## 9. Interview Follow-up Questions
+
+Why does `OnPush` sometimes still update without Input changes? (See section 10/11 — this is the standing follow-up for this question, answered explicitly below.)
+
+How would you debug a component that isn't updating under `OnPush`?
+
+What's the actual performance difference between `Default` and `OnPush` in a tree with 1,000 components?
+
+How do Signals change or replace the need for `OnPush` going forward (zoneless Angular)?
+
+What's the difference between `markForCheck()` and `detectChanges()`?
+
+## 10. Quick Answer (say this first)
+
+Change detection runs in two layers: Zone.js decides *when* to check (after any async task completes the zone), and Angular's dirty-checking walks the tree and re-evaluates each bound expression by reference/value comparison, not a deep diff. `OnPush` lets a component skip that walk unless its Input reference changed, a local DOM event fired, an async-piped Observable emitted, or someone calls `markForCheck()`/`detectChanges()` — and Signals add a fifth, independent trigger: reading a signal subscribes that view, and writing it marks that view dirty directly, bypassing the Input check entirely.
+
+## 11. Interview-Ready Answer (full)
+
+Angular's change detection has three cooperating layers. First, Zone.js patches every async API the browser exposes — `setTimeout`, `addEventListener`, `Promise.then`, XHR, `fetch` — so that whenever one of those fires and the zone's task queue empties out (`onMicrotaskEmpty`), Angular knows a callback just ran that *might* have changed state. Second, on that signal, `ApplicationRef.tick()` walks the entire component tree once, depth-first from the root, and for each component runs its compiled template's update function, comparing each individual bound expression's new value against the value recorded last check using `===`/`Object.is` — this is "dirty checking," and critically it's expression-by-expression, never a deep object diff.
+
+Third, `ChangeDetectionStrategy.OnPush` lets a component opt out of being checked on a given pass unless a specific trigger applies to it: its `@Input` reference changed (mutating the object in place does not count — only reference replacement does), a DOM event originated inside its own template (this fires regardless of whether any Input changed at all), an Observable bound via the `async` pipe emitted (because `AsyncPipe` calls `markForCheck()` internally), or something manually calls `markForCheck()`/`detectChanges()`.
+
+The follow-up — why OnPush sometimes updates with no Input change — has two concrete answers I verified directly: first, a click handler bound in the OnPush component's *own* template marks that component dirty purely because the event originated there, completely independent of any Input; I proved this live with a local "+1" button that incremented a local counter and the check count with zero Input touched. Second, Signals add an entirely separate reactive-dependency mechanism: reading `signal()` in a template subscribes that view, and writing the signal — even from a totally different component with zero Input relationship — marks that view dirty directly. I demonstrated this with a shared `CounterStore` signal incremented by a click in the *root* component, which updated a downstream OnPush component that had no `@Input` at all.
+
+## 12. Quick Revision
+
+Zone.js patches async APIs → triggers Angular's tick after zone stabilizes. `tick()` walks the whole tree, checks each bound expression by reference/value, not deep diff. `OnPush` skips a component's check unless: Input reference changed, local template event fired, async-piped Observable emitted, or `markForCheck()`/`detectChanges()` called manually. Mutating an object in place never triggers OnPush; replacing the reference does. Signals add a fifth trigger: reading a signal subscribes the view; writing it marks that view dirty directly, independent of Input identity. Verified live: local click marks OnPush dirty with zero Input change; shared signal write marks a no-Input OnPush component dirty from a different component's click; unrelated setTimeout ticks Default but leaves all OnPush-based components completely untouched.
+
+## 13. Memory Trick
+
+**"Zone knows WHEN, dirty-check knows WHAT, OnPush says NO unless: new ref, local event, async pipe, or manual push — and Signals skip the ref check entirely."**
