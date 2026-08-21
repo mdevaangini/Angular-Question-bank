@@ -54,7 +54,7 @@ Each operator exists to remove one specific flavor of that manual bookkeeping �
 
 ## 4. Example
 
-**Live demo (all four, exactly as designed below):** [https://stackblitz.com/edit/angular-tg8qzhta](https://stackblitz.com/edit/angular-tg8qzhta)
+**Live demo (all four, exactly as designed below, now with an "Error" button on every source too):** [https://stackblitz.com/edit/angular-pbezkso1](https://stackblitz.com/edit/angular-pbezkso1)
 
 ### combineLatest vs forkJoin — same 3 sources, side by side
 
@@ -101,6 +101,8 @@ export class CombineForkDemoComponent {
 3. Click "Emit A" a few more times — combineLatest updates on every single click. forkJoin still shows nothing.
 4. Click "Complete A," then "Complete B," then "Complete C" — only once the **third** completion happens does forkJoin finally emit, and it shows only the **last** value each source had — every earlier "Emit A" click's value is gone, only the final one mattered.
 
+(There's also a red "Error" button next to each source and each panel — that's covered separately in section 5b below, since it's worth walking through on its own.)
+
 ### zip and withLatestFrom — simplest possible examples
 
 ```ts
@@ -127,6 +129,55 @@ Try: click "Update value" a few times (nothing happens in the log — it's silen
 - **forkJoin** behaves like a checklist: it silently tracks who's finished, says nothing at all until everyone is done, and then reports the final status of each — once.
 - **zip** behaves like matching socks from two separate baskets: it only produces a matched pair when both baskets have an unmatched item waiting, no matter which basket got refilled first.
 - **withLatestFrom** behaves like taking a photo: pressing the shutter (`mainSource$` emitting) is the only thing that produces a picture, and that picture just happens to capture whatever the other subject currently looks like at that instant — the other subject changing on its own never presses the shutter.
+
+## 5b. Error Case — What Happens When a Source Fails
+
+All four operators share one important, easy-to-miss rule: **if any single source errors, the entire combined stream errors immediately and dies — permanently — even if the other sources are perfectly healthy.** There's no partial result, no "the other two still work." This is often called "fail-fast" behavior, and it's the same across combineLatest, forkJoin, and zip; withLatestFrom follows it too, even though it looks asymmetric in the happy path.
+
+The live demo now has a red **Error** button next to every source, so you can trigger this directly:
+
+```ts
+// combine-fork-demo.component.ts
+errorC(): void {
+  if (!this.cDone) {
+    this.cDone = true;
+    this.cSubject.error(new Error('Source C failed (simulated network error)'));
+  }
+}
+```
+
+```ts
+combineLatest([this.aSubject, this.bSubject, this.cSubject]).subscribe({
+  next: ([a, b, c]) => { /* ... */ },
+  error: (err) => {
+    // Fires immediately the moment ANY of the three subjects errors.
+    this.combineLatestError = err.message;
+  }
+});
+```
+
+**Try this on the live demo:**
+
+1. Click "Emit A" and "Emit B" a couple of times each — leave Source C alone.
+2. Click "Error C."
+3. Watch both the combineLatest panel *and* the forkJoin panel immediately show a red error line and go dead — despite A and B never having any problem at all.
+4. Now click "Emit A" again — Source A itself still accepts it silently (a plain `Subject` doesn't know or care that some *other* subject errored), but that value goes nowhere: both combined subscriptions already terminated and are gone. Nothing will ever appear in either result panel again, no matter what you click.
+
+The same pattern is wired into **zip** (an "Error A" / "Error B" button — erroring either one kills the pairing stream, and any values already buffered waiting for a partner, like an extra "Emit A" click with no matching B yet, are silently lost) and into **withLatestFrom** (an "Error the latest-value source" button — this one is the more surprising case, explained below).
+
+**The subtle one: withLatestFrom's secondary source erroring.** You might expect that since only the *main* source's emissions produce output, only the main source's errors matter. That's not true — `withLatestFrom` subscribes to the secondary source (`other$`) as soon as the pipeline is subscribed, specifically so it always has a "latest value" ready. If that secondary source errors, the error propagates to the subscriber immediately, without needing another `Submit` click first. Try it on the demo: click "Error the latest-value source," then click "Submit" — you'll see the error was already showing before you even clicked Submit again.
+
+**Real-world implication:** if you're forkJoin-ing three parallel API calls and one of them can legitimately fail sometimes (like an optional analytics call), a raw `forkJoin` will make the *entire* page fail to load just because that one non-critical call failed. The fix is to give that source its own `catchError` *before* it goes into the combination, so it turns its failure into a fallback value instead of an error:
+
+```ts
+forkJoin({
+  profile: this.getProfile(),                 // must succeed
+  settings: this.getSettings(),                // must succeed
+  analytics: this.getAnalytics().pipe(
+    catchError(() => of(null))                // optional -- don't let this sink the page
+  )
+}).subscribe(result => { /* profile and settings guaranteed; analytics may be null */ });
+```
 
 ## 6. When should we use it?
 
