@@ -1,0 +1,112 @@
+# `rbac-role-based-access-control.md`
+**Suggested folder:** `interview-prep/security/access-control/`
+
+---
+
+## 1. What is it?
+
+Role-Based Access Control (RBAC) is a way of deciding who can do what in a system by grouping permissions into "roles," and then assigning users to those roles instead of granting permissions one by one. Instead of asking "can this specific user delete an invoice," the system asks "does this user have the `Admin` role, and does `Admin` include the delete-invoice permission?"
+
+## 2. Why introduced?
+
+Managing access permission-by-permission for every single user doesn't scale. If a company has 500 employees and 40 possible actions, that's up to 20,000 individual permission checks to track and keep in sync. RBAC groups those 40 actions into a handful of roles (`Admin`, `Editor`, `Viewer`, `Billing`), and each employee just gets one or two roles. When someone changes jobs, you swap their role instead of manually re-auditing every permission they had. It also makes access easier to reason about and audit — you can list a role's permissions once, instead of tracing individual grants scattered across users.
+
+## 3. How does it work?
+
+There are four core building blocks: **users** (the people or accounts), **roles** (named groups like `Admin` or `Editor`), **permissions** (specific actions like `invoice:delete` or `user:invite`), and the **assignments** connecting them — users get roles, and roles get permissions. A user's effective permissions are just the union of every permission granted by every role they hold.
+
+Checking access at runtime is a simple lookup: get the current user's roles, get the permissions those roles grant, and check if the required permission is in that list. This check typically happens in more than one place — on the server (the only check that actually matters for security), and often also in the UI (to hide buttons/routes the user can't use, purely for a better experience, not as a security boundary).
+
+Some systems add role hierarchy (an `Admin` role automatically includes everything an `Editor` role can do) or scoped roles (a user can be `Editor` for one project but only `Viewer` for another) to avoid having to define an explosion of near-duplicate roles.
+
+## 4. Example
+
+```typescript
+// permission.service.ts — the source of truth for role → permission mapping
+@Injectable({ providedIn: 'root' })
+export class PermissionService {
+  private rolePermissions: Record<string, string[]> = {
+    Viewer: ['invoice:read'],
+    Editor: ['invoice:read', 'invoice:edit'],
+    Admin: ['invoice:read', 'invoice:edit', 'invoice:delete', 'user:invite'],
+  };
+
+  constructor(private auth: AuthService) {}
+
+  hasPermission(permission: string): boolean {
+    const roles = this.auth.currentUser.roles; // e.g. ['Editor']
+    return roles.some((role) => this.rolePermissions[role]?.includes(permission));
+  }
+}
+```
+
+```typescript
+// can-delete-invoice.guard.ts — blocks a route on the client (UX only, not a real security boundary)
+export const canDeleteInvoiceGuard: CanActivateFn = () => {
+  const permissions = inject(PermissionService);
+  const router = inject(Router);
+  return permissions.hasPermission('invoice:delete') || router.parseUrl('/forbidden');
+};
+```
+
+```typescript
+// has-permission.directive.ts — hides UI the user isn't allowed to use
+@Directive({ selector: '[hasPermission]', standalone: true })
+export class HasPermissionDirective {
+  private permissions = inject(PermissionService);
+  private templateRef = inject(TemplateRef);
+  private viewContainer = inject(ViewContainerRef);
+
+  @Input() set hasPermission(permission: string) {
+    this.viewContainer.clear();
+    if (this.permissions.hasPermission(permission)) {
+      this.viewContainer.createEmbeddedView(this.templateRef);
+    }
+  }
+}
+```
+
+```html
+<!-- usage in a template -->
+<button *hasPermission="'invoice:delete'" (click)="deleteInvoice()">Delete</button>
+```
+
+## 5. Example Explanation – Execution Flow
+
+`PermissionService` holds the role-to-permission map — this is the one place that defines what each role can do. When a component checks `hasPermission('invoice:delete')`, it looks up the current user's roles (say, `['Editor']`), then checks whether any of those roles' permission lists include `'invoice:delete'` — for `Editor`, they don't, so it returns `false`. The route guard uses that same check to block navigation to a delete page client-side, redirecting to `/forbidden` if the check fails. The structural directive uses it to simply not render the delete button at all for users without permission, so they never see a control they can't use. None of this — the guard or the directive — is a real security boundary; a user could still call the delete API directly with dev tools. The actual enforcement has to happen on the server, checking the same kind of role/permission mapping before performing the delete.
+
+## 6. When does this show up?
+
+Any system with more than a couple of distinct user types: admin dashboards, SaaS products with paid tiers, content management systems, internal tools separating engineers/managers/finance. It comes up in interviews whenever access control, authorization, or "how do you handle different user types" is asked — RBAC is usually the first, most standard answer, with the interviewer often following up on how you'd handle more complex cases.
+
+## 7. Advantages/Disadvantages
+
+RBAC is simple to understand, easy to audit (list a role's permissions once), and scales well for organizations with clearly defined job functions. The tradeoff shows up as an organization's access rules get more specific: if you need "this user can edit invoices, but only for their own department," plain roles don't capture that — you end up creating a role per department per action, which multiplies fast (this is sometimes called "role explosion"). Finer-grained systems like Attribute-Based Access Control (ABAC), which decides access based on attributes (department, resource owner, time of day) rather than fixed roles, or a hybrid approach, handle that case better but are more complex to build and reason about.
+
+## 8. Common Interview Traps
+
+Treating a client-side role check (hiding a button, blocking a route) as actual security — it isn't; it's just UX, and the real check must happen on the server for every request. Confusing roles with permissions — a role is a named bundle of permissions, not a permission itself. Assuming RBAC handles ownership-based rules well ("edit only your own posts") — plain RBAC doesn't model "your own resource" out of the box; that usually needs an extra ownership check layered on top, or a move toward ABAC. Forgetting that role hierarchies need to be handled carefully — if `Admin` should include everything `Editor` can do, that inheritance needs to be modeled explicitly, or the permission lists start drifting out of sync.
+
+## 9. Interview Follow-up Questions
+
+How would you handle a rule like "users can only edit their own documents" using RBAC? What's the difference between RBAC and ABAC (Attribute-Based Access Control), and when would you reach for ABAC instead? How do you keep client-side permission checks (for UI/UX) from becoming a false sense of security? How would you design role hierarchies so `Admin` doesn't need to duplicate every permission `Editor` already has?
+
+## 10. Quick Answer (say this first)
+
+RBAC controls access by grouping permissions into named roles, then assigning users to roles instead of managing individual permissions per user. A user's effective access is the union of everything their roles grant. It's simple to manage and audit at organizational scale, but it doesn't handle fine-grained, per-resource rules like "only your own records" without extra logic layered on top — and any client-side role check (hiding a button, blocking a route) is only a UX nicety, never a real security boundary, since the server has to enforce the same check independently.
+
+## 11. Interview-Ready Answer (full)
+
+RBAC (Role-Based Access Control) manages permissions at the level of roles instead of individual users. You define a set of roles — say `Viewer`, `Editor`, `Admin` — each mapped to a list of specific permissions like `invoice:read` or `invoice:delete`. Users are then assigned one or more roles, and their effective access is just the combined set of permissions across all their roles. This scales far better than granting permissions user-by-user: onboarding, offboarding, and role changes become a matter of swapping a role assignment rather than auditing dozens of individual grants, and it's easy to reason about since you can list what a role can do in one place.
+
+In practice, the check happens in more than one layer. The server performs the check that actually matters — before executing any action, it verifies the authenticated user's roles include the required permission. The client (say, an Angular route guard or a structural directive that hides a delete button) can perform the same check purely for user experience — so people don't see options they can't use, or get redirected before hitting a page they can't act on — but this is never a substitute for the server-side check, since a client-side check can always be bypassed.
+
+The main limitation of plain RBAC is that it struggles with fine-grained, contextual rules — "edit only your own documents," or "approve requests under $500 but not over." Those need either extra ownership/attribute checks layered on top of the role system, or a move toward Attribute-Based Access Control (ABAC), which grants access based on attributes of the user, resource, and context rather than a fixed role. Most real systems end up using RBAC as the primary structure, with a thin layer of resource-specific or attribute-based rules handling the cases roles alone can't express cleanly.
+
+## 12. Quick Revision
+
+RBAC: users → roles → permissions. Effective access = union of all permissions from all assigned roles. Scales well, easy to audit, simple mental model. Weak spot: fine-grained/ownership rules ("only your own resource") aren't naturally expressed — needs extra logic or ABAC. Client-side checks (guards, directives hiding UI) = UX only, never real security; the server must independently re-check every request. Role hierarchies (Admin includes Editor's permissions) need explicit modeling or lists drift out of sync.
+
+## 13. Memory Trick
+
+**"Users wear roles, roles carry permissions — check the badge, not the person. And never trust the badge check that happens client-side."**
