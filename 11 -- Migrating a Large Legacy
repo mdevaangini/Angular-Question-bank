@@ -1,0 +1,277 @@
+# [Scenario] Migrating a Large Legacy Angular/AngularJS App to Modern Angular Without Pausing Features
+
+## 1. What is it?
+
+This is a **migration strategy** question: your company has a large, revenue-earning app stuck on an old Angular version (or even the original AngularJS), leadership wants it on modern Angular, but the business cannot afford to freeze feature work for months to do a big rewrite.
+
+The accepted answer is the **Strangler Fig pattern** — you grow the new (modern) system *around* the old one, screen by screen, until the old system's footprint shrinks to nothing and you can delete it. You never have one giant "rewrite everything, then switch" moment. Both the legacy and modern code run side-by-side, in production, at the same time, for months — and users don't notice the seam.
+
+## 2. Why was it introduced?
+
+**The problem before:** the traditional way to modernize an old app was a "big-bang rewrite" — freeze the old app, rebuild everything from scratch in the new stack, then cut over on one release day. In practice this almost always fails for large apps, for a few concrete reasons:
+
+- Feature work has to stop (or run on two parallel codebases) for months or years, which the business usually won't accept — the app is earning revenue *right now*.
+- The rewrite target keeps moving, because the old app doesn't freeze in real life — new features and bug fixes keep landing on it while the rewrite is happening, so the rewrite is chasing a moving target.
+- Big-bang cutovers are high-risk — you switch millions of users to entirely new code on one day, so if something's subtly wrong, *everything* breaks at once, for everyone, with no partial rollback.
+- Old, undocumented business logic (edge cases nobody remembers the reason for) tends to get silently dropped during a rewrite, because nobody re-discovers it until a customer complaint shows up after launch.
+
+**Why the incremental/Strangler Fig approach was introduced:** it directly answers "how do we modernize without stopping the business." By replacing one small piece (one screen, one route, one component) at a time, each swap is small enough to test, ship, and roll back independently. Feature work never has to pause because the old app keeps running normally while individual pieces get replaced underneath it.
+
+## 3. How does it work?
+
+There are two different situations, and the right technique depends on which one you're in.
+
+### Situation A — the app is on AngularJS (not Angular at all)
+
+Angular provides an official interop layer called **`@angular/upgrade`** (often called **ngUpgrade**) specifically for this. It lets AngularJS and Angular run in the *same* application, in the *same* browser page, at the *same* time.
+
+- **`UpgradeModule`** bootstraps a hybrid app — AngularJS bootstraps as usual, but Angular is bootstrapped alongside it inside the same page, and the two frameworks' change detection cycles are bridged together (Angular's `Zone.js` change detection is wired to also trigger AngularJS's `$digest`, and vice versa, so bindings on both sides stay in sync).
+- **`downgradeComponent()`** takes a modern Angular component and wraps it so it can be used as a directive *inside* AngularJS templates. This is how you introduce a brand-new Angular component into an old AngularJS screen without rewriting that whole screen.
+- **`downgradeInjectable()`** takes an Angular service and exposes it to AngularJS's dependency injection, so old AngularJS controllers can consume new Angular services.
+- **`upgradeNg1Provider()`** (the reverse direction) takes an existing AngularJS service and makes it injectable into modern Angular components — useful when a big, business-critical AngularJS service isn't worth rewriting yet, but new Angular code still needs to call it.
+- Routing is usually the hardest part — you typically keep AngularJS's router owning top-level navigation at first, and only move routes over to the Angular Router once enough of the app is on Angular that it's safe to hand navigation over.
+
+This lets teams migrate **screen by screen**: pick the highest-value screen, rebuild just that one in Angular, `downgradeComponent()` it back into the existing AngularJS shell, ship it, and repeat for the next screen — while every other screen keeps working exactly as before.
+
+### Situation B — the app is already on Angular, just a very old version
+
+Here you don't need ngUpgrade at all (no AngularJS to bridge). Instead:
+
+- Use **`ng update`** to move up **one major version at a time** (e.g. v8 → v9 → v10 …), never skipping versions — each major version's official migration schematics (automated codemods) only know how to handle a one-step jump, and skipping versions means losing that automation and hand-fixing everything instead.
+- In parallel, incrementally convert **NgModule-based** components to **standalone components** — this can be done file-by-file (Angular actually ships an `ng generate @angular/core:standalone` schematic for this), so it doesn't need to happen all at once either.
+- Because there's only one framework involved, this path is lower-risk than the AngularJS case — it's "upgrade the plumbing" rather than "bridge two different frameworks," but it should still be done incrementally, version-by-version, for the same reason: smaller, testable, revertible steps.
+
+### The shared technique — feature-flagged "strangler" routing shell (works for both situations)
+
+Regardless of which situation you're in, the actual cutover per screen/feature typically works like this:
+
+1. Introduce a **routing shell** (or a simple flag check) that decides, per screen or per feature, whether to render the **legacy** version or the **modern** version.
+2. Put that decision behind a **feature flag** — a config value (often per-user or per-percentage-rollout) that can be flipped without a code deploy.
+3. Both versions read/write through the **same shared state/service layer** underneath (this is critical — if legacy and modern each keep their own separate copy of the data, switching between them will show stale or inconsistent information).
+4. Ship the modern version *dark* first (flag off, so nobody sees it), test it in production traffic patterns, then flip the flag for a small percentage of users, watch for errors, and ramp up.
+5. If anything looks wrong, flip the flag back — instant rollback, no redeploy needed.
+6. Once a screen is on modern for 100% of users with no issues for a sustained period, delete the legacy code for that screen. Repeat for the next screen.
+
+### The business-process side (this is just as important as the code)
+
+Interviewers are listening for this half as much as the technical half:
+
+- **New features are always built in the new stack**, never the old one — otherwise the old stack keeps growing and the migration never catches up (a moving target again).
+- A **dedicated migration team** (not "whoever has spare time") owns converting screens, and merges its work **continuously** into the main branch — not on a long-lived separate branch that drifts and becomes a nightmare to merge later.
+- A strong **automated test safety net** (unit + integration + end-to-end) has to exist *before* migrating a screen, so you can tell immediately if the rewritten version behaves differently from the original.
+- **Prioritize by business value and risk**, not by "easiest first" — usually the highest-traffic screens or the most-frequently-touched-by-developers screens go first, since that's where the biggest pain (and biggest payoff) is.
+- The old stack only gets **fully sunset and deleted** once its footprint has shrunk to zero — not before, since a half-migrated app still needs the old runtime for whatever hasn't moved yet.
+
+## 4. Example
+
+Below is a simplified "Strangler Fig" demo built in Angular: a shared `OrdersBridgeService` stands in for what `downgradeInjectable()`/`upgradeNg1Provider()` would really do (share one source of truth between old and new code), and a feature-flag service decides, per screen, which UI renders. It's simulated in plain Angular (rather than a real AngularJS+Angular hybrid) so it can run standalone, but it mirrors exactly the same data-flow shape as a real ngUpgrade migration.
+
+Live, runnable demo (Angular standalone, StackBlitz): **https://stackblitz.com/edit/angular-s1x4tmdv**
+
+**`migration-flags.service.ts`** — decides legacy vs. modern per screen, and tracks overall progress:
+
+```typescript
+import { Injectable, computed, signal } from '@angular/core';
+
+export type ScreenKey = 'orders' | 'invoices' | 'reports';
+
+@Injectable({ providedIn: 'root' })
+export class MigrationFlagsService {
+  private readonly flags = signal<Record<ScreenKey, boolean>>({
+    orders: true,    // orders screen: already cut over to modern
+    invoices: false, // invoices screen: still legacy
+    reports: false,  // reports screen: still legacy
+  });
+
+  readonly migratedCount = computed(
+    () => Object.values(this.flags()).filter(Boolean).length
+  );
+  readonly totalScreens = computed(() => Object.keys(this.flags()).length);
+
+  isModern(screen: ScreenKey) {
+    return computed(() => this.flags()[screen]);
+  }
+
+  cutOverToModern(screen: ScreenKey) {
+    this.flags.update((f) => ({ ...f, [screen]: true }));
+  }
+
+  revertToLegacy(screen: ScreenKey) {
+    this.flags.update((f) => ({ ...f, [screen]: false }));
+  }
+}
+```
+
+**`orders-bridge.service.ts`** — the single shared source of truth both the legacy and modern Orders UI read/write through (in a real AngularJS migration, this role is played by `downgradeInjectable()` exposing an Angular service to AngularJS, or `upgradeNg1Provider()` exposing an AngularJS service to Angular):
+
+```typescript
+import { Injectable, signal } from '@angular/core';
+
+@Injectable({ providedIn: 'root' })
+export class OrdersBridgeService {
+  readonly itemCount = signal(0);
+
+  addItem() {
+    this.itemCount.update((n) => n + 1);
+  }
+}
+```
+
+**`orders-legacy.component.ts`** — deliberately written in an old, imperative DOM-manipulation style (standing in for real legacy AngularJS-controller-style code):
+
+```typescript
+import { Component, effect } from '@angular/core';
+import { OrdersBridgeService } from './orders-bridge.service';
+
+@Component({
+  selector: 'app-orders-legacy',
+  standalone: true,
+  template: `
+    <div class="legacy-box">
+      <p>LEGACY Angular UI (imperative DOM style) — Items: <span #countEl>0</span></p>
+      <button (click)="addItem()">Add item (legacy)</button>
+    </div>
+  `,
+})
+export class OrdersLegacyComponent {
+  constructor(private bridge: OrdersBridgeService) {
+    // Deliberately imperative style to represent "old" code that
+    // doesn't use modern signal-bound templates yet.
+    effect(() => {
+      const count = this.bridge.itemCount();
+      const el = document.querySelector('.legacy-box span');
+      if (el) el.textContent = String(count);
+    });
+  }
+
+  addItem() {
+    this.bridge.addItem();
+  }
+}
+```
+
+**`orders-modern.component.ts`** — clean, modern signal-bound template (this is the file that originally hit the `template must be a string` compiler error when it used `template: [...].join('')`; it now correctly uses `templateUrl` pointing at a real `.html` file):
+
+```typescript
+import { Component } from '@angular/core';
+import { OrdersBridgeService } from './orders-bridge.service';
+
+@Component({
+  selector: 'app-orders-modern',
+  standalone: true,
+  templateUrl: './orders-modern.component.html',
+})
+export class OrdersModernComponent {
+  constructor(public bridge: OrdersBridgeService) {}
+
+  addItem() {
+    this.bridge.addItem();
+  }
+}
+```
+
+**`orders-modern.component.html`**:
+
+```html
+<div class="modern-box">
+  <p>MODERN Angular UI (signals + template binding) — Items: {{ bridge.itemCount() }}</p>
+  <button (click)="addItem()">Add item (modern)</button>
+</div>
+```
+
+**`app.component.ts`** — the routing "shell" that reads the flag and decides which component to render per screen:
+
+```typescript
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { MigrationFlagsService } from './migration-flags.service';
+import { OrdersLegacyComponent } from './orders-legacy.component';
+import { OrdersModernComponent } from './orders-modern.component';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule, OrdersLegacyComponent, OrdersModernComponent],
+  templateUrl: './app.component.html',
+})
+export class AppComponent {
+  constructor(public flags: MigrationFlagsService) {}
+}
+```
+
+## 5. Example Explanation / Execution Flow
+
+1. `MigrationFlagsService` holds one boolean flag per screen. `orders` starts as `true` (already migrated), `invoices` and `reports` start as `false` (still legacy) — this models a migration that's partway done, which is the realistic state of any in-progress Strangler Fig migration.
+2. The Orders row in `app.component.html` checks `flags.isModern('orders')()` and renders either `<app-orders-legacy>` or `<app-orders-modern>` — this `*ngIf` toggle is exactly the "routing shell" decision described in section 3, just simplified to a template conditional instead of a full router-level feature flag.
+3. Both `OrdersLegacyComponent` and `OrdersModernComponent` inject the *same* `OrdersBridgeService` singleton (`providedIn: 'root'`, so there's only ever one instance app-wide). Clicking "Add item" in either component updates the one shared `itemCount` signal.
+4. This is the detail that makes the whole pattern work in practice: click "Add item (modern)" a few times, then click "Cut over to modern" / "Revert to legacy" to flip the flag — the item count **carries over exactly**, because both UIs were always reading and writing through the same underlying service. If each version had kept its own separate copy of the count instead, flipping the flag would show stale/wrong data, and that's the #1 way real migrations break in production.
+5. The `Invoices` and `Reports` rows are left as simple legacy placeholders with a "Cut over to modern" button that isn't wired to a real modern component yet — representing screens still waiting in the migration backlog. `migratedCount` / `totalScreens` at the top give a live "1 / 3 screens on modern Angular" readout, standing in for a real migration dashboard leadership would track progress against.
+
+## 6. When should we use it?
+
+- The app is business-critical and revenue-generating, so a multi-month feature freeze isn't acceptable.
+- The app is large enough that a full rewrite would take longer than the business can tolerate the risk of "big bang, all-or-nothing" cutover.
+- There's an existing AngularJS (or very old Angular) codebase that still has real, working, revenue-driving logic worth preserving rather than reimplementing from scratch immediately.
+- Leadership wants continuous, visible progress (a shrinking legacy footprint) rather than a long "nothing shippable yet" black box.
+
+It is generally **not** worth this incremental complexity for a small app that could realistically be rewritten in a few weeks — in that case a full rewrite is simpler and the interop machinery (ngUpgrade, feature-flag shells) is overkill.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- Feature work never has to stop — the business keeps shipping while the migration happens underneath it.
+- Each cutover is small, so it's easy to test in isolation and trivially easy to roll back (just flip the flag) if something's wrong.
+- Progress is continuous and visible (a shrinking legacy footprint, a rising "screens migrated" count) rather than an all-or-nothing bet.
+- Risk is spread out over many small changes instead of concentrated into one massive, high-stakes cutover day.
+
+**Disadvantages**
+
+- Running two frameworks (or two Angular versions/patterns) side-by-side for months adds real complexity and a larger total bundle size during the transition period.
+- The bridging/interop layer (ngUpgrade, or a bridge service) is itself extra code that has to be written, tested, and eventually torn down — it's not free.
+- The migration can drag on far longer than planned if leadership doesn't protect the dedicated migration team's time, or if new legacy-stack feature work keeps sneaking in.
+- Shared state between legacy and modern versions of a screen has to be designed carefully — get it wrong, and toggling the flag shows stale or inconsistent data (exactly what the bridge service in the example is there to prevent).
+
+## 8. Common Interview Traps
+
+- Jumping straight to "just rewrite it" without acknowledging *why* a big-bang rewrite fails for large, revenue-critical apps — interviewers want to hear the reasoning, not just the buzzword "Strangler Fig."
+- Not knowing the actual `@angular/upgrade` APIs by name (`UpgradeModule`, `downgradeComponent`, `downgradeInjectable`, `upgradeNg1Provider`) — saying "there's some interop layer" without specifics reads as surface-level knowledge.
+- Forgetting that `ng update` must go **one major version at a time** — trying to jump multiple majors at once loses the automated migration schematics.
+- Missing the **shared state** requirement — describing legacy and modern versions of a screen without explaining how they stay in sync is the single most common gap; this is exactly the bug the `OrdersBridgeService` in the example is designed to highlight.
+- Treating this as a purely technical problem and forgetting the business-process half: dedicated team, continuous merging, test safety net, prioritization by business value, and a clear sunset criterion for the old stack.
+- Confusing feature flags used for gradual/reversible rollout with A/B testing for product experiments — they're related mechanisms but serve different purposes here (the flag here is about migration risk control, not experimentation).
+
+## 9. Interview Follow-up Questions
+
+**Q: How do `UpgradeModule`, `downgradeComponent()`, and `downgradeInjectable()` actually differ?**
+Answer: `UpgradeModule` bootstraps the hybrid app and bridges AngularJS's `$digest` with Angular's `Zone.js` change detection. `downgradeComponent()` lets a modern Angular component be used inside AngularJS templates. `downgradeInjectable()` lets an Angular service be injected into AngularJS code. `upgradeNg1Provider()` does the reverse — lets an existing AngularJS service be injected into modern Angular components.
+
+**Q: How do you decide which screen to migrate first?**
+Answer: Usually by a combination of business value and risk — the highest-traffic screens or the ones developers touch most often, since that's where the pain (and the payoff of removing it) is greatest. Low-risk, low-traffic screens are sometimes done first instead, purely to prove out the migration process safely before touching anything critical.
+
+**Q: What happens if you need to roll back a migrated screen?**
+Answer: Flip its feature flag back to legacy — no redeploy needed if the flag is a runtime config value. This is exactly why keeping both versions reading/writing through the same shared state matters: the rollback has to show consistent, non-stale data immediately.
+
+**Q: How do you keep the old AngularJS/Angular-version app from just growing forever during the migration?**
+Answer: A hard rule that all new feature work is built in the new stack only, enforced by the dedicated migration team and code review — the old stack is treated as frozen except for critical bug fixes.
+
+**Q: When is it actually safe to delete the legacy code entirely?**
+Answer: Only once every screen/feature's flag has been on "modern" for 100% of users for a sustained period with no regressions — i.e., the legacy stack's real production footprint has reached zero, not just "we think we're done."
+
+## 10. Interview-Ready Answer
+
+"For a large, revenue-earning legacy app, I wouldn't recommend a big-bang rewrite — freezing feature work for months is too risky and the target keeps moving anyway, since the old app doesn't stop changing while you rebuild it. I'd use the Strangler Fig pattern instead: migrate incrementally, screen by screen, so the old and new versions run side-by-side in production. If it's AngularJS, I'd use Angular's official `@angular/upgrade` package — `UpgradeModule` to bootstrap a hybrid app, `downgradeComponent()` to drop new Angular components into existing AngularJS templates, and `downgradeInjectable()` / `upgradeNg1Provider()` to share services across the boundary. If it's just an old Angular version, it's simpler — `ng update` one major version at a time, plus incrementally converting NgModules to standalone components. Either way, the actual cutover per screen goes through a feature flag, so it's instantly reversible, and — this is the part people often miss — both the legacy and modern versions of a screen have to read and write through the *same* shared service, or toggling the flag shows stale or inconsistent data. On the process side, I'd want a dedicated migration team merging continuously, all new features built in the new stack only, a solid test safety net before touching each screen, and prioritization based on traffic and business value — with the old stack only fully deleted once its production footprint actually hits zero."
+
+## 11. Quick Revision
+
+- **What:** Strangler Fig migration — grow the new stack around the old one, screen by screen, instead of one big-bang rewrite.
+- **Why:** Big-bang rewrites force a feature freeze the business can't afford, and the old app keeps changing anyway while you're rebuilding it, so the target moves.
+- **Problem solved:** Modernizes a large legacy app with small, reversible, independently-testable steps instead of one huge high-risk cutover.
+- **How:** AngularJS → `UpgradeModule` + `downgradeComponent()` + `downgradeInjectable()`/`upgradeNg1Provider()`. Old-Angular-only → `ng update` one major at a time + incremental standalone conversion. Either way: feature-flagged per-screen cutover, both versions sharing the same underlying state/service.
+- **Use when:** The app is business-critical, too large to safely rewrite all at once, and leadership needs continuous shippable progress.
+- **Important:** Legacy and modern versions of a screen MUST share the same state/service — otherwise flipping the flag shows stale or wrong data.
+- **Remember:** New features always go in the new stack only; the old stack gets deleted only once its production footprint is truly zero.
+
+## 12. Memory Trick
+
+Think of it like renovating a house **while people are still living in it**, one room at a time — you never make everyone move out and live in a hotel for a year (the big-bang rewrite). You renovate the kitchen first, everyone still uses the rest of the house normally, then the next room, and so on — and crucially, the water and electricity lines (the shared state/service) stay connected the whole time, room to room, so nothing stops working halfway through.
