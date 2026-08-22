@@ -1,8 +1,3 @@
-# `detecting-dom-fully-loaded.md`
-**Suggested folder:** `interview-prep/javascript/dom-lifecycle/`
-
----
-
 ## 1. What is it?
 
 "DOM fully loaded" means knowing it's safe to touch the page's elements in code. Two events tell you this: `DOMContentLoaded` (the HTML is parsed into the DOM) and `load` (everything — images, stylesheets, iframes — has also finished). `document.readyState` lets you check the current state anytime, even after these events already happened.
