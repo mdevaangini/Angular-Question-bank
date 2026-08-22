@@ -1,20 +1,25 @@
+# `detecting-dom-fully-loaded.md`
+**Suggested folder:** `interview-prep/javascript/dom-lifecycle/`
+
+---
+
 ## 1. What is it?
 
-"DOM fully loaded" detection is how you know it's safe to run code that touches the page's elements — and it actually splits into two distinct, commonly-confused signals: `DOMContentLoaded` (the HTML has been fully parsed into the DOM tree) and `load` (everything — images, stylesheets, iframes, subresources — has finished loading too). There's also `document.readyState`, a synchronous property for checking the current state at any point, including after the events themselves have already fired.
+"DOM fully loaded" means knowing it's safe to touch the page's elements in code. Two events tell you this: `DOMContentLoaded` (the HTML is parsed into the DOM) and `load` (everything — images, stylesheets, iframes — has also finished). `document.readyState` lets you check the current state anytime, even after these events already happened.
 
 ## 2. Why introduced?
 
-Early scripts ran inline, in document order, which meant a `<script>` tag could execute before elements later in the HTML even existed — a constant source of "cannot read property of null" bugs when a script tried to grab an element by ID too early. Browsers needed explicit lifecycle events so code could declare "run this once the DOM (or the whole page) is actually ready," instead of developers guessing based on script placement or wrapping everything in fragile `setTimeout` hacks.
+Old scripts ran inline, in the order they appeared in the HTML. That meant a `<script>` tag could run before an element further down the page even existed — a constant source of "cannot read property of null" bugs when code tried to grab an element too early. Browsers needed clear signals so code could say "run this once the DOM (or the whole page) is actually ready," instead of guessing based on where the script tag sits, or using fragile `setTimeout` hacks.
 
 ## 3. How does it work?
 
-`document.readyState` moves through three values over a page load: `"loading"` (still parsing HTML), `"interactive"` (parsing finished, DOM is fully built and accessible, but subresources like images/stylesheets/iframes may still be loading), and `"complete"` (everything has finished loading, including subresources).
+`document.readyState` moves through three stages during a page load: `"loading"` (still parsing HTML), `"interactive"` (parsing is done, the DOM is fully built and usable, but images/stylesheets/iframes might still be loading), and `"complete"` (everything, including those subresources, has finished).
 
-`DOMContentLoaded` fires on `document` the moment `readyState` transitions to `"interactive"` — as soon as the DOM tree is parsed and safe to query/manipulate, without waiting for images or stylesheets. It does wait for synchronous, non-deferred `<script>` tags to finish executing (since the parser blocks on those), but not for async scripts or subresources.
+`DOMContentLoaded` fires the moment `readyState` hits `"interactive"` — as soon as the DOM is parsed and safe to query, without waiting for images or stylesheets. It does wait for regular `<script>` tags to finish running (the parser pauses for those), but not for async scripts or subresources.
 
-`load` fires on `window` the moment `readyState` transitions to `"complete"` — every image, stylesheet, and iframe has finished loading. This is strictly later than (or simultaneous with) `DOMContentLoaded`, never earlier.
+`load` fires on `window` once `readyState` hits `"complete"` — every image, stylesheet, and iframe has finished loading. This always happens at the same time as or after `DOMContentLoaded`, never before.
 
-Because both events are one-shot and fire once per page load, attaching a listener *after* the event has already happened means you'll never see it fire — which is exactly what `readyState` solves: check it synchronously first, and only attach a listener if the target state hasn't been reached yet.
+Both events only fire once. If you attach a listener after the event already happened, it will never fire for you — that's exactly what `readyState` is for: check it first, and only attach a listener if you haven't reached the state you need yet.
 
 ```javascript
 function onDomReady(callback) {
@@ -27,7 +32,7 @@ function onDomReady(callback) {
 }
 ```
 
-Modern HTML also offers `<script defer>`, which delays script execution until parsing completes (effectively running right before `DOMContentLoaded`) without blocking the parser, and `<script type="module">`, which defers by default for the same reason — both largely replace the "put your script tag at the bottom of `<body>`" convention.
+Modern HTML also gives you `<script defer>`, which waits until parsing finishes before running (right before `DOMContentLoaded`) without blocking the parser, and `<script type="module">`, which defers by default for the same reason. Both mostly replace the old trick of putting your script tag at the bottom of `<body>`.
 
 ## 4. Example
 
@@ -52,7 +57,7 @@ Modern HTML also offers `<script defer>`, which delays script execution until pa
 </body>
 ```
 
-In an Angular app specifically, you rarely reach for these directly — Angular's own bootstrap (`bootstrapApplication`/`platformBrowserDynamic().bootstrapModule()`) already runs after the DOM is parseable, and finer-grained "has the view actually rendered" hooks are handled by Angular's own lifecycle (`ngAfterViewInit`) or, in modern Angular, `afterNextRender()`/`afterRender()` for code that specifically needs the browser DOM (e.g., measuring an element, or third-party libraries that read layout).
+In an Angular app, you rarely need any of this directly. Angular's own bootstrap already runs after the DOM is parsed. For finer control — knowing when a specific component's view is actually rendered — Angular gives you its own hooks: `ngAfterViewInit()`, or in modern Angular, `afterNextRender()`/`afterRender()` for code that needs the real browser DOM (like measuring an element or mounting a third-party library).
 
 ```typescript
 import { Component, afterNextRender, ElementRef, viewChild } from '@angular/core';
@@ -72,42 +77,46 @@ export class ChartComponent {
 
 ## 5. Example Explanation – Execution Flow
 
-At the top of the inline `<script>` in `<head>`, the parser hasn't reached `<body>` yet, so `readyState` reads `"loading"`. The `DOMContentLoaded` listener is registered before that event can fire, so it reliably runs once parsing completes — at that point `getElementById('main')` succeeds because the DOM tree is fully built, even though `large-photo.jpg` may still be mid-download. The `load` listener fires later still, once the image finishes downloading and `readyState` reaches `"complete"`. In the Angular example, `afterNextRender()` schedules its callback for after Angular has rendered the component's view into real DOM nodes and attached them — guaranteeing `chartHost().nativeElement` is a real, attached element by the time the callback runs, which is the Angular-idiomatic equivalent of "wait for the relevant DOM to exist" scoped to a single component rather than the whole document.
+At the top of the `<script>` in `<head>`, the parser hasn't reached `<body>` yet, so `readyState` reads `"loading"`. The `DOMContentLoaded` listener is set up before that event can fire, so it runs reliably once parsing finishes — at that point `getElementById('main')` works because the DOM is fully built, even though `large-photo.jpg` might still be downloading. The `load` listener fires later, once the image finishes and `readyState` reaches `"complete"`. In the Angular example, `afterNextRender()` runs its callback only after Angular has rendered the component's view into real, attached DOM nodes — so `chartHost().nativeElement` is guaranteed to exist by then. It's the Angular version of "wait for the DOM," just scoped to one component instead of the whole page.
 
 ## 6. When does this show up?
 
-Any vanilla-JS or third-party-script integration where you must query or mutate the DOM but can't guarantee script execution order — widget embeds, analytics snippets, non-Angular libraries mounted into a page. Within Angular apps it shows up specifically when integrating DOM-measuring or DOM-mutating third-party libraries (charting, maps, rich text editors) that need real, attached DOM nodes and can't run inside Angular's virtual/pre-render lifecycle — hence reaching for `afterNextRender()` instead of, say, `ngOnInit()` (which can run before view DOM is attached in some scenarios) or the vanilla `DOMContentLoaded`/`load` events (which fire once for the whole document, not per-component).
+Any time you're working with plain JS or a third-party script that touches the DOM but can't guarantee when it runs relative to the page — widget embeds, analytics snippets, non-Angular libraries dropped into a page. In Angular apps, it comes up specifically when wiring up DOM-measuring or DOM-mutating libraries (charts, maps, rich text editors) that need real, attached DOM nodes — which is why you'd reach for `afterNextRender()` instead of `ngOnInit()` (which can run before the view's DOM is attached) or the plain `DOMContentLoaded`/`load` events (which fire once for the whole page, not per component).
 
 ## 7. Advantages/Disadvantages
 
-`DOMContentLoaded` is fast — code runs as soon as the DOM is safe to touch, without waiting on slow images. The tradeoff is that anything depending on image dimensions, iframe content, or other subresources isn't ready yet, so using it for layout-dependent code can misfire. `load` guarantees everything is ready but is correspondingly slower and blocks meaningful work behind potentially large downloads. Checking `readyState` directly is the safest general pattern since it works regardless of whether the event already fired, but requires remembering to branch on it — a plain `addEventListener('DOMContentLoaded', cb)` with no `readyState` check silently does nothing if the script runs after the event already happened (e.g., a dynamically injected `<script>` tag added late).
+`DOMContentLoaded` is fast — your code runs as soon as the DOM is safe to touch, without waiting on slow images. The catch: anything depending on image size, iframe content, or other subresources isn't ready yet, so layout-dependent code can break if you use it too early. `load` guarantees everything is ready, but it's slower and can be delayed by large downloads. Checking `readyState` directly is the safest habit, since it works no matter when your script runs — but you have to remember to do it. A plain `addEventListener('DOMContentLoaded', cb)` with no `readyState` check silently does nothing if your script runs after the event already fired (for example, a `<script>` tag added dynamically, late).
 
 ## 8. Common Interview Traps
 
-Confusing `DOMContentLoaded` (DOM parsed) with `load` (everything, including images, finished) — a very common mix-up. Forgetting that a listener attached after the event already fired simply never runs, and not knowing `readyState` is the fix. Assuming `defer`/`type="module"` scripts run *during* parsing — they're fetched during parsing but execute after parsing completes, in document order, just before `DOMContentLoaded`. In Angular specifically: assuming `ngOnInit()` guarantees the view's DOM is rendered and attached — it doesn't always (it runs after inputs are set, before/around view initialization depending on the case) — `ngAfterViewInit()` or `afterNextRender()` are the correct hooks for DOM-dependent work.
+Mixing up `DOMContentLoaded` (DOM parsed) with `load` (everything, images included, finished) — a very common mistake. Forgetting that a listener attached after the event already fired simply never runs, and not knowing `readyState` fixes that. Thinking `defer`/`type="module"` scripts run *during* parsing — they're fetched during parsing, but they actually run after parsing finishes, in order, just before `DOMContentLoaded`. In Angular: assuming `ngOnInit()` guarantees the view's DOM is rendered and attached — it doesn't always. `ngAfterViewInit()` or `afterNextRender()` are the right hooks for DOM-dependent work.
 
 ## 9. Interview Follow-up Questions
 
-What's the execution-order difference between a `defer` script and an `async` script relative to `DOMContentLoaded`?
+What's the difference in execution order between a `defer` script and an `async` script, relative to `DOMContentLoaded`?
 
-Why might `window.onload` fire much later than expected on a page with many images?
+Why might `window.onload` fire much later than expected on a page with lots of images?
 
-In Angular, when would you reach for `afterNextRender()` vs `afterRender()` vs `ngAfterViewInit()`?
+In Angular, when would you use `afterNextRender()` vs `afterRender()` vs `ngAfterViewInit()`?
 
-How would you detect "DOM ready" for content injected dynamically via `innerHTML` or a framework, where no native browser event fires at all?
+How would you detect "DOM ready" for content added dynamically (via `innerHTML` or a framework), where no native browser event fires at all?
 
 ## 10. Quick Answer (say this first)
 
-Use `DOMContentLoaded` when you need the DOM tree parsed and queryable but don't care about images/stylesheets, and `window.load` when you need everything — including subresources — fully loaded. Always guard with `document.readyState` first, since both events are one-shot and a listener attached after the fact will never fire. In Angular, the framework-idiomatic equivalent for "the DOM I care about exists" is `afterNextRender()`/`afterRender()`, scoped to a component rather than the whole document.
+Use `DOMContentLoaded` when you just need the DOM parsed and queryable, and don't care about images or stylesheets. Use `window.load` when you need everything, subresources included, fully loaded. Always check `document.readyState` first, since both events fire only once, and a listener attached too late never fires. In Angular, the equivalent tool is `afterNextRender()`/`afterRender()`, scoped to a single component rather than the whole page.
 
 ## 11. Interview-Ready Answer (full)
 
-Detecting a fully-loaded DOM actually means picking the right signal for what "loaded" means to your code. `document.readyState` moves through `"loading"` → `"interactive"` → `"complete"`. `DOMContentLoaded` fires the moment `readyState` hits `"interactive"` — the HTML has been fully parsed into a DOM tree, so it's safe to query and manipulate elements, but images, stylesheets, and iframes may still be loading. `window`'s `load` event fires later, once `readyState` reaches `"complete"`, meaning every subresource has finished too. Because both are one-time events, the safe general pattern is to check `readyState` synchronously first — if it's already past `"loading"`, the DOM is ready and you can run immediately; otherwise, attach the listener and wait, since a listener registered after the event already fired will simply never be called. In Angular, you rarely touch these directly — Angular's bootstrap already runs post-parse, and for code that specifically needs real, attached DOM nodes (measuring an element, mounting a third-party chart or map library), the idiomatic hook is `afterNextRender()` (or `afterRender()` for recurring post-render work), which guarantees the component's view has been rendered into actual DOM, scoped to that component rather than the whole document.
+Detecting a "fully loaded" DOM really means picking the right signal for what you actually need. `document.readyState` moves through `"loading"` → `"interactive"` → `"complete"`. `DOMContentLoaded` fires the moment it hits `"interactive"` — the HTML is fully parsed into a DOM tree, so it's safe to query and change elements, but images, stylesheets, and iframes might still be loading. `window`'s `load` event fires later, once `readyState` reaches `"complete"` — every subresource is done too.
+
+Since both events only fire once, the safe habit is to check `readyState` first: if it's already past `"loading"`, the DOM is ready and you can run your code immediately. Otherwise, attach the listener and wait — because a listener added after the event already fired simply never gets called.
+
+In Angular, you rarely deal with these directly. Angular's bootstrap already runs after the page is parsed. For code that specifically needs real, attached DOM — like measuring an element or mounting a chart or map library — the idiomatic hook is `afterNextRender()` (or `afterRender()` for work that needs to repeat after every render). It guarantees the component's view has actually been rendered into the DOM, scoped to that one component rather than the whole document.
 
 ## 12. Quick Revision
 
-`readyState`: `"loading"` → `"interactive"` (DOM parsed, `DOMContentLoaded` fires here) → `"complete"` (all subresources loaded, `load` fires here). Both events are one-shot — check `readyState` before attaching a listener, since post-hoc listeners never fire. `defer`/`module` scripts execute right before `DOMContentLoaded`, in order, without blocking the parser. Angular equivalent: `afterNextRender()`/`afterRender()` for DOM-dependent work per component, not `ngOnInit()`.
+`readyState`: `"loading"` → `"interactive"` (DOM parsed, `DOMContentLoaded` fires) → `"complete"` (everything loaded, `load` fires). Both events fire once — check `readyState` before attaching a listener, since late listeners never fire. `defer`/`module` scripts run right before `DOMContentLoaded`, in order, without blocking the parser. Angular equivalent: `afterNextRender()`/`afterRender()` per component, not `ngOnInit()`.
 
 ## 13. Memory Trick
 
-**"DOMContentLoaded = the skeleton's built. `load` = the skeleton's dressed, fed, and the photos have arrived. Check `readyState` first — you can't RSVP to a party that already happened."**
+**"DOMContentLoaded = the skeleton's built. `load` = it's dressed, fed, and the photos have arrived. Check `readyState` first — you can't RSVP to a party that already happened."**
