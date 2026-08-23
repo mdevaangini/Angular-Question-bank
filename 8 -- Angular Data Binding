@@ -4,6 +4,7 @@
 
 Data binding is how Angular keeps the component class (TypeScript) and the template (HTML) automatically in sync, without you manually touching the DOM. Angular has four binding forms:
 
+
 - **Interpolation** — `{{ expression }}` — component → view.
 - **Property binding** — `[property]="expression"` — component → view.
 - **Event binding** — `(event)="handler($event)"` — view → component.
