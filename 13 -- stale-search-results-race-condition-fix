@@ -1,0 +1,156 @@
+## 1. What is it?
+
+This is a classic search-box bug: every keystroke fires an API call, but network responses don't always come back in the same order they were sent. If an older, slower request resolves after a newer, faster one, its results can overwrite the correct, newer results on screen — the user briefly sees results for a query they already moved past. The fix uses RxJS's `switchMap` operator to cancel any request that's no longer relevant the moment a newer one starts.
+
+## 2. Why does this happen?
+
+Each keystroke kicks off its own independent HTTP call. Network timing isn't guaranteed — a request for a short, common query might take longer on the server than a request sent slightly later for a more specific query. If the code just calls `.subscribe()` on every request with no memory of "is this still the request I care about," whichever response happens to arrive last simply overwrites whatever's currently displayed, even if it's answering a query the user already replaced by typing more.
+
+## 3. How does it work?
+
+The fix routes every keystroke through a single stream instead of firing independent, disconnected calls. Keystrokes get pushed into a `Subject`, and that stream is piped through `switchMap`, which maps each value to a new inner observable (the API call) — but critically, the moment a new value arrives, `switchMap` unsubscribes from whatever inner observable it was previously waiting on, before subscribing to the new one. If that older request is still pending, unsubscribing tells RxJS to run its teardown logic — for a real HTTP client this cancels the underlying request (or at minimum stops caring about its result); for the mock version used in this demo, it clears the pending timer directly. Either way, a stale request can never emit into the stream again, so its result can never overwrite anything.
+
+## 4. Example
+
+Verified live at `https://stackblitz.com/edit/angular-z38w6flc`. A deterministic mock backend where single-character queries are slow (3s) and longer queries are fast (300ms), so typing "a" then quickly "ang" reliably reproduces the exact race every time.
+
+```typescript
+// search-api.service.ts
+import { Injectable } from '@angular/core';
+import { Observable } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class SearchApiService {
+  private resultsByQuery: Record<string, string[]> = {
+    a: ['Amazon', 'Apple', 'Airbnb'],
+    ang: ['Angular', 'Angular Material', 'Angular CLI'],
+  };
+
+  private delayFor(query: string): number {
+    return query.length <= 1 ? 3000 : 300;
+  }
+
+  search(query: string, onLog: (msg: string) => void): Observable<string[]> {
+    const ms = this.delayFor(query);
+    const results = this.resultsByQuery[query] ?? [`No canned results for "${query}"`];
+
+    return new Observable<string[]>((subscriber) => {
+      onLog(`→ request sent for "${query}" (resolves in ${ms}ms)`);
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        onLog(`✓ request for "${query}" resolved`);
+        subscriber.next(results);
+        subscriber.complete();
+      }, ms);
+
+      // Teardown: runs on unsubscribe. If the timer never fired, this is a
+      // genuine cancellation -- exactly what switchMap triggers on its
+      // previous inner subscription when a new value arrives.
+      return () => {
+        if (!settled) {
+          clearTimeout(timer);
+          onLog(`✗ request for "${query}" CANCELLED before it resolved`);
+        }
+      };
+    });
+  }
+}
+```
+
+```typescript
+// broken-search.component.ts — the bug
+export class BrokenSearchComponent {
+  private api = inject(SearchApiService);
+  query = '';
+  results: string[] = [];
+  displayedFor = '';
+  log: string[] = [];
+
+  onInput(value: string) {
+    this.api.search(value, (msg) => this.log.push(msg)).subscribe((results) => {
+      this.results = results;
+      this.displayedFor = value;
+    });
+  }
+}
+```
+
+```typescript
+// fixed-search.component.ts — the fix
+import { Subject, Subscription, switchMap, map } from 'rxjs';
+
+export class FixedSearchComponent implements OnInit, OnDestroy {
+  private api = inject(SearchApiService);
+  private queryChanges = new Subject<string>();
+  private sub?: Subscription;
+  results: string[] = [];
+  displayedFor = '';
+  log: string[] = [];
+
+  ngOnInit() {
+    this.sub = this.queryChanges
+      .pipe(
+        switchMap((value) =>
+          this.api.search(value, (msg) => this.log.push(msg)).pipe(map((results) => ({ value, results })))
+        )
+      )
+      .subscribe(({ value, results }) => {
+        this.results = results;
+        this.displayedFor = value;
+      });
+  }
+
+  ngOnDestroy() {
+    this.sub?.unsubscribe();
+  }
+
+  onInput(value: string) {
+    this.queryChanges.next(value);
+  }
+}
+```
+
+## 5. Example Explanation – Execution Flow
+
+Clicking "Simulate race" on both panels types `"a"` (starting a slow, 3-second request), then 300ms later types `"ang"` (starting a fast, 300ms request). Verified live, final state on both sides:
+
+**Broken panel:** the log shows, in order, `→ sent "a"`, `→ sent "ang"`, `✓ resolved "ang"`, `✓ resolved "a"` — both requests ran to completion, and since `"a"`'s 3-second timer fired last, its result (`Amazon, Apple, Airbnb`) overwrote the correct, already-displayed `"ang"` results. The final displayed heading reads `Displayed results (for query: "a")` — the exact bug described: an older query's results flashing in after a newer one.
+
+**Fixed panel:** the log shows `→ sent "a"`, `✗ "a" CANCELLED before it resolved`, `→ sent "ang"`, `✓ resolved "ang"` — the moment `"ang"` was typed, `switchMap` unsubscribed from the still-pending `"a"` request, running its teardown and canceling the timer immediately (confirmed by the `CANCELLED` log line appearing right away, not after 3 seconds). The final displayed heading correctly reads `Displayed results (for query: "ang")` with `Angular, Angular Material, Angular CLI` — the stale request never got a chance to overwrite anything, because it never got to emit at all.
+
+## 6. When does this show up?
+
+Any live-search or type-ahead box backed by a real API, autocomplete fields, filter-as-you-type tables, or any UI that fires a new async request in response to rapid, repeated user input. It's one of the most common real-world RxJS interview questions because it has a concrete, correct, canonical answer (`switchMap`) and a very common wrong answer (just adding a `debounceTime` and hoping the problem goes away, which reduces the odds but doesn't eliminate the race).
+
+## 7. Advantages/Disadvantages
+
+`switchMap` fully eliminates the race by construction — there's no way for a stale response to reach the subscriber, since its source observable is unsubscribed before it can emit. It also saves wasted work: for a real HTTP client, unsubscribing a pending request typically aborts it over the wire. The tradeoff is that `switchMap` is specifically for "only the latest matters" scenarios — it's the wrong tool if you need every request's result (use `mergeMap`) or need requests to run strictly one-at-a-time in order without dropping any (use `concatMap`). Using `switchMap` for, say, a "submit form" button would incorrectly cancel a real in-progress submission if the user clicked twice.
+
+## 8. Common Interview Traps
+
+Assuming `debounceTime` alone fixes this — it reduces how often requests fire, but doesn't stop two in-flight requests from resolving out of order; the race is still possible, just less frequent. Confusing `switchMap` with `mergeMap` (which runs every inner observable to completion and merges results, keeping the exact bug intact) or `concatMap` (which queues instead of cancels, meaning old, stale requests still run and still emit, just later). Forgetting that this pattern requires routing input through a single stream (a `Subject`, or `valueChanges` on a form control) — calling `.subscribe()` directly inside an event handler, as in the broken version, has no way to cancel anything, no matter what operators exist elsewhere in the codebase.
+
+## 9. Interview Follow-up Questions
+
+Why doesn't `debounceTime` alone solve this problem? What's the difference between how `switchMap`, `mergeMap`, `concatMap`, and `exhaustMap` handle overlapping inner observables? How would you also add debouncing and duplicate-query filtering on top of the `switchMap` fix? What happens to an in-flight real HTTP request when `switchMap` unsubscribes from it — does it actually cancel the network request, or just stop listening?
+
+## 10. Quick Answer (say this first)
+
+Route every keystroke through a single stream (a `Subject`, or a form control's `valueChanges`) and pipe it through `switchMap` instead of calling `.subscribe()` directly on each keystroke. `switchMap` unsubscribes from the previous in-flight request the instant a new one starts, so a slow, superseded request can never emit and overwrite newer results — verified live: the broken version let a 3-second-old query flash in after a 300ms-newer one resolved, while the `switchMap` version showed the stale request being actively cancelled the moment the new query was typed.
+
+## 11. Interview-Ready Answer (full)
+
+This bug happens because each keystroke fires an independent async call with no relationship to any other call, and network responses aren't guaranteed to arrive in the order they were sent. If the code just subscribes directly to each new request, whichever one happens to resolve last wins, overwriting the display — even if it's answering a query the user has already typed past. I reproduced this directly with a mock API where single-character queries are deliberately slow and longer queries are fast: typing "a" then quickly "ang" reliably shows "ang"'s correct results getting overwritten a few seconds later by "a"'s stale results, because both requests ran to completion independently.
+
+The fix is to route keystrokes through a single observable stream — a `Subject` that each keystroke pushes into, or a reactive form control's `valueChanges` — and pipe that stream through `switchMap` rather than subscribing per-keystroke. `switchMap` maps each emitted value to a new inner observable (the API call), but the key behavior is that it unsubscribes from whatever inner observable it was previously subscribed to the instant a new outer value arrives. I confirmed this exactly: in the fixed version, the moment "ang" was typed, the still-pending request for "a" was actively cancelled — its teardown logic ran immediately rather than three seconds later — so it never got the chance to emit a stale result at all. The displayed results always matched the most recent query, with no possibility of an older response arriving late and overwriting anything.
+
+It's worth being precise about why `debounceTime` alone isn't a full fix: it reduces how often requests fire by waiting for a pause in typing, which lowers the odds of a race but doesn't structurally prevent one — two requests can still be in flight and still resolve out of order. `switchMap` is the correct fix because it eliminates the possibility at the subscription level, not just reduces its likelihood. It's also worth distinguishing `switchMap` from its siblings: `mergeMap` would keep the exact same bug since it lets every request run to completion, and `concatMap` would queue requests rather than cancel them, meaning a stale request still eventually resolves and still gets displayed — just later, after the queue catches up. `switchMap` is specifically the "only the latest result matters" operator, which is exactly the search-box use case.
+
+## 12. Quick Revision
+
+Bug: each keystroke fires an independent request; whichever resolves last wins, even if it's stale. `debounceTime` alone reduces frequency but doesn't eliminate the race. Fix: route keystrokes through one stream (`Subject`/`valueChanges`) piped through `switchMap` — it unsubscribes the previous inner observable the instant a new value arrives, so a stale request is cancelled and can never emit. `mergeMap` keeps the bug (runs everything to completion); `concatMap` queues instead of cancelling (stale request still eventually resolves, just later). Verified live: broken version showed a 3-second-old query overwrite a 300ms-newer one; fixed version showed the old request get actively cancelled the moment the new query was typed.
+
+## 13. Memory Trick
+
+**"switchMap fires the old messenger the second a new one shows up — mergeMap lets both finish their story, concatMap just makes the old one wait in line."**
