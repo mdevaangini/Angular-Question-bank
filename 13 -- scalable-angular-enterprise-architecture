@@ -1,0 +1,245 @@
+## 1. What is it?
+
+A scalable Angular enterprise architecture is a way of organizing a large app's code so many developers can work on it at once without stepping on each other, and so the app stays fast and easy to change as it grows. The usual approach splits code into three kinds of things: **core** (app-wide singletons — auth, logging, config — created once), **shared** (reusable, dumb UI pieces with no business logic), and **feature** (self-contained chunks of the app, each lazy-loaded and each owning its own local state).
+
+## 2. Why introduced?
+
+A small app can get away with dumping everything in one folder. An enterprise app usually has dozens of features, multiple teams, and years of ongoing development — without structure, a flat pile of components and services turns into a tangle where nobody can safely change one thing without breaking three others, and the initial bundle grows huge because everything loads up front whether the user needs it or not. Splitting into core/shared/feature, and lazy-loading each feature, keeps the initial load small, keeps teams working in isolated areas of the codebase, and makes it obvious where new code should go.
+
+## 3. How does it work?
+
+**Core** holds services that must exist exactly once for the whole app — authentication state, a logging service, app-wide configuration. These are registered with `providedIn: 'root'`, which makes Angular's dependency injector create exactly one instance the first time anything asks for it, and hand back that same instance to every other consumer for the rest of the app's life.
+
+**Shared** holds components, directives, and pipes with no feature-specific logic — a card, a button, a date-formatting pipe. They don't inject feature services and don't know which feature is using them; they just take inputs and render.
+
+**Feature** modules own a specific piece of functionality (a dashboard, a settings page, a billing flow). Each feature is lazy-loaded through the router, so its code only downloads when the user actually navigates there — Angular's router supports this natively for standalone components via `loadComponent: () => import(...)`. A feature can also declare its own local services in a component's `providers` array (instead of `providedIn: 'root'`), which makes Angular create a fresh instance every time that component is created and destroy it when the component is destroyed — keeping that feature's local state from leaking into or persisting outside the feature.
+
+## 4. Example
+
+Verified live at `https://stackblitz.com/edit/angular-dtj8ilds`. Two lazy-loaded feature routes (Dashboard, Settings), one core singleton service, and one shared component.
+
+```typescript
+// core/activity-log.service.ts
+import { Injectable } from '@angular/core';
+
+/**
+ * CORE service: providedIn 'root' makes this a true app-wide singleton --
+ * exactly ONE instance ever exists, no matter how many lazy feature routes
+ * get loaded/unloaded. This is the defining trait of a "core module"
+ * service in an enterprise Angular architecture: shared, stateful,
+ * instantiated once, injected everywhere.
+ */
+@Injectable({ providedIn: 'root' })
+export class ActivityLogService {
+  private static instanceCount = 0;
+  instanceId: number;
+  entries: string[] = [];
+
+  constructor() {
+    ActivityLogService.instanceCount++;
+    this.instanceId = ActivityLogService.instanceCount;
+    this.entries.push(
+      `ActivityLogService created -- instance #${this.instanceId} (should stay #1 forever, app-wide singleton)`
+    );
+  }
+
+  log(message: string) {
+    this.entries.push(message);
+  }
+}
+```
+
+```typescript
+// shared/card.component.ts
+import { Component, Input } from '@angular/core';
+
+/**
+ * SHARED component: a dumb, reusable presentational building block with no
+ * feature-specific logic and no injected feature services. This is what
+ * belongs in a "shared module" in an enterprise architecture -- pure UI,
+ * reused across unrelated features.
+ */
+@Component({
+  selector: 'app-card',
+  standalone: true,
+  template: `
+    <div class="card">
+      <h3>{{ title }}</h3>
+      <ng-content></ng-content>
+    </div>
+  `,
+})
+export class CardComponent {
+  @Input() title = '';
+}
+```
+
+```typescript
+// features/dashboard/dashboard-data.service.ts
+import { Injectable } from '@angular/core';
+
+/**
+ * FEATURE-SCOPED service: deliberately NOT providedIn 'root'. It is instead
+ * listed in DashboardComponent's own `providers` array, so Angular creates
+ * a FRESH instance every time that component is instantiated -- i.e. every
+ * time you navigate to /dashboard, since the lazy-loaded standalone
+ * component (and its provider) is torn down and recreated by the router.
+ * This is the enterprise pattern for feature-local state/services that
+ * should NOT leak or persist outside their own feature.
+ */
+@Injectable()
+export class DashboardDataService {
+  private static instanceCount = 0;
+  instanceId: number;
+
+  constructor() {
+    DashboardDataService.instanceCount++;
+    this.instanceId = DashboardDataService.instanceCount;
+  }
+
+  getWidgets(): string[] {
+    return ['Revenue', 'Active Users', 'Churn Rate'];
+  }
+}
+```
+
+```typescript
+// features/dashboard/dashboard.component.ts
+import { Component, inject } from '@angular/core';
+import { CardComponent } from '../../shared/card.component';
+import { ActivityLogService } from '../../core/activity-log.service';
+import { DashboardDataService } from './dashboard-data.service';
+
+@Component({
+  selector: 'app-dashboard',
+  standalone: true,
+  imports: [CardComponent],
+  // Feature-scoped provider: a NEW DashboardDataService instance is created
+  // every time this lazy-loaded component is mounted.
+  providers: [DashboardDataService],
+  template: `
+    <app-card title="Dashboard (feature-scoped)">
+      <p>This mount's DashboardDataService instance: #{{ dataService.instanceId }}</p>
+      <ul>
+        @for (widget of widgets; track widget) {
+          <li>{{ widget }}</li>
+        }
+      </ul>
+    </app-card>
+  `,
+})
+export class DashboardComponent {
+  dataService = inject(DashboardDataService);
+  private activityLog = inject(ActivityLogService);
+  widgets = this.dataService.getWidgets();
+
+  constructor() {
+    this.activityLog.log(
+      `DashboardComponent mounted -- feature-scoped DashboardDataService instance #${this.dataService.instanceId} (ActivityLogService is still instance #${this.activityLog.instanceId})`
+    );
+  }
+}
+```
+
+```typescript
+// app.routes.ts
+import { Routes } from '@angular/router';
+
+/**
+ * Each feature route uses loadComponent with a dynamic import, so its
+ * component (and everything only it imports) ships in its own lazy chunk.
+ */
+export const routes: Routes = [
+  { path: '', redirectTo: 'dashboard', pathMatch: 'full' },
+  {
+    path: 'dashboard',
+    loadComponent: () =>
+      import('./features/dashboard/dashboard.component').then((m) => m.DashboardComponent),
+  },
+  {
+    path: 'settings',
+    loadComponent: () =>
+      import('./features/settings/settings.component').then((m) => m.SettingsComponent),
+  },
+];
+```
+
+```typescript
+// app.component.ts (root)
+import { Component, inject } from '@angular/core';
+import { RouterOutlet, RouterLink, RouterLinkActive } from '@angular/router';
+import { ActivityLogService } from './core/activity-log.service';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [RouterOutlet, RouterLink, RouterLinkActive],
+  template: `
+    <div class="container">
+      <h1>Scalable Angular Enterprise Architecture</h1>
+      <nav>
+        <a routerLink="/dashboard" routerLinkActive="active">Dashboard</a>
+        <a routerLink="/settings" routerLinkActive="active">Settings</a>
+      </nav>
+      <router-outlet></router-outlet>
+      <h2>Activity log (ActivityLogService -- one singleton instance for the whole app)</h2>
+      <ul class="log">
+        @for (entry of activityLog.entries; track $index) {
+          <li>{{ entry }}</li>
+        }
+      </ul>
+    </div>
+  `,
+})
+export class AppComponent {
+  activityLog = inject(ActivityLogService);
+}
+```
+
+(`SettingsComponent` and `SettingsDataService` mirror the Dashboard files exactly, with their own independent instance counter.)
+
+## 5. Example Explanation – Execution Flow
+
+Verified live, step by step:
+
+- **First load (redirects to `/dashboard`):** the log shows `ActivityLogService created -- instance #1`, then `DashboardComponent mounted -- feature-scoped DashboardDataService instance #1 (ActivityLogService is still instance #1)`.
+- **Navigate to Settings:** `SettingsComponent` mounts fresh (its own lazy chunk), logging `SettingsDataService instance #1`, while the log confirms `ActivityLogService is still instance #1`.
+- **Navigate back to Dashboard:** because the router destroys the previous `DashboardComponent` instance when you navigate away and creates a brand-new one when you navigate back, its `providers: [DashboardDataService]` array runs again — the log shows `DashboardDataService instance #2` this time, while `ActivityLogService is still instance #1`, unchanged across all three mounts.
+
+This is the concrete proof of the core-vs-feature distinction: a root-provided service survives navigation and stays a true singleton, while a component-scoped service is recreated every time its owning component remounts — exactly the behavior you want for feature-local state that shouldn't leak between visits or between features.
+
+## 6. When to use?
+
+Reach for this structure once an app has more than a handful of routes/features, more than one team contributing, or a growing initial bundle size becoming a real problem. It's the default expectation in most mid-to-large Angular codebases and comes up in interviews as a system-design-style question testing whether a candidate thinks about more than just component code — module boundaries, DI scoping, lazy loading, and bundle size all matter here.
+
+## 7. Advantages/Disadvantages
+
+Splitting into core/shared/feature keeps the mental model simple (new code has an obvious home), keeps teams from stepping on each other's files, and lazy loading keeps the initial bundle small since features only download when visited. Root-provided core singletons give you a clean, predictable place for app-wide state. The tradeoff: it's more upfront structure than a small app needs, feature-scoped providers require discipline (it's easy to accidentally put something in `providedIn: 'root'` that should have been feature-scoped, or vice versa), and lazy loading adds a small navigation delay the first time a user visits a given feature, which needs to be handled gracefully (loading states, route preloading strategies).
+
+## 8. Common Interview Traps
+
+Assuming every service should be `providedIn: 'root'` "to be safe" — that turns every service into a permanent, app-wide singleton whether or not that's appropriate, and can cause feature-local state to leak between unrelated parts of the app or between different visits to the same feature. Assuming "shared module" components should contain business logic — they shouldn't; if a component needs a feature-specific service, it belongs in that feature, not shared. Forgetting that lazy loading requires the router to be told explicitly (`loadComponent`/`loadChildren`) — importing a feature component directly in the root component's `imports` array defeats lazy loading, since it forces that code into the initial bundle regardless of what the route config says.
+
+## 9. Interview Follow-up Questions
+
+How would you decide whether a service belongs in "core" (root-provided) versus scoped to a single feature? What's the difference between `loadComponent` and the older `loadChildren` NgModule-based lazy loading, and when would you still use the latter? How would you share state between two independent lazy-loaded features without making everything a root singleton? What router features would you add for a production app (route guards, preloading strategies, resolvers) and why?
+
+## 10. Quick Answer (say this first)
+
+A scalable Angular architecture splits code into core (root-provided, app-wide singleton services), shared (reusable UI with no business logic), and feature (self-contained, lazy-loaded chunks that can declare their own locally-scoped services). Lazy loading via `loadComponent` keeps the initial bundle small since a feature's code only downloads when the user navigates there, and component-level `providers` arrays keep feature-local state from leaking outside that feature or persisting between visits — verified live by watching a feature-scoped service get a fresh instance on every remount, while a root-provided core service stayed the same single instance throughout.
+
+## 11. Interview-Ready Answer (full)
+
+For a scalable enterprise Angular app, I'd organize code into three categories. Core holds app-wide singleton services — auth state, logging, global configuration — registered with `providedIn: 'root'`, so Angular's injector creates exactly one instance for the app's entire lifetime and hands that same instance to every consumer. Shared holds dumb, reusable UI — components, pipes, directives with no business logic and no dependency on any specific feature's services — things like a card component or a date-formatting pipe that any feature can safely reuse. Feature modules own a specific piece of functionality end to end, and critically, each one is lazy-loaded through the router using `loadComponent` (for standalone components) with a dynamic `import()`, so its code only ships to the browser the first time a user actually navigates there, keeping the initial bundle small.
+
+The part that's easy to get wrong is service scoping within features. If a feature needs its own local service — say, a data-fetching facade specific to a dashboard — the right move is usually to declare it in that feature's own component `providers` array rather than `providedIn: 'root'`. I verified this distinction directly: a root-provided `ActivityLogService` stayed the same single instance across every navigation, exactly as a core singleton should. Meanwhile, a `DashboardDataService` declared only in `DashboardComponent`'s own `providers` array got a completely fresh instance every time I navigated away and back to that route, because the router destroys and recreates the lazy-loaded component (and everything in its provider array) on each visit. That's the correct behavior for feature-local state — it shouldn't leak into other features, and it shouldn't silently persist stale data between visits.
+
+Beyond that, a production setup would add router guards for auth-gated routes, a preloading strategy so features load in the background after the initial paint instead of only on-demand, and resolvers for data that must be ready before a route activates. But the core structural decision — core singletons vs. shared dumb UI vs. lazy-loaded, independently-scoped features — is what makes the codebase navigable and the bundle size manageable as the app and the team both grow.
+
+## 12. Quick Revision
+
+Core = `providedIn: 'root'` singletons (auth, logging, config) — one instance, whole app, forever. Shared = dumb reusable UI, no feature logic, no feature service injection. Feature = lazy-loaded via `loadComponent`/dynamic `import()`, keeps initial bundle small, can declare its own component-scoped `providers` for feature-local state. Component-scoped providers get a fresh instance every time the component (re)mounts — verified live: a feature service's instance count incremented on every remount while a root-provided service stayed at instance #1 the whole time. Trap: don't default everything to `providedIn: 'root'` — that turns feature-local state into an accidental app-wide singleton.
+
+## 13. Memory Trick
+
+**"Core is the one thing that never leaves. Shared doesn't know whose party it's at. Feature packs its own bags every time it shows up."**
