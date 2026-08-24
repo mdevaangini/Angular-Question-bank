@@ -1,8 +1,3 @@
-# `rbac-role-based-access-control.md`
-**Suggested folder:** `interview-prep/security/access-control/`
-
----
-
 ## 1. What is it?
 
 Role-Based Access Control (RBAC) is a way of deciding who can do what in a system by grouping permissions into "roles," and then assigning users to those roles instead of granting permissions one by one. Instead of asking "can this specific user delete an invoice," the system asks "does this user have the `Admin` role, and does `Admin` include the delete-invoice permission?"
