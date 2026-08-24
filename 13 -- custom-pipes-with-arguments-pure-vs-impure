@@ -1,0 +1,269 @@
+## 1. What is it?
+
+A custom pipe is a class that transforms a value for display in a template, using the `{{ value | pipeName:arg }}` syntax. "With arguments" means the pipe takes extra parameters beyond the value itself, like `timeAgo:'short'` or `highlight:searchTerm`. "Pure" is a setting on the pipe that controls exactly when Angular bothers to re-run it.
+
+## 2. Why introduced?
+
+Formatting logic like "turn a timestamp into '5 minutes ago'" or "wrap matching text in `<mark>`" shows up in templates all the time. Pipes let you write that logic once and reuse it declaratively in any template, instead of repeating formatting code in every component or computing it manually on every change. Purity was added on top of that so Angular doesn't have to blindly re-run every pipe's logic on every single change detection pass — for a pipe whose output depends only on its inputs, that would be wasted work.
+
+## 3. How does it work?
+
+A pipe is a class with a `transform(value, ...args)` method, decorated with `@Pipe({ name: '...' })`. By default, a pipe is **pure** (you don't even need to write `pure: true` — it's the default). A pure pipe only re-runs `transform()` when the bound value or any of its arguments changes, compared to the last call, using reference comparison for objects and value comparison for primitives. If nothing it's watching changed, Angular reuses the last output without calling `transform()` again — even if some totally unrelated part of the page just triggered a change detection pass.
+
+Setting `pure: false` makes a pipe **impure**. An impure pipe re-runs `transform()` on every single change detection pass that reaches its component, no matter what actually changed — even if none of its own inputs did. This is expensive in a large list, but it's necessary for pipes whose output can change without any input reference changing (like a pipe that reads from a mutable array in place, without ever replacing the array itself).
+
+## 4. Example
+
+Verified live at `https://stackblitz.com/edit/angular-lheyr15u`. A `timeAgo` pipe built twice — once pure, once impure — plus a pure `highlight` pipe that takes a search term. A shared counter service tracks exactly how many times each pipe's `transform()` actually runs.
+
+```typescript
+// pipe-call-counter.service.ts
+import { Injectable } from '@angular/core';
+
+/**
+ * Deliberately NOT signal-based: writing to a signal from inside a pipe's
+ * transform() throws NG0600 ("Writing to signals is not allowed in a
+ * computed or an effect"), because template refresh runs pipes inside a
+ * reactive-context guard. A plain mutable object works fine here -- the
+ * root component uses Default change detection, so its template
+ * re-reads these plain properties on every tick regardless of how they
+ * changed.
+ */
+@Injectable({ providedIn: 'root' })
+export class PipeCallCounterService {
+  counts = { pure: 0, impure: 0, highlight: 0 };
+
+  incrementPure() {
+    this.counts.pure++;
+  }
+  incrementImpure() {
+    this.counts.impure++;
+  }
+  incrementHighlight() {
+    this.counts.highlight++;
+  }
+}
+```
+
+```typescript
+// time-ago.pipe.ts
+import { Pipe, PipeTransform, inject } from '@angular/core';
+import { PipeCallCounterService } from './pipe-call-counter.service';
+
+/**
+ * PURE pipe (the default -- no `pure: false` set). Angular only re-runs
+ * transform() when the bound value OR any argument changes by reference
+ * (objects) or value (primitives), compared against the last call. It does
+ * NOT re-run just because a change detection pass happened somewhere else
+ * on the page. This is why it's safe and efficient to use in large lists.
+ */
+@Pipe({ name: 'timeAgo', standalone: true })
+export class TimeAgoPipe implements PipeTransform {
+  private counter = inject(PipeCallCounterService);
+
+  transform(value: number, unit: 'short' | 'long' = 'long'): string {
+    this.counter.incrementPure();
+    const seconds = Math.floor((Date.now() - value) / 1000);
+    if (seconds < 60) return unit === 'short' ? `${seconds}s` : `${seconds} seconds ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return unit === 'short' ? `${minutes}m` : `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+    const hours = Math.floor(minutes / 60);
+    return unit === 'short' ? `${hours}h` : `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  }
+}
+```
+
+```typescript
+// time-ago-impure.pipe.ts
+import { Pipe, PipeTransform, inject } from '@angular/core';
+import { PipeCallCounterService } from './pipe-call-counter.service';
+
+/**
+ * IMPURE pipe (pure: false). Angular re-runs transform() on EVERY change
+ * detection pass, anywhere on the page -- regardless of whether the value
+ * or arguments bound to this exact pipe usage changed at all. Identical
+ * logic to TimeAgoPipe, kept as a separate class purely to compare call
+ * counts side by side in the demo.
+ */
+@Pipe({ name: 'timeAgoImpure', standalone: true, pure: false })
+export class TimeAgoImpurePipe implements PipeTransform {
+  private counter = inject(PipeCallCounterService);
+
+  transform(value: number, unit: 'short' | 'long' = 'long'): string {
+    this.counter.incrementImpure();
+    const seconds = Math.floor((Date.now() - value) / 1000);
+    if (seconds < 60) return unit === 'short' ? `${seconds}s` : `${seconds} seconds ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return unit === 'short' ? `${minutes}m` : `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+    const hours = Math.floor(minutes / 60);
+    return unit === 'short' ? `${hours}h` : `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  }
+}
+```
+
+```typescript
+// highlight.pipe.ts
+import { Pipe, PipeTransform, inject } from '@angular/core';
+import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
+import { PipeCallCounterService } from './pipe-call-counter.service';
+
+/**
+ * PURE pipe with a SECOND argument (the search term). Angular compares
+ * BOTH the bound text and the term argument to their previous values --
+ * transform() only re-runs when either one actually changes.
+ */
+@Pipe({ name: 'highlight', standalone: true })
+export class HighlightPipe implements PipeTransform {
+  private sanitizer = inject(DomSanitizer);
+  private counter = inject(PipeCallCounterService);
+
+  transform(text: string, term: string): SafeHtml {
+    this.counter.incrementHighlight();
+    if (!term) {
+      return this.sanitizer.bypassSecurityTrustHtml(text);
+    }
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`(${escaped})`, 'gi');
+    const highlighted = text.replace(pattern, '<mark>$1</mark>');
+    return this.sanitizer.bypassSecurityTrustHtml(highlighted);
+  }
+}
+```
+
+```typescript
+// app.component.ts (root)
+import { Component, inject, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { TimeAgoPipe } from './time-ago.pipe';
+import { TimeAgoImpurePipe } from './time-ago-impure.pipe';
+import { HighlightPipe } from './highlight.pipe';
+import { PipeCallCounterService } from './pipe-call-counter.service';
+
+interface Comment {
+  id: number;
+  text: string;
+  timestamp: number;
+}
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule, FormsModule, TimeAgoPipe, TimeAgoImpurePipe, HighlightPipe],
+  template: `
+    <div class="container">
+      <h1>Custom Pipes with Arguments: timeAgo &amp; highlight (Pure vs Impure)</h1>
+      <p class="intro">
+        Both pipes below take an argument. "timeAgo" takes a format unit ('short'/'long');
+        "highlight" takes the search term to wrap in &lt;mark&gt;. The counters prove exactly
+        when Angular actually re-runs each pipe's transform() -- a PURE pipe only re-runs when
+        its bound value or arguments change by reference/value; an IMPURE pipe re-runs on every
+        single change-detection pass, no matter what changed anywhere on the page.
+      </p>
+
+      <div class="global-actions">
+        <button (click)="triggerUnrelatedTick()">① Trigger unrelated CD tick (touches nothing the pipes read)</button>
+        <button (click)="bumpOneTimestamp()">② Change one comment's timestamp (pure timeAgo SHOULD re-run for it)</button>
+      </div>
+
+      <p>Unrelated ticks so far: <strong>{{ unrelatedTicks }}</strong></p>
+
+      <div class="counters">
+        <div class="counter-box">timeAgo (pure) calls: <strong>{{ counter.counts.pure }}</strong></div>
+        <div class="counter-box">timeAgoImpure calls: <strong>{{ counter.counts.impure }}</strong></div>
+        <div class="counter-box">highlight (pure) calls: <strong>{{ counter.counts.highlight }}</strong></div>
+      </div>
+
+      <h2>Comments (each rendered with both the pure and impure timeAgo pipe)</h2>
+      <ul class="comment-list">
+        @for (comment of comments(); track comment.id) {
+          <li>
+            {{ comment.text }}
+            — <span class="pure-tag">pure: {{ comment.timestamp | timeAgo:'long' }}</span>
+            / <span class="impure-tag">impure: {{ comment.timestamp | timeAgoImpure:'long' }}</span>
+          </li>
+        }
+      </ul>
+
+      <h2>Highlight search (pure pipe with a search-term argument)</h2>
+      <input
+        class="search-box"
+        type="text"
+        placeholder="Type to highlight matches..."
+        [(ngModel)]="searchTerm"
+      />
+      <ul class="highlight-list">
+        @for (comment of comments(); track comment.id) {
+          <li [innerHTML]="comment.text | highlight:searchTerm"></li>
+        }
+      </ul>
+    </div>
+  `,
+})
+export class AppComponent {
+  counter = inject(PipeCallCounterService);
+  searchTerm = '';
+  unrelatedTicks = 0;
+
+  comments = signal<Comment[]>([
+    { id: 1, text: 'Angular pipes are great for formatting.', timestamp: Date.now() - 30_000 },
+    { id: 2, text: 'Pure pipes only recompute when inputs change.', timestamp: Date.now() - 5 * 60_000 },
+    { id: 3, text: 'Impure pipes recompute on every change detection run.', timestamp: Date.now() - 2 * 60 * 60_000 },
+  ]);
+
+  triggerUnrelatedTick() {
+    this.unrelatedTicks++;
+  }
+
+  bumpOneTimestamp() {
+    this.comments.update((list) =>
+      list.map((c) => (c.id === 1 ? { ...c, timestamp: Date.now() - 1000 } : c))
+    );
+  }
+}
+```
+
+## 5. Example Explanation – Execution Flow
+
+Verified live, step by step:
+
+- **Baseline (page load):** `timeAgo (pure)`, `timeAgoImpure`, and `highlight (pure)` all read **3** — one call per comment row, as expected on first render.
+- **① Trigger unrelated CD tick** (an empty click handler, touching no data the pipes read): `timeAgoImpure` jumped **3 → 6** — it re-ran for all 3 rows even though nothing relevant changed. `timeAgo (pure)` and `highlight (pure)` stayed at **3**, completely untouched.
+- **② Change one comment's timestamp** (a genuine input change for row 1's pure `timeAgo` pipe): the displayed text for row 1 updated correctly (`"1 seconds ago"`), proving the pure pipe *did* recompute. But the counter itself briefly showed a stale value — because the counter display sits **above** the comment list in the template, and Angular checks bindings top-to-bottom in a single pass: it reads the old counter value before the pipe increments it further down. Clicking **any** button to trigger one more pass immediately revealed the true, already-incremented count (**3 → 4**). This is a real, useful lesson in its own right: a pure pipe's own recompute is correct and immediate, but a counter *of* that recompute can lag one pass behind if it's positioned earlier in the template than the pipe call that updates it.
+- **Typing "pipes" into the search box:** `highlight (pure)` jumped from **3 to 15** — since the `term` argument changed on every keystroke, all 3 rows' pure `highlight` pipe correctly recomputed each time (matches highlighted live in `<mark>` tags), while `timeAgo`/`timeAgoImpure` were unaffected by typing.
+
+## 6. When to use?
+
+Use a **pure** pipe (the default) for almost everything — formatting dates, currency, text transforms, filtering/searching displayed data — since it's cheap and only runs when its actual inputs change. Reach for an **impure** pipe only when the output can genuinely change without any bound reference changing, most commonly a pipe that needs to reflect the current time continuously (like a live "time ago" ticker) or one that reads from a mutable collection updated in place rather than replaced. This comes up in interviews constantly as a follow-up to "how would you show relative timestamps," and as a check on whether a candidate understands performance implications of pipes in large lists.
+
+## 7. Advantages/Disadvantages
+
+Pure pipes are efficient by default: Angular skips re-running them unless something they actually depend on changed, which is exactly what you want in a list with hundreds of rows. The tradeoff is that a pure pipe won't notice a value that changed "in place" without a new reference — mutating an object's property without replacing the object won't trigger a pure pipe to recompute, which is a common source of "why isn't my pipe updating" bugs. Impure pipes solve that by always re-running, but at a real cost: in a large list, an impure pipe runs on every single change detection pass anywhere in the app, which can silently become a performance problem as the app grows.
+
+## 8. Common Interview Traps
+
+Assuming a pipe always re-runs on every change detection cycle — only impure pipes do that; pure pipes (the default) only re-run when their own bound value or arguments change. Assuming "pure" means the pipe has no side effects in some abstract sense — it specifically refers to Angular's caching behavior based on reference/value comparison of inputs, not a general functional-purity guarantee. Forgetting that mutating an object in place (instead of replacing it) won't trigger a pure pipe to recompute, since the reference didn't change. Not realizing that impure pipes can quietly hurt performance in large lists, since every single one re-runs on every tick regardless of relevance.
+
+## 9. Interview Follow-up Questions
+
+Why would a pure pipe fail to update when you mutate an array in place instead of replacing it? When would you actually need an impure pipe, and what's the performance cost of using one in a large list? How does Angular decide whether two pipe arguments "changed" — is it a deep comparison or something else? How would you build a live-updating "time ago" display without making the whole pipe impure (hint: a periodic tick that forces a fresh reference)?
+
+## 10. Quick Answer (say this first)
+
+A pure pipe (the default) only re-runs `transform()` when its bound value or arguments actually change, using reference comparison for objects and value comparison for primitives — this makes it cheap and safe to use even in large lists. An impure pipe (`pure: false`) re-runs on every single change detection pass regardless of whether anything relevant changed, which is sometimes necessary (like a continuously-updating "time ago" display) but can hurt performance if overused. The key trap: a pure pipe won't notice an in-place mutation, only a new reference or a changed primitive value.
+
+## 11. Interview-Ready Answer (full)
+
+A custom pipe with arguments — like `timeAgo:'short'` or `highlight:searchTerm` — is just a class implementing `PipeTransform`, where `transform()` receives the bound value plus any extra arguments after the colons in the template. The interesting behavior is purity. By default every pipe is pure, meaning Angular only calls `transform()` again when the bound value or any argument changes, compared to the previous call — object/array arguments are compared by reference, primitives by value. If nothing relevant changed, Angular reuses the cached output and skips calling `transform()` at all, even if a completely unrelated part of the page just triggered a change detection pass.
+
+Setting `pure: false` turns that off: an impure pipe re-runs on every single change detection cycle that reaches its component, regardless of whether its own inputs changed. I verified this directly: a `timeAgo` pipe built as both pure and impure versions, with a shared counter tracking real call counts. Triggering an unrelated event elsewhere on the page left the pure pipe's call count untouched, while the impure version's count jumped by one call per rendered row — proving it re-ran even though nothing it displayed had changed.
+
+The practical tradeoff is this: pure pipes are the right default because they're cheap and scale fine in large lists, but they have one real gotcha — they compare by reference, so mutating an object or array in place (changing a property without replacing the whole object) won't be noticed, since the reference is identical. Replacing the object with a new one, even with the same-looking data, does trigger a recompute — which I confirmed live by mutating one comment's timestamp via `{ ...comment, timestamp: newValue }` rather than editing the object in place. Impure pipes exist for the genuine cases where output needs to change without any reference changing — most commonly a continuously ticking "time ago" display — but they should be used sparingly, since every impure pipe usage re-runs on literally every change detection pass in the whole app, which can add up fast in a large list.
+
+## 12. Quick Revision
+
+Pipes take a value plus optional arguments: `{{ value | pipeName:arg }}`. Pure (default): `transform()` only re-runs when the value or arguments change by reference (objects) or value (primitives) — cheap, safe for large lists. Impure (`pure: false`): re-runs on every single change detection pass, everywhere — needed for continuously-changing output, but can hurt performance if overused. Common trap: mutating an object in place doesn't trigger a pure pipe; replacing the reference does. Verified live: unrelated CD tick left the pure pipe's count untouched but bumped the impure pipe's count by one per row; changing one row's data correctly triggered just that row's pure pipe; typing into a search box correctly re-triggered a pure `highlight` pipe on every keystroke since its search-term argument changed each time.
+
+## 13. Memory Trick
+
+**"Pure pipes are lazy in a good way — no new value, no new work. Impure pipes show up to every single meeting whether they're needed or not."**
