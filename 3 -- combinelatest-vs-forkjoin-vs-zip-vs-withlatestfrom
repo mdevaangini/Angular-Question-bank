@@ -54,7 +54,7 @@ Each operator exists to remove one specific flavor of that manual bookkeeping â€
 
 ## 4. Example
 
-**Live demo (all four, exactly as designed below, now with an "Error" button on every source too):** [https://stackblitz.com/edit/angular-pbezkso1](https://stackblitz.com/edit/angular-pbezkso1)
+**Live demo (all four, exactly as designed below, now with an "Error" button on every source too):*
 
 ### combineLatest vs forkJoin â€” same 3 sources, side by side
 
