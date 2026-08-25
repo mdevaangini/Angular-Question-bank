@@ -61,7 +61,7 @@ Each operator exists to remove one specific flavor of that manual bookkeeping â€
 Both use the exact same three `Subject`s, each with its own "Emit" and "Complete" button, so you can directly compare how differently they react to the exact same sequence of events:
 
 ```ts
-// combine-fork-demo.component.ts
+// combine-fork-demo.component.ts  --> https://stackblitz.com/edit/angular-tg8qzhta-rrw3bm31?file=src%2Fapp%2Fcombine-fork-demo.component.ts
 import { Component } from '@angular/core';
 import { Subject, combineLatest, forkJoin } from 'rxjs';
 
