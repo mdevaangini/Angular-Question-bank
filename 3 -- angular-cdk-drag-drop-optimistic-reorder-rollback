@@ -176,6 +176,42 @@ export class TaskBoardComponent {
 
 - Forgetting to connect the two `cdkDropList`s (via `cdkDropListGroup` or `[cdkDropListConnectedTo]`) — without it, the drag preview shows but items can't actually be dropped into the other list.
 - Not realizing `moveItemInArray`/`transferArrayItem` mutate their arguments in place — combined with signals, mutating the *existing* array reference and then calling `.set()` with that same reference won't trigger a re-render (`.set()` compares with `Object.is()` by default), so nothing visually updates even though the data technically changed.
+
+// explaination of above --> 
+
+          moveItemInArray / transferArrayItem
+          These are helper functions from @angular/cdk/drag-drop. They reorder or move items between arrays — but they do it in place, meaning they mutate the array you pass in rather than returning a new array. So if you call:
+          
+          ts
+          moveItemInArray(myArray, previousIndex, currentIndex);
+          
+          myArray itself gets reordered — no new array object is created. The reference stays exactly the same.
+          
+          Why that breaks with signals
+          Angular signals use Object.is() (referential equality, essentially ===) to decide whether a value actually changed when you call .set(). If you do:
+          
+          ts
+          const arr = mySignal();       // grab current array reference
+          moveItemInArray(arr, prevIdx, curIdx); // mutates arr in place
+          mySignal.set(arr);            // same reference as before!
+          
+          Angular's signal sees that the reference passed to .set() is Object.is()-equal to what it already has stored — because it is the same array object, just with its internal contents shuffled. So the signal decides "nothing changed" and skips notifying subscribers/re-rendering, even though the actual data order changed.
+          
+          The visible symptom
+          You drag an item, the underlying array data is correctly reordered in memory, but the UI doesn't update — the list looks frozen in its old order until something else happens to trigger change detection.
+          
+          The fix
+          Create a new array reference before calling .set(), e.g.:
+          
+          ts
+          const arr = [...mySignal()];
+          moveItemInArray(arr, prevIdx, curIdx);
+          mySignal.set(arr);
+          
+          or use .update() with a spread/copy inside it. Either way, the point is: give the signal a new object reference so its Object.is() check sees a difference and triggers reactivity.
+
+//
+
 - Skipping the pre-mutation snapshot and trying to "compute the inverse" after the fact to roll back — fragile and error-prone compared to just keeping a clean copy of the prior state upfront.
 - Not distinguishing `event.previousContainer === event.container` — calling `transferArrayItem` for what was actually a same-list reorder (or vice versa) silently corrupts one of the arrays.
 - Ignoring concurrent drags: if the user drags twice quickly, an unguarded implementation can roll back to an outdated snapshot after the *second* drag already changed things, effectively undoing a change the user never asked to undo. Needs either disabling further drags while a save is in flight (`[cdkDropListDisabled]`), or a proper request-sequencing/snapshot-per-operation strategy.
