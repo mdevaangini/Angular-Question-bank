@@ -137,6 +137,15 @@ A: If you key purely by URL, you'd incorrectly serve User B a response cached/de
 **Q4: Does `shareReplay(1)` leak memory if nobody ever unsubscribes?**
 A: `shareReplay` keeps its internal `ReplaySubject` (and therefore the last emitted value) alive as long as there's a subscriber, or indefinitely if you don't pass `{ refCount: true }` in modern RxJS. In this dedup pattern that's fine, because `finalize()` removes it from our own `Map` once the source completes — the `ReplaySubject` itself becomes eligible for garbage collection once nothing references it, since we don't hold onto it after that point.
 
+////
+what's a "memory leak" in plain words? It just means your program keeps holding onto something in memory that it doesn't actually need anymore — nothing ever throws it away, so it sits there taking up space forever, even though it's useless. Over time, if this keeps happening, your app slowly uses more and more memory for no reason.
+What is this ReplaySubject thing? When you use shareReplay(1), RxJS creates a small internal helper behind the scenes whose only job is: "remember the last answer, so if someone starts listening a bit late, I can still hand them that answer." Think of it like a sticky note where someone writes down the answer as soon as it comes in, so latecomers can just read the sticky note instead of missing out.
+The question being asked: does that sticky note ever get thrown away? Or does it just sit there forever, using up memory, even after nobody needs it anymore?
+The answer, in plain terms: normally, that sticky note stays around for as long as something is still holding onto it. If you never clean anything up yourself, yes — it could stay there forever, which would be a real leak. RxJS does offer a setting (refCount: true) that says "count how many listeners are attached, and automatically throw the sticky note away once that count hits zero" — but we're not even using that setting here.
+So why isn't this a leak in our case? Because we already have our own cleanup happening in a different place — the finalize() step. Once the request finishes (success or failure), finalize() deletes our map entry that was pointing at this whole thing. Once we delete that, nothing in our code refers to the sticky note anymore.
+////
+
+
 **Q5: How would you unit test this?**
 A: Fire two `.get(url)` calls back to back inside a `fakeAsync`/`TestScheduler` context, assert `HttpTestingController` (Angular's `HttpClientTestingModule`) only recorded **one** matching request via `httpMock.expectOne(url)`, flush it once, and assert both subscriptions received the value. Then fire a third call *after* flushing and assert a *second* `expectOne` request now exists, proving it wasn't accidentally turned into a permanent cache.
 
