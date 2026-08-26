@@ -20,18 +20,49 @@ So a "credential store" (usually a database table) holds something like:
                                                                           username: alice
                                                                           password_hash: $2b$12$KIXQ7f3n9z... (not "hunter2")
 
+////  Password hashing. When you sign up, the server never stores your actual password. It runs it through a one-way hashing function (like bcrypt or Argon2) that's deliberately slow and also mixes in a random "salt" per user, so two people with the same password end up with completely different stored hashes. At login, your typed password 
+gets hashed the same way and compared to the stored hash — if they match, you're in. The "one-way" part means even someone who steals the whole database can't reverse the hashes back into real passwords.
+
 - Token-based auth (JWT) — after an initial login, a signed token is issued and sent on subsequent requests; the server verifies the signature to confirm identity without re-checking the password every time.
+////  JWT (token-based auth). A JWT is just three chunks of text glued together: a header, a payload (your user info, an expiry time, etc.), and a signature. When you log in, the server creates this payload and signs it with a secret key it holds. On every later request, the server doesn't look anything up in a database — it just re-checks 
+the signature using that same secret. If the signature matches, the server trusts the payload as untampered. This is why JWTs are called "stateless": the server doesn't need to remember you, the proof travels with the token itself.
+
 - Session-based auth — the server stores session state and identifies the user via a session ID in a cookie.
+//// Session-based auth. The opposite design choice: the server creates a session record (in memory, Redis, or a database) with a random ID, and gives you that ID as a cookie. Every request you make, your browser automatically sends that cookie back, and the server looks up the ID in its own storage to figure out who you are. 
+This is "stateful" — the server has to keep a growing table of active sessions, which is the main tradeoff against JWTs.
+
 - OAuth2/OIDC (SSO, "Sign in with Google") — delegates identity verification to a trusted external identity provider.
+//// OAuth2/OIDC (Sign in with Google). This is a redirect dance between three parties: your app, you, and Google. Your app sends you to Google's login page. You log in there (your password never touches your app at all). Google redirects you back with a short-lived "authorization code." Your app's server then privately exchanges
+that code with Google for real tokens — an access token (to call Google APIs on your behalf) and, for OIDC specifically, an ID token (a JWT proving who you are). The whole point of the design is that your app never sees or handles your actual Google password.
+
 - Multi-factor authentication (MFA) — adds a second factor (OTP, biometric) on top of a password for stronger identity assurance.
+//// MFA. After your password succeeds, the server demands a second, independent proof. The common design for "6-digit code" apps (TOTP) is: at signup, you and the server both get given the same secret key. Both sides independently combine that secret with the current time (rounded to a 30-second window) through a hashing formula, 
+producing the same 6-digit code on your phone and on the server, without ever needing to talk to each other to agree on it. You just have to type what your phone shows, and the server checks its own independently-computed version matches.
+
 - API keys — for service-to-service auth, identifying which system is calling rather than which human.
+//// API keys. No login flow at all — it's just a long random string generated once and handed to a service. The server stores a record like "this key belongs to Service X." Every request from that service includes the key in a header, and the server just looks up the key. It identifies which system is calling, not a human, 
+so there's no "session" concept involved at all.
 
 **Common authorization mechanisms:**
 - Role-Based Access Control (RBAC) — permissions attached to roles (admin, editor, viewer), users assigned to roles.
+//// RBAC. You define a small number of roles (admin, editor, viewer) and, separately, what each role is allowed to do. Users get assigned to one or more roles. At check time, the question is simple: "what roles does this user have, and does one of them include this permission?" Simple to reason about,
+but rigid — if one user needs one slightly different permission, you often end up creating a whole new role just for them.
+
 - Attribute-Based Access Control (ABAC) — access computed dynamically from attributes of the user, the resource, and the context (e.g., "user can edit if user.department === document.department").
+//// ABAC. Instead of fixed roles, you write conditions that look at attributes of the user, the resource, and the situation, evaluated live at request time — like "allow edit if user.department equals document.department, and it's during business hours." Much more flexible than RBAC since it can express 
+rules RBAC can't, but harder to audit, since the actual permission a user has can change based on context rather than being a fixed, listable thing.
+
 - Access Control Lists (ACLs) — explicit, per-resource, per-user or per-group permission entries.
+//// ACLs. Instead of defining roles at all, each individual resource carries its own list of exactly who (or which group) can do what to it — like a shared folder's sharing settings. Checking permission means going to that specific resource and reading its list, not consulting some global role table. 
+Very precise, but doesn't scale well if you need to hand-manage permissions on thousands of resources one by one.
+
 - Policy engines (e.g., OPA/Rego, CASL in JS) — centralized, declarative permission rules instead of scattered if-checks.
+//// Policy engines (OPA, CASL). These pull all your permission logic out of scattered if statements in your codebase and into one centralized rule set written in a dedicated policy language. Your app just asks it a question — "can user X do Y to Z?" — and the engine evaluates its own rules
+(which can look like RBAC, ABAC, or a mix) and returns yes/no. The design win is that all your authorization logic lives in one auditable place instead of being copy-pasted across dozens of files.
+
 - Scopes/claims embedded directly in a token (OAuth scopes) — the token itself carries what its bearer is allowed to do.
+//// Scopes/claims in tokens. When an OAuth token gets issued, the authorization server bakes directly into the signed token what the bearer is allowed to do — like scope: read:messages. Whoever receives that token later doesn't need to ask anyone else what it's allowed to do; it just reads the
+scope field out of the token itself. This is the same "carry the proof with you instead of looking it up" idea JWTs use for identity, just applied to permissions instead.
 
 **The typical request pipeline:**
 1. The user submits credentials — authentication happens: the server verifies identity and issues a token or session.
