@@ -27,7 +27,7 @@ Step by step:
    - If the map already has an entry for that key, **return the same Observable instance** — don't call `http.get()` again.
    - If not, call `http.get()`, pipe it through `shareReplay(1)` (so multiple subscribers share one underlying HTTP call and each gets the value even if they subscribe a tick apart), store it in the map, and return it.
 3. Use `finalize()` on the piped observable to **remove the entry from the map** once the request completes (success or error). This is critical — without it, the "dedup" cache would live forever and silently turn into a permanent (and never-invalidated) cache, which is a different, more dangerous feature you didn't ask for.
-4. Because `shareReplay(1)` multicasts, every caller that subscribed while the request was in flight gets the exact same emitted value from the exact same underlying HTTP call — the server only saw one request.
+4. "shareReplay(1) makes sure everyone who asked while the request was still waiting gets the same answer from that one request — the server only ever saw a single request."
 
 The cleanest place to implement this in Angular is either:
 - **A shared service method** (`get<T>(url)`) that every component/service calls instead of `HttpClient.get()` directly, or
