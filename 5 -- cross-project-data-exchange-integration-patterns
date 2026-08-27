@@ -26,7 +26,7 @@ BroadcastChannel is the same idea but for when the "same website" is open in mor
 - Module Federation (Webpack 5+) — lets independently built and deployed bundles share actual live JS modules/components at runtime, not just data.
 - Web Components as a framework-agnostic integration boundary — one app exposes a custom element that any other app, regardless of framework, can consume.
 
-**Same page, different origin** (a host app embedding a widget or third-party app via `<iframe>`):
+**Same page, different origin/can be sane origin** (a host app embedding a widget or third-party app via `<iframe>`):
 - `window.postMessage()` — the standard, secure mechanism for passing data across origins in the browser. Requires explicit origin validation on both ends (covered below).
 
 **Entirely separate systems, no shared browser tab** (backend-to-backend, or frontends that never render together):
