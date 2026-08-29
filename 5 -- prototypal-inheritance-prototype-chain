@@ -34,6 +34,7 @@ const dog = Object.create(animal); // dog's [[Prototype]] IS animal, directly
 
 This is the purest, most explicit way to set up prototypal inheritance — you're literally saying "this object's prototype is that object." `Object.create(null)` creates an object with **no** prototype at all (not even `Object.prototype`) — useful for a "dictionary" object immune to prototype pollution.
 
+
 **Constructor functions:**
 
 ```js
