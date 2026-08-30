@@ -30,7 +30,7 @@ This one line stops both symptoms at once: a cancelled request can't write stale
 
 Separately, it's worth noticing **where** the result is stored. If a page writes its result into a **shared/singleton service signal** (rather than a signal local to that component), an uncancelled late response can overwrite that shared signal even after the user has moved to a different page — that's exactly how "stale data on the next page" shows up visually. `takeUntilDestroyed` prevents this by making sure a late response never reaches that `.set()` call in the first place.
 
-## 4. Example
+## 4. Example  --> https://stackblitz.com/edit/angular-vrc8z8bf?file=src%2Fapp%2Fpage-b.component.ts,src%2Fapp%2Fdata.service.ts
 
 `data.service.ts` — shared service. `latestData` is the shared signal that a late, uncancelled response could leak into:
 
