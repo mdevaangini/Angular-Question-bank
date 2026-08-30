@@ -1,0 +1,301 @@
+# [Scenario] Users on slow connections navigate away before requests finish; the app then shows stale data on the next page, or errors from requests belonging to pages they already left. Clean this up.
+
+## 1. What is it?
+
+This is about a request that is still running when the user navigates to a different page. If you don't cancel it, it keeps running in the background and finishes later — while the user is looking at a completely different screen. When it finishes, two bad things can happen:
+
+- If it **succeeds**, its result can get written into shared state, so the new page suddenly shows data that belongs to the old page ("stale data").
+- If it **fails**, you get an error firing for a page the user isn't even looking at anymore.
+
+## 2. Why does this happen?
+
+An HTTP request doesn't know or care whether the component that started it still exists. Once you call `.subscribe()`, that subscription keeps running until it completes, errors, or something explicitly unsubscribes it. Navigating away in Angular destroys the component (its template disappears, `ngOnDestroy` runs) — but that does **not** automatically cancel any subscriptions the component created. So on a slow connection, this sequence is easy to hit:
+
+1. User opens Page A. Page A fires a request.
+2. Before it comes back, the user clicks to Page B.
+3. Angular destroys Page A's component. The request Page A started is still alive.
+4. Seconds later, that request finally finishes — success or error — and its callback still runs, even though Page A is gone.
+
+## 3. How do you fix it?
+
+Cancel the subscription the moment the component is destroyed. Angular gives you a clean built-in way to do this: `takeUntilDestroyed()`.
+
+Steps:
+
+1. Inject `DestroyRef` in the component (or pass it explicitly).
+2. Pipe any subscription through `takeUntilDestroyed(destroyRef)`.
+3. When the component is destroyed, Angular automatically unsubscribes — so if the request hasn't resolved yet, its `next` and `error` callbacks simply never run.
+
+This one line stops both symptoms at once: a cancelled request can't write stale data into shared state, and it can't fire an error for a page that's already gone.
+
+Separately, it's worth noticing **where** the result is stored. If a page writes its result into a **shared/singleton service signal** (rather than a signal local to that component), an uncancelled late response can overwrite that shared signal even after the user has moved to a different page — that's exactly how "stale data on the next page" shows up visually. `takeUntilDestroyed` prevents this by making sure a late response never reaches that `.set()` call in the first place.
+
+## 4. Example
+
+`data.service.ts` — shared service. `latestData` is the shared signal that a late, uncancelled response could leak into:
+
+```typescript
+import { Injectable, signal } from '@angular/core';
+import { Observable, of, throwError, timer } from 'rxjs';
+import { delay, mergeMap } from 'rxjs/operators';
+
+export interface PageResult {
+  page: string;
+  value: string;
+}
+
+@Injectable({ providedIn: 'root' })
+export class DataService {
+  // Shared state written to by whichever request resolves last. This is
+  // what lets a late, uncancelled response "leak" stale data onto
+  // whatever page happens to be showing right now.
+  latestData = signal<PageResult | null>(null);
+
+  fetchSlowData(page: string, delayMs: number, shouldFail: boolean): Observable<PageResult> {
+    if (shouldFail) {
+      // NOTE: throwError(...).pipe(delay(ms)) would NOT actually delay the
+      // error - RxJS's delay() only delays next/complete, not error
+      // notifications. timer(ms) + mergeMap is the correct way to make an
+      // error happen after a delay.
+      return timer(delayMs).pipe(
+        mergeMap(() => throwError(() => new Error(`${page} request failed`)))
+      );
+    }
+    return of({ page, value: `data-${Math.floor(Math.random() * 1000)}` }).pipe(delay(delayMs));
+  }
+}
+```
+
+`page-a.component.ts` — fires a slow request that fails, cancels it with `takeUntilDestroyed` only when "safe mode" is on (so you can compare both behaviors):
+
+```typescript
+import { Component, DestroyRef, OnDestroy, inject } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { DataService } from './data.service';
+import { EventLogService } from './event-log.service';
+import { SettingsService } from './settings.service';
+
+@Component({
+  selector: 'app-page-a',
+  standalone: true,
+  template: `
+    <div class="page">
+      <h2>Page A</h2>
+      <p>This page fires a slow (3s) request that FAILS. Click "Page B" before it resolves.</p>
+    </div>
+  `,
+})
+export class PageAComponent implements OnDestroy {
+  private data = inject(DataService);
+  private log = inject(EventLogService);
+  private settings = inject(SettingsService);
+  private destroyRef = inject(DestroyRef);
+
+  constructor() {
+    const safe = this.settings.safeMode();
+    this.log.add(`Page A mounted (safe mode: ${safe ? 'ON' : 'OFF'}) - starting 3s request that will fail...`);
+
+    let request$ = this.data.fetchSlowData('Page A', 3000, true);
+    if (safe) {
+      request$ = request$.pipe(takeUntilDestroyed(this.destroyRef));
+    }
+
+    request$.subscribe({
+      next: (result) => {
+        this.data.latestData.set(result);
+        this.log.add(`Page A request SUCCEEDED late: ${JSON.stringify(result)}`);
+      },
+      error: (err) => {
+        this.log.add(`Page A request FAILED (fired even though you already left Page A): ${err.message}`);
+      },
+    });
+  }
+
+  ngOnDestroy(): void {
+    this.log.add('Page A destroyed (navigated away)');
+  }
+}
+```
+
+`page-b.component.ts` — same pattern, but its request succeeds (so you can see the stale-data leak):
+
+```typescript
+import { Component, DestroyRef, OnDestroy, inject } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { DataService } from './data.service';
+import { EventLogService } from './event-log.service';
+import { SettingsService } from './settings.service';
+
+@Component({
+  selector: 'app-page-b',
+  standalone: true,
+  template: `
+    <div class="page">
+      <h2>Page B</h2>
+      <p>This page fires a slow (5s) request that SUCCEEDS. Click "Page A" before it resolves to see the stale-data leak.</p>
+    </div>
+  `,
+})
+export class PageBComponent implements OnDestroy {
+  private data = inject(DataService);
+  private log = inject(EventLogService);
+  private settings = inject(SettingsService);
+  private destroyRef = inject(DestroyRef);
+
+  constructor() {
+    const safe = this.settings.safeMode();
+    this.log.add(`Page B mounted (safe mode: ${safe ? 'ON' : 'OFF'}) - starting a slow (5s) request...`);
+
+    let request$ = this.data.fetchSlowData('Page B', 5000, false);
+    if (safe) {
+      request$ = request$.pipe(takeUntilDestroyed(this.destroyRef));
+    }
+
+    request$.subscribe({
+      next: (result) => {
+        this.data.latestData.set(result);
+        this.log.add(`Page B request succeeded: ${JSON.stringify(result)}`);
+      },
+      error: (err) => {
+        this.log.add(`Page B request failed: ${err.message}`);
+      },
+    });
+  }
+
+  ngOnDestroy(): void {
+    this.log.add('Page B destroyed (navigated away)');
+  }
+}
+```
+
+`app.component.ts` — the shared shell, showing the shared `latestData` signal and the live log, using signals + the new control-flow syntax:
+
+```typescript
+import { Component, inject } from '@angular/core';
+import { RouterLink, RouterOutlet } from '@angular/router';
+import { DataService } from './data.service';
+import { EventLogService } from './event-log.service';
+import { SettingsService } from './settings.service';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [RouterLink, RouterOutlet],
+  template: `
+    <h1>Cancelling Requests When Users Navigate Away</h1>
+
+    <label class="toggle">
+      <input type="checkbox" [checked]="settings.safeMode()" (change)="settings.toggle()" />
+      Cancel requests when leaving a page (safe mode)
+    </label>
+    <p class="hint">Set this BEFORE navigating to Page A, so the request it fires uses that mode. Try it OFF first, then ON.</p>
+
+    <nav>
+      <a routerLink="/page-a">Go to Page A (slow, fails)</a>
+      <a routerLink="/page-b">Go to Page B (fast, succeeds)</a>
+    </nav>
+
+    @if (data.latestData(); as d) {
+      <div class="shared-state">Shared "latest data" signal currently shows: <b>{{ d.page }}</b> - {{ d.value }}</div>
+    } @else {
+      <div class="shared-state">Shared "latest data" signal: (empty)</div>
+    }
+
+    <router-outlet />
+
+    <h3>Log</h3>
+    <div class="log">
+      @for (entry of log.log(); track entry) {
+        <div>{{ entry }}</div>
+      }
+    </div>
+  `,
+})
+export class AppComponent {
+  settings = inject(SettingsService);
+  data = inject(DataService);
+  log = inject(EventLogService);
+}
+```
+
+## 5. Example Explanation – Execution Flow
+
+**Safe mode OFF (the bug):**
+
+1. Page A mounts, fires a request that will fail after 3 seconds. Nothing cancels it.
+2. User clicks to Page B before those 3 seconds pass. Angular destroys Page A's component (`ngOnDestroy` runs, logs "Page A destroyed").
+3. Page A's subscription is still alive in the background — destroying the component didn't touch it.
+4. 3 seconds after Page A originally mounted, the request settles. Since nobody unsubscribed, its callback still runs: if it were a success, `data.latestData.set(...)` would fire and silently overwrite the shared signal Page B is now showing (the stale-data symptom). If it fails (as in this demo), the error callback runs anyway, logging "Page A request FAILED (fired even though you already left Page A)" — the orphaned-error symptom. Verified live: `Page A mounted` at 17:37:46 → `Page A destroyed` at 17:37:49 → `Page A request FAILED` also at 17:37:49.
+
+**Safe mode ON (the fix):**
+
+1. Page A mounts, fires the same request, but this time it's piped through `takeUntilDestroyed(this.destroyRef)`.
+2. User clicks to Page B before the request resolves. Angular destroys Page A's component.
+3. `takeUntilDestroyed` ties directly into that destroy event — the moment `ngOnDestroy` would run, it also unsubscribes the request.
+4. When the 3 seconds are up, there's no subscriber left to notify. Neither `next` nor `error` runs. No stale data gets written, no orphaned error gets logged. Verified live: after the same navigation steps with safe mode ON, the shared signal stayed empty and no failure entry appeared.
+
+## 6. When to use?
+
+- Any component that fires an HTTP call (or any Observable-based async work) and can be navigated away from before it resolves — which, on a slow connection, is most components.
+- Especially important when the result gets written into **shared/singleton state** (a service signal, a store) rather than purely local component state, since that's what makes the leak visible on an unrelated page.
+- Search-as-you-type, polling, or any "fire and forget" subscription created in a component constructor or `ngOnInit`.
+
+Not needed for requests that are guaranteed to be very fast relative to how quickly a user can navigate, though in practice you should default to using this pattern everywhere it costs nothing to add.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- One line (`takeUntilDestroyed(this.destroyRef)`) fixes both the stale-data symptom and the orphaned-error symptom at once.
+- Ties cleanly into Angular's own lifecycle — no manual `Subject` + `ngOnDestroy` + `takeUntil` boilerplate needed.
+- Works the same whether the async source is an HTTP call, a `timer`, a WebSocket stream, or anything else Observable-based.
+
+**Disadvantages**
+- Only cancels the *subscription* — it doesn't cancel the underlying HTTP request at the network level (the browser may still complete the request; you just stop listening to the result). For most UI-correctness bugs like this one, that's enough, but it doesn't reduce server load.
+- If you write results into a shared signal from many places, `takeUntilDestroyed` protects against *this* component's own late responses, but doesn't replace being careful about not writing directly to shared state from every component in the first place.
+- Easy to forget on some subscriptions and remember on others — it needs to be applied to every subscription in a component that shouldn't outlive it, not just the "obvious" one.
+
+## 8. Common Interview Traps
+
+- **Assuming `ngOnDestroy` alone cancels things.** `ngOnDestroy` just tells you the component is gone — it doesn't touch any subscriptions you created. You still have to explicitly unsubscribe, e.g. with `takeUntilDestroyed`.
+- **The `delay()`-doesn't-delay-errors trap.** In RxJS, `delay(ms)` only delays `next`/`complete` notifications. An error inside `throwError(...).pipe(delay(ms))` is NOT delayed — it fires immediately. To make an error happen after a delay (as needed to realistically simulate this scenario), use `timer(ms).pipe(mergeMap(() => throwError(...)))` instead. This is a genuinely surprising RxJS behavior and a great one to mention in an interview.
+- **Thinking the bug is about the HTTP call itself.** The real bug is about *where the result goes* — a page-local signal that's about to be destroyed anyway is harmless even if the request isn't cancelled; the actual danger is writing into shared/singleton state.
+- **Only fixing the success path.** Some engineers cancel or guard the success callback but forget the error callback still needs the same protection — `takeUntilDestroyed` handles both automatically, which is one reason to prefer it over a manual flag check.
+
+## 9. Interview Follow-up Questions
+
+**Q1: Does `takeUntilDestroyed` cancel the actual network request, or just the subscription?**
+A: Just the subscription. The browser's underlying HTTP request may still complete on the server/network side — you've just told RxJS to stop delivering its result to your callback. For most bugs like stale UI data or orphaned error handling, that's exactly what you need; if you also need to abort the network request itself (e.g., to save bandwidth), that's a separate concern usually handled via `HttpClient`'s support for `AbortController`-style cancellation, which naturally happens anyway once nobody is subscribed.
+
+**Q2: Why use `takeUntilDestroyed(destroyRef)` instead of the older manual pattern with a `Subject` and `takeUntil`?**
+A: The manual pattern requires you to create a `private destroy$ = new Subject<void>()`, remember to call `.pipe(takeUntil(this.destroy$))` on every subscription, and remember to call `this.destroy$.next(); this.destroy$.complete();` in `ngOnDestroy`. `takeUntilDestroyed` does all of that automatically, tied to Angular's own `DestroyRef`, so there's less boilerplate and less chance of forgetting the cleanup step.
+
+**Q3: Why does writing to a shared service signal cause this bug, but writing to a component-local signal wouldn't?**
+A: A component-local signal disappears along with the component when it's destroyed — even if a late response somehow set it, nothing is left showing it, so nobody notices. A shared/singleton service signal persists across navigation, and other pages read from it — so a late write from a page that no longer exists still visibly changes what a *different*, currently-active page displays. The fix (cancelling the subscription) prevents that write from happening at all, regardless of where the result would have been stored.
+
+**Q4: What's the difference between the "stale data" symptom and the "orphaned error" symptom, and does the same fix cover both?**
+A: They're both caused by the same root issue — an uncancelled subscription outliving its component — they just differ in which callback (`next` vs `error`) ends up firing late. `takeUntilDestroyed` prevents the subscription from receiving *either* notification once the component is destroyed, so one fix covers both symptoms.
+
+## 10. Quick Answer (say this first)
+
+"The request outlives the component because destroying a component doesn't automatically cancel its subscriptions. I fix it by piping the request through `takeUntilDestroyed(destroyRef)`, so when the user navigates away, Angular automatically unsubscribes — a late response can't write stale data into shared state, and it can't fire an error for a page that's already gone."
+
+## 11. Interview-Ready Answer (full)
+
+"The root cause here is that an HTTP subscription doesn't know or care whether the component that created it still exists. If a component fires a request and the user navigates away before it resolves, Angular destroys the component, but the subscription just keeps running in the background. When it finally settles, two things can go wrong: if it succeeds and its result gets written into shared state — like a service-level signal — the new page suddenly shows data that belongs to the old page. If it fails, you get an error handler firing for a page that isn't even on screen anymore.
+
+The fix is to tie the subscription's lifetime to the component's lifetime, using `takeUntilDestroyed(destroyRef)` from `@angular/core/rxjs-interop`. The moment the component is destroyed, Angular automatically unsubscribes, so if the request hasn't resolved yet, neither its success nor its error callback ever runs. That one line fixes both symptoms at once, because they share the same root cause.
+
+One subtlety I ran into building this out: I originally simulated the failing request with `throwError(...).pipe(delay(3000))`, expecting the failure after 3 seconds — but it failed instantly. RxJS's `delay()` only delays `next`/`complete` notifications, not `error` notifications. I had to switch to `timer(3000).pipe(mergeMap(() => throwError(...)))` to actually get a delayed failure. It's a good example of how RxJS operator semantics can be subtly different from what you'd assume, and worth knowing going into a scenario like this."
+
+## 12. Quick Revision
+
+1. **Problem**: navigating away doesn't cancel in-flight subscriptions — late responses can write stale data into shared state or fire errors for a page that's gone.
+2. **Fix**: `request$.pipe(takeUntilDestroyed(this.destroyRef))` — auto-unsubscribes when the component is destroyed.
+3. Danger is worst when results are written into **shared/singleton** state, not component-local state.
+4. One fix covers both symptoms — stale success data and orphaned errors — because both come from the same root cause.
+5. `takeUntilDestroyed` cancels the *subscription*, not necessarily the underlying network request.
+6. RxJS trap: `delay()` doesn't delay `error` notifications — use `timer(...).pipe(mergeMap(() => throwError(...)))` for a delayed failure.
+
+## 13. Memory Trick
+
+**"No forwarding address."** When a component is destroyed, think of it like someone moving out of an apartment without leaving a forwarding address. `takeUntilDestroyed` makes sure any mail (the request's result) still in transit gets returned to sender instead of being delivered to whoever moves in next (the next page) or piling up with nobody to receive it (an orphaned error).
