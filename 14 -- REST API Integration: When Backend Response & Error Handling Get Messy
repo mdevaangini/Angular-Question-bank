@@ -1,0 +1,380 @@
+# REST API Integration: When Backend Response & Error Handling Get Messy
+
+## 1. What is it?
+
+This is a **behavioral/experience question**, not a pure technical one. The interviewer isn't asking you to define REST or `HttpClient` — they're checking whether you've actually integrated with a real, imperfect backend and had to make engineering decisions when the API didn't behave the way the textbook says it should.
+
+The honest version of this story is almost always about **inconsistency**: a backend that doesn't return errors the way you'd expect, forcing you to build a normalization layer instead of trusting `response.ok` or a single `catchError`.
+
+## 2. Why was it introduced?
+
+Interviewers ask this because "call an API, handle success and error" sounds trivial in a tutorial, but production backends routinely break the clean mental model:
+
+- A "successful" HTTP 200 response can still contain a business-logic failure in the body (common with legacy backends, SOAP-wrapped-in-REST services, or PHP/Java monoliths that were never designed around proper HTTP semantics).
+- Different endpoints on the *same* API return errors in different shapes — one team's endpoint returns `{ error: { code, message } }`, another returns `{ errors: [...] }`, a third just returns a bare string.
+- Infrastructure sits in front of the real backend — a load balancer, API gateway, or reverse proxy — and when *that* fails (timeout, bad gateway), it returns its own HTML error page instead of JSON, with a status code your code wasn't expecting.
+- Naive retry logic re-hits the API on errors that will never succeed (like a 400 validation error), wasting requests and sometimes making things worse (e.g., retrying a non-idempotent POST).
+
+This question exists to see whether you've hit that wall and actually built something to survive it, rather than sprinkling `try/catch` around individual components.
+
+## 3. How does it work?
+
+A good answer walks through the **actual failure modes** and the **shared fix**, structured roughly like this (STAR-ish, but technical):
+
+- **Situation/Task:** Integrating with a backend (own team's or a third-party's) where error handling wasn't consistent across endpoints, and it was causing silent failures or confusing bugs in the UI.
+- **Specific problems encountered** (pick the ones that match your real experience — these three are the classic trio):
+  1. **"200 OK" that isn't actually OK** — the HTTP transport succeeded, but the JSON body carries a `success: false` / error object. Normal HTTP error handling (`catchError`, `HttpErrorResponse`) never fires, because as far as the browser is concerned, nothing went wrong. Symptom: the UI shows stale or empty data with no visible error.
+  2. **Inconsistent error shapes across endpoints** — some return `{ error: { code, message } }`, others `{ errors: [...] }`, others just plain text or an HTML error page from an intermediary proxy on a 502/504. Symptom: error-handling code that works for one endpoint throws or silently swallows the error for another.
+  3. **Retrying things that shouldn't be retried** — a blanket retry-on-any-error policy re-hits 4xx validation errors (which will never succeed) while under-handling genuinely transient 5xx/network errors that *should* be retried with backoff.
+- **Action (the actual fix):** Build one **normalization layer** at the HTTP boundary (an interceptor, in Angular) that:
+  - Inspects every response body, even on a 200, for an application-level failure signal and converts it into a thrown error — so downstream code has exactly one error-handling path, regardless of what the transport layer says.
+  - Maps every error shape (structured JSON, HTML gateway page, network failure, plain HTTP status) into one canonical internal type, e.g. `ApiError { code, message, retryable, status }`.
+  - Applies retry **only** where `retryable` is true (network errors, 429, 502/503/504), with exponential backoff and a capped attempt count — never for 4xx logic errors.
+- **Result:** Every component and service in the app consumes the same `ApiError` shape. Nobody needs to know whether a given endpoint wraps errors in `errors[]` or `error.message` or returns an HTML page — that's handled once, centrally.
+
+## 4. Example
+
+A runnable version of exactly this pattern — three endpoints simulating the three real failure modes described above, each normalized into one `ApiError` type, with a shared retry policy that only retries what's actually retryable.
+
+**StackBlitz (compiles, and the three scenarios run automatically on load — no clicks needed to see the result):**
+https://stackblitz.com/edit/angular-bcxkaj6r
+
+```ts
+// api-error.model.ts
+export interface ApiError {
+  code: string;
+  message: string;
+  retryable: boolean;
+  status: number;
+}
+```
+
+```ts
+// normalize-error.ts
+import { HttpErrorResponse } from '@angular/common/http';
+import { ApiError } from './api-error.model';
+
+const RETRYABLE_STATUSES = new Set([0, 408, 429, 502, 503, 504]);
+
+export function normalizeHttpError(err: HttpErrorResponse): ApiError {
+  if (err.error && typeof err.error === 'object' && err.error.error) {
+    const inner = err.error.error;
+    return {
+      code: inner.code || 'UNKNOWN',
+      message: inner.message || 'Something went wrong',
+      retryable: RETRYABLE_STATUSES.has(err.status),
+      status: err.status
+    };
+  }
+
+  if (typeof err.error === 'string' && err.error.trim().startsWith('<')) {
+    // A gateway/proxy returned an HTML error page instead of JSON
+    return {
+      code: 'GATEWAY_ERROR',
+      message: 'The server is temporarily unavailable. Please try again shortly.',
+      retryable: true,
+      status: err.status
+    };
+  }
+
+  if (err.status === 0) {
+    return {
+      code: 'NETWORK_ERROR',
+      message: 'Could not reach the server. Check your connection.',
+      retryable: true,
+      status: 0
+    };
+  }
+
+  return {
+    code: 'HTTP_' + err.status,
+    message: err.message || 'Unexpected error',
+    retryable: RETRYABLE_STATUSES.has(err.status),
+    status: err.status
+  };
+}
+
+export function normalizeLogicalError(body: any, status: number): ApiError {
+  const inner = body?.error ?? {};
+  return {
+    code: inner.code || 'LOGICAL_ERROR',
+    message: inner.message || 'Request failed',
+    retryable: false,
+    status
+  };
+}
+```
+
+```ts
+// retry-strategy.ts
+import { throwError, timer } from 'rxjs';
+import { ApiError } from './api-error.model';
+
+const MAX_RETRIES = 3;
+
+export function retryableErrorsOnly(error: ApiError, retryCount: number) {
+  if (!error?.retryable || retryCount > MAX_RETRIES) {
+    return throwError(() => error);
+  }
+
+  const backoffMs = Math.min(1000 * 2 ** (retryCount - 1), 8000);
+  const jitterMs = Math.random() * 300;
+  return timer(backoffMs + jitterMs);
+}
+```
+
+```ts
+// api-error.interceptor.ts
+import { HttpEventType, HttpInterceptorFn } from '@angular/common/http';
+import { map, catchError, throwError } from 'rxjs';
+import { normalizeHttpError, normalizeLogicalError } from './normalize-error';
+
+export const apiErrorInterceptor: HttpInterceptorFn = (req, next) => {
+  return next(req).pipe(
+    map(event => {
+      if (
+        event.type === HttpEventType.Response &&
+        event.body &&
+        typeof event.body === 'object' &&
+        (event.body as any).success === false
+      ) {
+        // Transport succeeded (200 OK) but the payload signals a logical failure
+        throw normalizeLogicalError(event.body, event.status);
+      }
+      return event;
+    }),
+    catchError(err => {
+      if (err && err.code) {
+        return throwError(() => err); // already normalized above
+      }
+      return throwError(() => normalizeHttpError(err));
+    })
+  );
+};
+```
+
+```ts
+// fake-backend.interceptor.ts (demo-only: simulates three real backend quirks)
+import { HttpInterceptorFn, HttpResponse, HttpErrorResponse } from '@angular/common/http';
+import { of, throwError } from 'rxjs';
+import { delay } from 'rxjs/operators';
+
+let flakyAttempts = 0;
+
+export const fakeBackendInterceptor: HttpInterceptorFn = (req, next) => {
+  if (req.url === '/api/orders') {
+    // Quirk #1: HTTP 200, but the body says the request logically failed
+    return of(
+      new HttpResponse({
+        status: 200,
+        body: {
+          success: false,
+          error: { code: 'ORDER_LOCKED', message: 'This order is locked for editing by another user.' }
+        }
+      })
+    ).pipe(delay(300));
+  }
+
+  if (req.url === '/api/flaky') {
+    // Quirk #2: transient 503s that succeed after a couple of retries
+    flakyAttempts++;
+    if (flakyAttempts < 3) {
+      return throwError(() =>
+        new HttpErrorResponse({ status: 503, statusText: 'Service Unavailable', url: req.url })
+      ).pipe(delay(300));
+    }
+    return of(
+      new HttpResponse({ status: 200, body: { success: true, data: { id: 42, attempt: flakyAttempts } } })
+    ).pipe(delay(300));
+  }
+
+  if (req.url === '/api/gateway-timeout') {
+    // Quirk #3: a reverse proxy returns its own HTML error page, not JSON
+    return throwError(() =>
+      new HttpErrorResponse({
+        status: 504,
+        statusText: 'Gateway Timeout',
+        url: req.url,
+        error: '<html><body><h1>504 Gateway Time-out</h1></body></html>'
+      })
+    ).pipe(delay(300));
+  }
+
+  return next(req);
+};
+```
+
+```ts
+// app.component.ts
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { retry } from 'rxjs/operators';
+import { retryableErrorsOnly } from './retry-strategy';
+import { ApiError } from './api-error.model';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  templateUrl: './app.component.html'
+})
+export class AppComponent implements OnInit {
+  private http = inject(HttpClient);
+
+  log = signal<string[]>([]);
+
+  ngOnInit(): void {
+    this.callOrders();
+    this.callFlaky();
+    this.callGatewayTimeout();
+  }
+
+  callOrders(): void {
+    this.http.get('/api/orders').subscribe({
+      next: () => this.addLog('orders -> unexpected success'),
+      error: (err: ApiError) => this.addLog(
+        'orders -> logical error caught even though transport was 200 OK: [' + err.code + '] ' + err.message
+      )
+    });
+  }
+
+  callFlaky(): void {
+    this.http.get('/api/flaky').pipe(
+      retry({ count: 3, delay: retryableErrorsOnly })
+    ).subscribe({
+      next: () => this.addLog('flaky -> succeeded after automatic retries with backoff'),
+      error: (err: ApiError) => this.addLog('flaky -> gave up: [' + err.code + '] ' + err.message)
+    });
+  }
+
+  callGatewayTimeout(): void {
+    this.http.get('/api/gateway-timeout').pipe(
+      retry({ count: 3, delay: retryableErrorsOnly })
+    ).subscribe({
+      next: () => this.addLog('gateway-timeout -> unexpected success'),
+      error: (err: ApiError) => this.addLog(
+        'gateway-timeout -> retried then normalized non-JSON HTML error into: [' + err.code + '] ' + err.message
+      )
+    });
+  }
+
+  private addLog(message: string): void {
+    this.log.update(entries => [...entries, message]);
+  }
+}
+```
+
+```html
+<!-- app.component.html -->
+<div class="page">
+  <h1>REST API Error Normalization</h1>
+  <p>Three real-world backend quirks, normalized into one consistent <code>ApiError</code> shape and a single retry policy — instead of three different handling paths scattered across the app.</p>
+
+  <div class="actions">
+    <button (click)="callOrders()">Re-run: 200 OK with logical error</button>
+    <button (click)="callFlaky()">Re-run: flaky 503 (retries then succeeds)</button>
+    <button (click)="callGatewayTimeout()">Re-run: gateway HTML error page</button>
+  </div>
+
+  <h3>Log</h3>
+  <ul class="log">
+    @for (entry of log(); track $index) {
+      <li>{{ entry }}</li>
+    } @empty {
+      <li>Running the three scenarios automatically…</li>
+    }
+  </ul>
+</div>
+```
+
+```ts
+// main.ts
+import 'zone.js';
+import { bootstrapApplication } from '@angular/platform-browser';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { AppComponent } from './app/app.component';
+import { apiErrorInterceptor } from './app/api-error.interceptor';
+import { fakeBackendInterceptor } from './app/fake-backend.interceptor';
+
+bootstrapApplication(AppComponent, {
+  providers: [
+    provideHttpClient(withInterceptors([apiErrorInterceptor, fakeBackendInterceptor]))
+  ]
+}).catch(err => console.error(err));
+```
+
+> **Verified live:** all three scenarios run automatically on load (no button clicks required to observe the result) and produced exactly the expected output on screen: the `/api/orders` call surfaced `[ORDER_LOCKED] This order is locked for editing by another user.` as a caught error despite the transport being 200 OK; `/api/flaky` logged "succeeded after automatic retries with backoff"; and `/api/gateway-timeout` logged "retried then normalized non-JSON HTML error into: [GATEWAY_ERROR] The server is temporarily unavailable..." after exhausting its retries. The three buttons let you re-trigger each scenario manually if you open the link yourself.
+
+## 5. Example Explanation / Execution Flow
+
+1. On app bootstrap, `apiErrorInterceptor` is registered *before* `fakeBackendInterceptor`, so it wraps everything downstream and sees both the final response and any thrown errors from the simulated backend.
+2. **`/api/orders`:** the fake backend returns a genuine `HttpResponse` with status 200, but body `{ success: false, error: {...} }`. Inside `apiErrorInterceptor`'s `map()`, the code checks `event.type === HttpEventType.Response` and `body.success === false`, and **throws** `normalizeLogicalError(...)` — turning a "successful" transport response into an error notification on the observable. This is the fix for failure mode #1: nothing downstream needs to know that this particular endpoint reports errors inside a 200.
+3. **`/api/flaky`:** the fake backend throws a `503 HttpErrorResponse` for the first two calls, then succeeds on the third. `apiErrorInterceptor`'s `catchError` normalizes the 503 into `ApiError` with `retryable: true` (503 is in `RETRYABLE_STATUSES`). The component subscribes with `retry({ count: 3, delay: retryableErrorsOnly })` — the `retryableErrorsOnly` function checks `error.retryable`, and since it's `true`, returns a `timer()` with exponential backoff instead of re-throwing, causing RxJS's `retry` to resubscribe. On the third attempt the fake backend finally returns success.
+4. **`/api/gateway-timeout`:** the fake backend always throws a 504 with a string body starting with `<html>`. `normalizeHttpError` specifically checks for that shape (`typeof err.error === 'string' && err.error.trim().startsWith('<')`) and maps it to a friendly `GATEWAY_ERROR` — this is the fix for failure mode #2/#3: a proxy's HTML error page never leaks into the UI as raw markup. Since 504 is retryable, `retry()` tries it up to 3 times (exponential backoff each time) before finally giving up and surfacing the normalized error — demonstrating the retry *cap*, so a permanently-broken gateway doesn't retry forever.
+5. In every case, the component's `error` callback receives the exact same `ApiError` shape (`code`, `message`, `retryable`, `status`) regardless of which of the three very different underlying failures actually happened — that uniformity is the entire point of the exercise.
+
+## 6. When should we use it?
+
+- Any real integration with a backend you don't fully control (third-party API, a legacy service, microservices maintained by other teams) where error conventions aren't guaranteed to be consistent.
+- Whenever there's a proxy/gateway/load balancer between your app and the real backend, since that layer can and will return its own error format on outages or timeouts.
+- Any app where blanket retry-on-failure would be actively harmful (e.g., retrying a non-idempotent request, or hammering an endpoint that's already returning validation errors).
+- Not really necessary for a small app hitting one well-behaved, internally-owned API with consistent, spec-compliant error responses — a single `catchError` may be enough there, and adding this layer would be premature complexity.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- One error-handling path for the entire app — components never need to know which endpoint returns which error shape.
+- Retry logic becomes centralized and deliberate (retryable vs. not), instead of an accidental blanket policy.
+- Debuggability improves — the raw `HttpErrorResponse` can still be logged for observability while the UI only ever sees the clean, normalized shape.
+- New backend quirks (a fourth error format shows up next month) only require one new branch in `normalizeHttpError`, not changes scattered across every feature that calls the API.
+
+**Disadvantages**
+- It's an extra abstraction layer that has to be learned and maintained — a very simple app might not need it.
+- Detecting a "logical" 200-with-error requires assuming a body convention (here, `success: false`); if the backend later changes that convention without warning, the interceptor's detection breaks silently.
+- Throwing inside `map()` and catching in `catchError()` is a slightly non-obvious RxJS pattern — worth a comment for anyone unfamiliar with it.
+- Backoff/retry constants (max attempts, base delay) are guesses that need tuning against real failure rates and user tolerance for waiting.
+
+## 8. Common Interview Traps
+
+- Giving a vague answer like "the API sometimes failed and I added error handling" with no specifics — interviewers want the *actual shape* of the problem (what did the response look like, why did normal handling miss it).
+- Not distinguishing retryable from non-retryable errors — a candidate who says "I just wrapped it in a retry" without mentioning they excluded 4xx errors raises a flag.
+- Forgetting that a 200-with-error-body won't trigger `HttpErrorResponse`/`catchError` at all — that's the whole crux of failure mode #1, and missing it suggests the candidate hasn't actually hit this in practice.
+- Not knowing how to handle a non-JSON error body (HTML error pages from proxies) — this trips up candidates who've only worked against clean, well-behaved internal APIs.
+- Treating this as a purely technical question and forgetting the "why does this matter" framing (user impact: silent failures, confusing bugs) — interviewers are also assessing communication and business-impact awareness here, not just code.
+
+## 9. Interview Follow-up Questions
+
+**Q: How would you decide whether an error is retryable?**
+A: Base it on the HTTP status and error semantics, not just "any failure": network errors (status 0), request timeouts (408), rate limiting (429), and server-side/gateway errors (502/503/504) are generally safe to retry with backoff. Client errors (400, 401, 403, 404, 422) represent a request that will fail again no matter how many times you resend it, so they should never be retried automatically.
+
+**Q: Where would you put this logic — interceptor, service, or component?**
+A: An interceptor, because it applies uniformly to every request without every call site needing to remember to use a wrapper. It's the same reasoning as centralizing auth token attachment or global loading indicators — cross-cutting concerns belong in the HTTP pipeline, not duplicated in each feature.
+
+**Q: How do you avoid retrying a non-idempotent request (like a POST that creates a resource) and accidentally creating duplicates?**
+A: Either avoid automatic retry for mutating requests entirely (reserve retry for idempotent GETs), or require the backend to support idempotency keys so a retried POST is recognized as a duplicate and safely no-ops server-side.
+
+**Q: How would you surface these normalized errors to the user without leaking technical detail?**
+A: Keep the technical `code`/raw error for logging and observability (e.g., sent to an error-tracking service), but map `code` to a small, curated set of user-facing messages in one place — so "ORDER_LOCKED" becomes a specific helpful sentence, and anything unrecognized falls back to a generic "something went wrong, please try again" rather than showing raw error text.
+
+**Q: What would you test here, and how?**
+A: Unit test `normalizeHttpError`/`normalizeLogicalError` directly with fabricated `HttpErrorResponse`/body shapes (no HTTP needed), and test `retryableErrorsOnly` with `TestScheduler`/marble tests or `fakeAsync`+`tick()` to assert it only schedules a retry for `retryable: true` errors and stops after the max count.
+
+## 10. Interview-Ready Answer
+
+"I worked on an integration where the backend didn't fail the way a typical REST API is supposed to. Three things came up in practice: first, some endpoints returned an HTTP 200 but with a `success: false` flag and an error object in the body — so normal error handling never triggered, and the UI would just show stale data with no visible error. Second, different endpoints used different error shapes, so handling logic written for one broke on another. Third, there was a proxy in front of the real backend that, on timeouts, returned its own HTML error page instead of JSON, with a status our code wasn't expecting. Instead of patching each of those individually wherever they showed up, I built a single normalization layer in an HTTP interceptor: it inspects every response, even successful ones, for that logical-failure flag and throws if it finds one, and it maps every error — structured JSON, HTML page, network failure — into one internal `ApiError` type with a `retryable` flag. Then retry logic became centralized too: only requests marked retryable — network errors, 5xx, 429 — get retried with exponential backoff, capped at a few attempts, so we're not endlessly hammering a broken gateway or retrying a validation error that will never succeed. After that, every component just handled one consistent error shape, and adding support for a new backend quirk meant touching one file instead of hunting through the app."
+
+## 11. Quick Revision
+
+- **What:** A behavioral question probing real experience with inconsistent backend error handling, not textbook REST theory.
+- **Why:** Real backends routinely violate the clean success/error model — 200-with-logical-error, inconsistent error shapes, proxy-generated HTML error pages, naive retries hitting non-retryable errors.
+- **Problem solved:** One canonical error type and one retry policy, instead of ad hoc handling scattered per endpoint/component.
+- **How:** Normalize at the HTTP boundary (interceptor) — detect logical failures inside 200 responses via `map()` + throw, normalize every error shape into `ApiError { code, message, retryable, status }` via `catchError`, and gate retry (`retry({ count, delay })`) on `retryable` only, with exponential backoff and a cap.
+- **Use when:** Integrating with any backend/proxy you don't fully control, or where blanket retries could be harmful.
+- **Important:** A 200 status does not guarantee success at the application level; never retry non-idempotent or 4xx logic errors.
+- **Remember:** Normalize once at the boundary, not per component. Retryable vs. not is a deliberate decision, not a blanket policy.
+
+## 12. Memory Trick
+
+**"200 lies, shapes differ, retries need judgment."**
+- **200 lies** — a successful HTTP status doesn't guarantee a successful business outcome; check the body.
+- **Shapes differ** — every endpoint/proxy can format errors differently; normalize to one type at the boundary.
+- **Retries need judgment** — only retry what's actually transient (network/5xx/429), never 4xx logic errors or non-idempotent writes.
