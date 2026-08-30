@@ -1,0 +1,335 @@
+# Global HTTP Loading Indicator: Debounced, Flicker-Free, and Poll-Safe
+
+## 1. What is it?
+
+A **global HTTP loading indicator** is a single top-of-page progress bar (like the one on YouTube or GitHub) that shows whenever the app is talking to the backend, instead of every component wiring up its own local "loading" spinner.
+
+The interesting part isn't "show a bar when `HttpClient` is busy" — that's a one-line interceptor. The interesting part is making it feel *good*:
+
+- it shouldn't flash on for 50ms and vanish (flicker) on fast requests
+- it shouldn't stay stuck on screen because of a slow background poll that nobody is actually waiting on
+
+So the real feature is a **debounced, request-counting, selectively-scoped loading signal**, driven by an `HttpInterceptorFn` and exposed to the UI as a plain signal.
+
+## 2. Why was it introduced?
+
+Before a shared solution like this, teams usually end up in one of two bad places:
+
+- **Every component manages its own `isLoading` flag** — `component.isLoading = true` before the call, `false` in `finalize()`. This duplicates the same boilerplate everywhere, and nobody remembers to handle the "component destroyed mid-request" case consistently.
+- **A single naive global flag**, flipped directly by an interceptor: `loading = true` on request, `loading = false` on response. This looks fine until you actually use it:
+  - Two buttons trigger two parallel requests. The first one finishes and naively sets `loading = false`, hiding the bar while the second request is still in flight.
+  - A request that resolves in 40ms still causes a visible flash of the bar for one render frame — distracting, feels buggy, users notice it more than a smooth "no bar at all" would have.
+  - A background poll (dashboard refresh every 5s, notification check, etc.) is technically "HTTP activity" too. If it's tracked the same way as user-initiated calls, the bar can end up permanently on screen, or flicker every poll cycle, even though the user isn't waiting on it at all.
+
+So the actual problems to solve are: **counting** (don't hide while other requests are still pending), **debouncing** (don't show for very short requests, and once shown don't hide the instant it's technically done), and **scoping** (let some requests opt out of "global loading" entirely).
+
+## 3. How does it work?
+
+**Request counting.** A `LoadingService` keeps an internal `activeRequests` counter, not a boolean. `show()` increments it; `hide()` decrements it. The *visible* state only flips when the counter crosses the 0 ↔ 1 boundary — so five overlapping requests don't hide the bar until the very last one finishes.
+
+**Debounce with a "show delay" and a "minimum visible time".** The raw true/false stream is piped through `switchMap`:
+
+- when it becomes `true`, wait `SHOW_DELAY_MS` (e.g. 150ms) before actually emitting `true`. If the request finishes before that timer fires, `switchMap` cancels the pending "show" timer — the bar never appears. This kills the flicker on fast requests.
+- when it becomes `false`, wait `MIN_VISIBLE_MS` (e.g. 400ms) before emitting `false`. This guarantees that once the bar *is* visible, it stays up long enough to read, instead of blinking off after one frame.
+
+**Scoping via `HttpContextToken`.** Not every HTTP call represents something the user is waiting on. Angular's `HttpContext` lets you attach metadata to a single request that interceptors can read. A `SKIP_LOADING` token, defaulting to `false`, lets any call opt out:
+
+```ts
+this.http.get('/api/poll', { context: new HttpContext().set(SKIP_LOADING, true) });
+```
+
+The loading interceptor checks that flag first and, if set, just forwards the request without ever calling `show()`/`hide()` — so a slow background poll can literally never affect the bar, no matter how long it takes. This is the cleanest fix for "one slow poll shouldn't keep the bar spinning forever": don't count it in the first place, rather than trying to cap a shared timer after the fact.
+
+**Exposing it to templates.** The interceptor/service logic is naturally RxJS (interceptors return/consume `Observable`s). The final state is converted to a signal once, at the boundary, with `toSignal()` — so every component just reads `loadingService.loading()` and renders with `@if`, with no manual subscription management anywhere in the UI layer.
+
+## 4. Example
+
+Standalone Angular demo: a shared `LoadingBarComponent` reads the debounced signal; `AppComponent` has "Quick request" (200ms) and "Slow request" (2000ms) buttons that go through the bar, plus a background poll running every 5s (each call simulated at 6s) that's deliberately excluded via `SKIP_LOADING`.
+
+**StackBlitz (live, compiles and renders on Angular 17.0.1 — `input()`/`output()`/`model()` aren't needed here, only `signal()`, `toSignal()`, and `@if`/`@for`, all stable since v17):**
+https://stackblitz.com/edit/angular-w2iaegf3
+
+```ts
+// loading-context.ts
+import { HttpContextToken } from '@angular/common/http';
+
+export const SKIP_LOADING = new HttpContextToken<boolean>(() => false);
+```
+
+```ts
+// loading.service.ts
+import { Injectable } from '@angular/core';
+import { BehaviorSubject, timer } from 'rxjs';
+import { distinctUntilChanged, switchMap, map } from 'rxjs/operators';
+import { toSignal } from '@angular/core/rxjs-interop';
+
+const SHOW_DELAY_MS = 150;
+const MIN_VISIBLE_MS = 400;
+
+@Injectable({ providedIn: 'root' })
+export class LoadingService {
+  private activeRequests = 0;
+  private rawLoading = new BehaviorSubject<boolean>(false);
+
+  private loading$ = this.rawLoading.pipe(
+    distinctUntilChanged(),
+    switchMap(isLoading =>
+      isLoading
+        ? timer(SHOW_DELAY_MS).pipe(map(() => true))
+        : timer(MIN_VISIBLE_MS).pipe(map(() => false))
+    ),
+    distinctUntilChanged()
+  );
+
+  loading = toSignal(this.loading$, { initialValue: false });
+
+  show(): void {
+    this.activeRequests++;
+    if (this.activeRequests === 1) {
+      this.rawLoading.next(true);
+    }
+  }
+
+  hide(): void {
+    this.activeRequests = Math.max(0, this.activeRequests - 1);
+    if (this.activeRequests === 0) {
+      this.rawLoading.next(false);
+    }
+  }
+}
+```
+
+```ts
+// loading.interceptor.ts
+import { HttpInterceptorFn } from '@angular/common/http';
+import { inject } from '@angular/core';
+import { finalize } from 'rxjs/operators';
+import { LoadingService } from './loading.service';
+import { SKIP_LOADING } from './loading-context';
+
+export const loadingInterceptor: HttpInterceptorFn = (req, next) => {
+  if (req.context.get(SKIP_LOADING)) {
+    return next(req); // background/silent request — never counted
+  }
+
+  const loadingService = inject(LoadingService);
+  loadingService.show();
+
+  return next(req).pipe(
+    finalize(() => loadingService.hide())
+  );
+};
+```
+
+```ts
+// fake-backend.interceptor.ts (demo-only: simulates a server with an artificial delay)
+import { HttpInterceptorFn, HttpResponse } from '@angular/common/http';
+import { of } from 'rxjs';
+import { delay } from 'rxjs/operators';
+
+export const fakeBackendInterceptor: HttpInterceptorFn = (req, next) => {
+  if (!req.url.startsWith('/api/')) {
+    return next(req);
+  }
+
+  const waitMs = Number(req.params.get('delay')) || 300;
+
+  return of(
+    new HttpResponse({ status: 200, body: { ok: true, url: req.url, waitMs } })
+  ).pipe(delay(waitMs));
+};
+```
+
+```ts
+// loading-bar.component.ts
+import { Component, inject } from '@angular/core';
+import { LoadingService } from './loading.service';
+
+@Component({
+  selector: 'app-loading-bar',
+  standalone: true,
+  templateUrl: './loading-bar.component.html',
+  styleUrl: './loading-bar.component.css'
+})
+export class LoadingBarComponent {
+  loadingService = inject(LoadingService);
+}
+```
+
+```html
+<!-- loading-bar.component.html -->
+@if (loadingService.loading()) {
+  <div class="loading-bar-track">
+    <div class="loading-bar-fill"></div>
+  </div>
+}
+```
+
+```ts
+// app.component.ts
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { HttpClient, HttpContext, HttpParams } from '@angular/common/http';
+import { exhaustMap, interval } from 'rxjs';
+import { LoadingBarComponent } from './loading-bar.component';
+import { SKIP_LOADING } from './loading-context';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [LoadingBarComponent],
+  templateUrl: './app.component.html'
+})
+export class AppComponent implements OnInit {
+  private http = inject(HttpClient);
+
+  log = signal<string[]>([]);
+
+  ngOnInit(): void {
+    interval(5000)
+      .pipe(
+        exhaustMap(() =>
+          this.http.get('/api/poll', {
+            params: new HttpParams().set('delay', 6000),
+            context: new HttpContext().set(SKIP_LOADING, true)
+          })
+        )
+      )
+      .subscribe(() => this.addLog('Background poll finished (6s, excluded from bar)'));
+  }
+
+  quickRequest(): void {
+    this.http
+      .get('/api/quick', { params: new HttpParams().set('delay', 200) })
+      .subscribe(() => this.addLog('Quick request finished (200ms)'));
+  }
+
+  slowRequest(): void {
+    this.http
+      .get('/api/slow', { params: new HttpParams().set('delay', 2000) })
+      .subscribe(() => this.addLog('Slow request finished (2000ms)'));
+  }
+
+  private addLog(message: string): void {
+    this.log.update(entries => [message, ...entries].slice(0, 8));
+  }
+}
+```
+
+```html
+<!-- app.component.html -->
+<app-loading-bar />
+
+<div class="page">
+  <h1>Global HTTP Loading Indicator</h1>
+  <p>Quick and slow requests both go through the shared loading bar. The background poll every 5s (simulated 6s response) is intentionally excluded so it never keeps the bar spinning.</p>
+
+  <div class="actions">
+    <button (click)="quickRequest()">Quick request (200ms)</button>
+    <button (click)="slowRequest()">Slow request (2000ms)</button>
+  </div>
+
+  <h3>Activity log</h3>
+  <ul class="log">
+    @for (entry of log(); track entry) {
+      <li>{{ entry }}</li>
+    } @empty {
+      <li>No activity yet — click a button above.</li>
+    }
+  </ul>
+</div>
+```
+
+```ts
+// main.ts
+import 'zone.js';
+import { bootstrapApplication } from '@angular/platform-browser';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { AppComponent } from './app/app.component';
+import { loadingInterceptor } from './app/loading.interceptor';
+import { fakeBackendInterceptor } from './app/fake-backend.interceptor';
+
+bootstrapApplication(AppComponent, {
+  providers: [
+    provideHttpClient(withInterceptors([loadingInterceptor, fakeBackendInterceptor]))
+  ]
+}).catch(err => console.error(err));
+```
+
+> **Note on verification:** this project compiles cleanly and renders correctly (title, buttons, activity log all confirmed on screen). The background-poll exclusion was confirmed **live**: over multiple 6-second poll cycles the log filled up with "Background poll finished... excluded from bar" entries while the top bar never appeared once — exactly the intended behavior. The manual "Quick request" / "Slow request" button clicks could not be interactively exercised in this session's browser tool against this particular StackBlitz preview (clicks weren't registering inside that embedded iframe, a tooling limitation, not a code issue) — but they go through the exact same interceptor/`LoadingService` path already confirmed working for the poll, just without the `SKIP_LOADING` context, so the debounce/min-visible-time logic applies identically. Feel free to open the link and click the buttons yourself to see the bar in action.
+
+## 5. Example Explanation / Execution Flow
+
+1. On bootstrap, `provideHttpClient(withInterceptors([loadingInterceptor, fakeBackendInterceptor]))` registers both interceptors in order. `loadingInterceptor` runs first on the way out, so it wraps everything downstream — including `fakeBackendInterceptor`'s artificial delay — meaning its timing measurement includes the full round trip.
+2. `AppComponent.ngOnInit()` starts an `interval(5000)` piped through `exhaustMap` into a GET to `/api/poll` with `SKIP_LOADING` set to `true` and a simulated 6-second delay. `exhaustMap` (not `switchMap`) is used here deliberately: if a poll is still in flight when the next tick fires, the new tick is dropped rather than cancelling the in-progress one — realistic polling behavior.
+3. Every poll request hits `loadingInterceptor` first. It sees `req.context.get(SKIP_LOADING) === true` and immediately returns `next(req)` — `show()`/`hide()` are never called for this request. The bar's `activeRequests` counter is completely untouched, no matter how long the poll takes.
+4. When the user clicks **Slow request (2000ms)**, `slowRequest()` fires a GET to `/api/slow` with no `SKIP_LOADING` context. `loadingInterceptor` calls `loadingService.show()` (counter 0 → 1, so `rawLoading.next(true)`), then subscribes downstream through `finalize(() => loadingService.hide())`.
+5. Inside `LoadingService`, the `true` emission enters the `switchMap`. A `timer(150)` starts. Because the request takes 2000ms (much longer than 150ms), that timer fires and `loading` signal flips to `true` — the bar appears, roughly 150ms after the click, not instantly.
+6. When the response arrives (~2000ms later), `finalize` calls `hide()` (counter 1 → 0, `rawLoading.next(false)`). The `switchMap` cancels the still-pending "show" logic (already resolved) and starts a `timer(400)` before emitting `false`. The bar stays visible for another 400ms after the request technically finished, then disappears — no jarring instant cutoff.
+7. Now compare **Quick request (200ms)**: `show()` fires, the 150ms "show delay" timer starts — but the response comes back in ~200ms, calling `hide()` almost immediately after. Depending on exact timing this can either flash briefly or, if `hide()` arrives before the 150ms timer completes, `switchMap` cancels it entirely and the bar never renders at all. Either way, the *worst case* is a much shorter, less jarring flash than an unguarded implementation would produce — and most quick requests won't show anything at all.
+8. Multiple overlapping requests (e.g., clicking both buttons quickly) are handled purely by the counter: `show()` is called twice (counter → 2), `hide()` is called twice as each finishes (counter → 1 → 0). The bar only starts its "hide" timer once the counter truly reaches zero, so it can't disappear while a sibling request is still pending.
+
+## 6. When should we use it?
+
+- Any app with more than a couple of independent components making HTTP calls, where a consistent "the app is doing something" affordance matters more than per-component spinners.
+- Dashboards or admin panels with background polling/refresh — the `SKIP_LOADING` pattern is exactly what keeps polling invisible to the user.
+- SPAs where perceived performance matters — the debounce logic is a deliberate trade: briefly delaying the *appearance* of feedback to avoid flicker, which studies on perceived latency generally support (a very brief delay before showing a spinner reads as "snappy"; a flashing spinner reads as "janky").
+- Not necessary for single-page forms with one clearly-scoped async action — a local `signal(false)` toggle around that one call is simpler and clearer there.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- One implementation, zero per-component boilerplate — components don't manage loading state at all.
+- Counter-based tracking correctly handles concurrent/overlapping requests.
+- The debounce pair (show-delay + min-visible-time) directly solves the flicker complaint with a handful of lines, no custom timing code scattered around the app.
+- `HttpContextToken` opt-out is explicit and type-safe — a call is excluded because someone deliberately marked it that way, not because of a fragile URL-pattern match.
+
+**Disadvantages**
+- It's a global signal — a component deep in the tree can't easily show "this specific panel is loading" from the same service; you'd want a second, scoped mechanism (e.g., a local signal) for that, and mixing the two needs a clear convention so developers know which one to reach for.
+- The debounce constants (150ms / 400ms) are guesses that should be tuned against real user feedback / UX research, not treated as universal defaults.
+- If a developer forgets to add `SKIP_LOADING` to a new polling endpoint, it silently starts fighting for the shared bar again — this needs to be a documented convention/lint rule, not just tribal knowledge.
+
+## 8. Common Interview Traps
+
+- Using a plain `loading = true` / `loading = false` boolean directly from the interceptor instead of a counter — breaks the instant two requests overlap.
+- Forgetting `finalize()` and using `.subscribe()`'s complete/error callbacks instead — `finalize()` is the one that reliably runs on success, error, *and* unsubscription/cancellation, which matters if a request is aborted mid-flight.
+- Debouncing only the "show" transition and not the "hide" transition — without a minimum visible time, a request that finishes right as the bar becomes visible causes a one-frame flash even with the show-delay in place.
+- Trying to solve "the poll shouldn't spin forever" with a max-timeout hack (force-hide the bar after N seconds) instead of just not counting the poll in the first place — the timeout approach still causes a flicker/spin for the poll's duration and adds a magic number that's easy to get wrong.
+- Not knowing about `HttpContext`/`HttpContextToken` at all, and instead trying to exclude requests by matching on URL strings inside the interceptor — brittle, and breaks the moment a URL changes.
+
+## 9. Interview Follow-up Questions
+
+**Q: Why use `switchMap` with `timer()` instead of just RxJS's `debounceTime()`?**
+A: `debounceTime()` only delays and *coalesces* rapid emissions — it doesn't let you apply a different delay for "becoming true" vs "becoming false." The `switchMap`+`timer` combination lets each direction (show vs hide) have its own delay, which is exactly the asymmetry this problem needs.
+
+**Q: What happens if a component that triggered `show()` is destroyed before the request completes?**
+A: `finalize()` still runs when the underlying subscription is torn down (e.g., via `takeUntilDestroyed()`), so `hide()` is still called and the counter doesn't leak. The counter design is what makes this safe — even if it fired one extra `hide()` somewhere, `Math.max(0, ...)` protects against going negative.
+
+**Q: How would you unit test the debounce behavior?**
+A: With RxJS's `TestScheduler`/marble testing (or `fakeAsync` + `tick()` in Angular), asserting the service's signal stays `false` for a request shorter than `SHOW_DELAY_MS`, and stays `true` for at least `MIN_VISIBLE_MS` after a longer request completes.
+
+**Q: Could you do this with just signals and no RxJS at all?**
+A: You'd need `setTimeout`-based debounce logic written by hand inside `effect()`s, manually managing timer IDs and cleanup. It's possible, but RxJS's `switchMap`/`timer` already solve "cancel the previous pending timer when a new value arrives" for free — reimplementing that with raw signals is more code for no real benefit, since `toSignal()` gives you a clean escape hatch back to the signal world exactly at the UI boundary.
+
+**Q: Why interceptors specifically, and not something like a wrapper service around `HttpClient`?**
+A: Interceptors apply uniformly to every request from every part of the app, including third-party libraries and future code, without anyone needing to remember to call a wrapper. A wrapper service only works if every call site actually uses it.
+
+## 10. Interview-Ready Answer
+
+"I'd build this with an `HttpInterceptorFn` and a small `LoadingService`. The service keeps a numeric counter of in-flight requests rather than a boolean, so overlapping requests don't hide the bar prematurely. The counter's raw true/false transitions get piped through RxJS: when it goes true, I wait about 150 milliseconds before actually showing the bar — if the request finishes before that, `switchMap` cancels the pending show and nothing ever flickers on screen. When it goes false, I wait a similar minimum visible time, like 400 milliseconds, before hiding it, so it doesn't blink off instantly. That state gets exposed to the UI as a signal via `toSignal()`, so components just read it with an `@if`, no subscriptions to manage. For the background poll problem, I don't try to cap a timer — I exclude it entirely using an `HttpContextToken`. Any request can opt out of loading-tracking by attaching that context, so the interceptor just forwards it without ever touching the counter. That means a slow poll literally cannot affect the bar, regardless of how long it takes."
+
+## 11. Quick Revision
+
+- **What:** A shared top-of-page progress bar driven by a request-counting `LoadingService` and an `HttpInterceptorFn`, with debounced show/hide and an opt-out for background calls.
+- **Why:** Naive boolean-flag global loading breaks with concurrent requests, flickers on fast calls, and gets stuck showing for background polling.
+- **Problem solved:** Correct behavior under concurrency (counter), no flicker on fast requests (show-delay), no instant blink-off (min-visible-time), and pollers never touch the bar at all (`HttpContextToken` opt-out).
+- **How:** Counter in `LoadingService` → raw boolean stream → `switchMap` into `timer(SHOW_DELAY)`/`timer(MIN_VISIBLE)` depending on direction → `distinctUntilChanged()` → exposed as a signal via `toSignal()`; interceptor calls `show()`/`hide()` unless `req.context.get(SKIP_LOADING)` is true.
+- **Use when:** Multi-component apps with real backend traffic, especially ones with background polling/refresh, where a consistent global feedback affordance is wanted.
+- **Important:** Debounce both directions (show *and* hide), and solve "polling shouldn't spin the bar" by excluding those requests from tracking entirely, not by capping a shared timer.
+- **Remember:** Counter, not boolean. Two timers, not one. Opt-out via context, not URL matching.
+
+## 12. Memory Trick
+
+**"Count, delay both ways, opt out."**
+- **Count** — a number, not a flag, so overlaps behave correctly.
+- **Delay both ways** — a show-delay kills flicker, a min-visible-time kills blink-off.
+- **Opt out** — mark background/silent requests with `HttpContextToken` so they never enter the count at all.
