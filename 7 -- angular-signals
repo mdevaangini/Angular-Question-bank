@@ -309,7 +309,26 @@ Rule of thumb: if a value is derived from other signals, use computed(). Only us
 
 **Q: How do signals interact with RxJS Observables?**
 Answer: Angular provides interop functions — `toSignal()` converts an Observable into a signal (useful for consuming HTTP calls or other async streams in a template without an `async` pipe), and `toObservable()` converts a signal into an Observable (useful when you need RxJS operators like `debounceTime` or `switchMap` on top of signal-driven state).
+///
+import { toSignal, toObservable } from '@angular/core/rxjs-interop';
 
+// Observable -> Signal (e.g. consume an HTTP call without async pipe)
+users = toSignal(this.http.get<User[]>('/api/users'), { initialValue: [] });
+
+// Signal -> Observable (e.g. use RxJS operators on signal-driven state)
+searchTerm = signal('');
+searchTerm$ = toObservable(this.searchTerm);
+
+results$ = this.searchTerm$.pipe(
+  debounceTime(300),
+  switchMap(term => this.http.get<Item[]>(`/api/search?q=${term}`))
+);
+
+
+
+----The overall shape: this is the common pattern of "state lives in a signal, but I need Observable-only tooling (debounce, cancellation, retry, combining streams) to process it" — toObservable gets you into RxJS-land for that processing, and if you needed the final results$ back as a signal for the template, you'd wrap it again with toSignal(this.results$, { initialValue: [] }).
+
+////
 **Q: Is a signal synchronous or asynchronous?**
 Answer: Synchronous. Reading a signal always returns its current value immediately — there's no subscription delay or async scheduling involved in reading it, unlike an Observable which you must subscribe to and which may emit over time.
 
