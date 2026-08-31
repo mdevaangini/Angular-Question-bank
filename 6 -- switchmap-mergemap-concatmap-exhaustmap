@@ -199,6 +199,42 @@ A: Only partially, and only once. `catchError` on the outer pipe does stop the e
 — so the flattening operator's subscription is still gone, and no further source values (new keystrokes, new clicks, new files) will ever be processed unless the fallback itself happens to be a long-lived Observable that resubscribes to the source. The correct fix is always `catchError` *inside* the projection function, 
 wrapped around just the inner Observable, so each value's failure is isolated and the outer stream — and the flattening operator — keeps running indefinitely.
 
+
+//////
+1) 
+Option A — catchError on the outside (wrong place):
+
+trigger$.pipe(
+  switchMap(t => apiCall(t)),
+  catchError(err => of(fallbackValue))
+).subscribe(...)
+
+Here's the thing people get wrong: in RxJS, pipe() builds one continuous stream. switchMap isn't a separate box that can fail on its own and let trigger$ keep going — its output is the stream. So when the inner apiCall errors:
+
+The error propagates out through switchMap.
+switchMap's subscription to trigger$ (the source) gets torn down as a side effect — RxJS treats an error as "this stream is over."
+catchError catches that error and substitutes of(fallbackValue) in its place — but it's replacing the entire pipeline, not just that one bad response.
+of(fallbackValue) emits once and completes. Nothing is listening to trigger$ anymore.
+
+So visually: you type one more character, click one more button, nothing happens. The stream is dead, silently. You got one fallback value and then permanent silence — no crash, no error in the console, just a UI that stopped responding to input.
+
+2) 
+Option B — catchError on the inside (correct place):
+
+trigger$.pipe(
+  switchMap(t => apiCall(t).pipe(
+    catchError(err => of(fallbackValue))
+  ))
+).subscribe(...)
+
+Now catchError is wrapped around just the inner apiCall(t), inside the projection function that switchMap calls per trigger. When that one call errors:
+
+The error happens inside the small inner pipe.
+catchError catches it right there and swaps in of(fallbackValue) for that inner observable only.
+From switchMap's perspective, that inner observable just completed normally (with a fallback value instead of a real one). switchMap's subscription to trigger$ was never touched.
+The next trigger comes in and works completely normally.
+
+///
 ## 10. Interview-Ready Answer
 
 "All four are flattening operators — they take a stream of values, map each one to an inner Observable, usually some async call, and flatten the inner emissions back into a single output stream. The only difference between them is how they handle a new source value arriving while a previous inner Observable is still active. `mergeMap` runs everything concurrently — no cancellation, no queuing, all inner Observables run in parallel and emit whenever they resolve. `concatMap` queues them — it waits for the current inner Observable to fully complete before starting the next, so everything's processed strictly in order, one at a time, and nothing is dropped. `switchMap` cancels the previous inner Observable the moment a new source value arrives, so only the latest one's result is ever kept — anything from a superseded, in-flight call is thrown away. `exhaustMap` does the opposite of `switchMap` — it ignores new source values entirely while one's still in flight, keeps the current one running to completion, and only picks up a new value once it's free again.
