@@ -228,6 +228,61 @@ export class AppComponent {
 - Forgetting that a signal must be **called as a function** to read (`count()`), not accessed as a property (`count`) — a very common first-time mistake, and one interviewers like to probe.
 - Thinking `computed()` reruns "on every change detection cycle" like a plain method — it doesn't; it's memoized and only recomputes when a tracked dependency actually changes.
 - Mutating an array/object in place and calling `.set()`/`.update()` with the *same reference* — since signals use reference equality (`===`) by default, this silently fails to trigger updates. Always create a new array/object.
+
+/////
+
+The core mechanism
+
+A signal's set() and update() don't do a deep comparison of old vs new value. By default they check Object.is(oldValue, newValue) — essentially ===. If the new value is the same reference as the old value, Angular concludes "nothing changed" and skips notifying anyone who depends on that signal. No re-render, no computed signals re-evaluating, nothing.
+
+The bug in practice
+ts
+items = signal<string[]>(['a', 'b']);
+
+// WRONG — mutates the array in place, then "sets" the same reference
+addItemBroken(x: string) {
+  this.items().push(x);        // mutates the underlying array directly
+  this.items.set(this.items()); // passes the SAME array reference back in
+}
+
+Walk through what happens:
+
+this.items() reads the array — call it arr (same object in memory).
+.push(x) mutates arr in place. The array now genuinely has 3 elements.
+this.items.set(arr) — you're calling set() with the exact same reference the signal already holds.
+Angular does Object.is(oldValue, newValue) → Object.is(arr, arr) → true → "no change" → skips notifying consumers.
+
+The data is technically correct if you inspect it directly, but nothing that depends on the signal (templates, computed(), effect()) gets told to re-run. Your UI silently doesn't update. This is a nasty bug because it doesn't throw an error — it just quietly does nothing, and it's easy to convince yourself "but I did update it, look, console.log(this.items()) shows the new item!" — because you're logging the mutated array, not observing whether the signal notified anyone.
+
+The fix — always produce a new reference
+ts
+// CORRECT — build a new array, old one is left untouched
+addItemFixed(x: string) {
+  this.items.update(current => [...current, x]);
+}
+
+Here update() receives the current array, and the callback returns a brand new array ([...current, x]). The new array is a different object in memory from the old one, so Object.is(old, new) → false → change detected → all consumers notified correctly.
+
+Same trap with objects
+ts
+user = signal({ name: 'Alice', age: 30 });
+
+// WRONG
+user().age = 31;
+user.set(user()); // same object reference, silently ignored
+
+// CORRECT
+user.update(u => ({ ...u, age: 31 })); // new object reference
+Why this trips people up specifically coming from Angular's old model
+
+With Zone.js + default (non-OnPush) change detection, Angular re-checks every binding on every tick regardless of whether a reference changed — so in-place mutation followed by any trigger for change detection would often "just work" by accident, because Angular was doing dirty-checking by re-evaluating expressions, not comparing references. Signals flip that assumption: they are explicitly reference-based and opt-in to notification, which is faster and more precise, but it means the "mutate then poke Angular" habit that used to be harmless now silently breaks things.
+
+Rule of thumb
+
+Treat everything inside a signal as immutable. Never call a mutating method (push, splice, sort, direct property assignment) on a value you got out of a signal. Always derive a new array/object (spread syntax, map, filter, { ...obj, key: newValue }) and pass that to set()/update().
+
+///////
+
 - Calling `effect()` outside an injection context (e.g., inside a regular method triggered by a click, not in the constructor or a field initializer) — this throws a runtime error unless you explicitly pass an `Injector`.
 - **The big one this question is really testing:** using `effect()` to keep one signal in sync with another (`effect(() => otherSignal.set(...))`) instead of using `computed()`. This is explicitly called out as an anti-pattern in Angular's own documentation — it risks infinite loops, adds a hidden asynchronous hop into what should be a synchronous derivation, and reintroduces the "where did this value come from and when did it update" confusion that signals were designed to eliminate.
 
