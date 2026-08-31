@@ -9,7 +9,8 @@ The only thing that actually differs between them is how they handle a **new sou
 
 A very common pattern is reacting to a stream of triggers — clicks, keystrokes, route changes — by kicking off async work for each one. But because the trigger stream and the async work have independent timing, real decisions have to be made about concurrency: should overlapping async calls run in parallel? Should the newest one cancel the previous? Should they queue and run strictly in order? Should new ones be ignored while one's already running?
 
-Without a deliberate choice here, real bugs follow: race conditions where a slower, earlier response arrives after a newer one and overwrites fresh data with stale data (the classic search-box bug), duplicate charges from double-clicking a payment button, or wasted duplicate work. RxJS provides four purpose-built operators so this concurrency behavior is chosen explicitly and declaratively, instead of hand-rolled with flags, manual `unsubscribe()` calls, and mutable "isLoading" booleans scattered through a component.
+Without a deliberate choice here, real bugs follow: race conditions where a slower, earlier response arrives after a newer one and overwrites fresh data with stale data (the classic search-box bug), duplicate charges from double-clicking a payment button, or wasted duplicate work.
+RxJS provides four purpose-built operators so this concurrency behavior is chosen explicitly and declaratively, instead of hand-rolled with flags, manual `unsubscribe()` calls, and mutable "isLoading" booleans scattered through a component.
 
 ## 3. How does it work?
 
