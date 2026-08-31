@@ -294,6 +294,19 @@ Answer: `computed()` *produces a value* — it's a pure derivation with no side 
 **Q: Why does Angular explicitly warn against using `effect()` to propagate state changes?**
 Answer: Because it turns a synchronous, traceable derivation (`computed()`) into an asynchronous, hidden side channel. It can cause infinite update loops if the written-to signal is read back into the same or a connected effect, can cause consumers to briefly observe a stale value before the effect catches up, and makes the app's data flow harder to reason about — exactly the kind of implicit reactivity bug class signals were introduced to reduce.
 
+////
+In short:
+
+computed() is a pure, synchronous formula — Angular knows exactly how the value is derived and recalculates it instantly whenever it's read. Transparent and traceable.
+Writing to a signal inside an effect() instead breaks that transparency — the value is no longer "a formula," it's "whatever an effect happened to write, whenever it last ran." That's an implicit, indirect side channel.
+Infinite loops: if the effect reads a signal it also writes to (directly or through a chain), writing triggers the effect again, which writes again — forever. computed() can't do this because it's read-only, it never writes to signals.
+Stale reads: effects run asynchronously, after the triggering change. So there's a window where the written-to signal still holds its old value because the effect hasn't caught up yet. computed() has no such gap — it's always in sync the instant it's read.
+Harder to reason about: signals exist to make data flow explicit ("this depends on that"). Writing to signals inside effects reintroduces the same tangled, implicit reactivity bugs signals were meant to eliminate.
+
+Rule of thumb: if a value is derived from other signals, use computed(). Only use effect() for genuine side effects (logging, DOM writes, API calls) — never to keep another signal in sync.
+
+///
+
 **Q: How do signals interact with RxJS Observables?**
 Answer: Angular provides interop functions — `toSignal()` converts an Observable into a signal (useful for consuming HTTP calls or other async streams in a template without an `async` pipe), and `toObservable()` converts a signal into an Observable (useful when you need RxJS operators like `debounceTime` or `switchMap` on top of signal-driven state).
 
