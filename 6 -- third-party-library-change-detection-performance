@@ -157,12 +157,33 @@ Don't reach for `runOutsideAngular` reflexively on code that legitimately needs 
 
 ## 9. Interview Follow-up Questions
 
-- How does Zone.js actually intercept these APIs under the hood (monkey-patching)?
-- What triggers `ApplicationRef.tick()` besides zone `onMicrotaskEmpty`? (Manual `ApplicationRef.tick()`, `ChangeDetectorRef.detectChanges()`, router navigation, etc.)
-- How would you detect this problem without Angular DevTools — e.g., using `NgZone.isInAngularZone()` or a console spy on `tick()`?
-- What is zoneless Angular (Angular's newer zoneless change detection, built on signals) and how does it change this entire class of problem?
-- What's the difference between `ChangeDetectorRef.detectChanges()` and `markForCheck()`, and when would you use each inside an `OnPush` component?
-- If the third-party library exposes its own "pause/resume rendering" API, would you still bother with `runOutsideAngular`? Why or why not.
+1. How Zone.js intercepts APIs (monkey-patching)
+Zone.js overwrites global async APIs (setTimeout, Promise.then, addEventListener, XHR, etc.) at load time. Each patched version tracks which zone was active when scheduled, runs the real API underneath, then re-enters that zone when the callback fires. When no pending async tasks remain in the zone, it fires onMicrotaskEmpty, which NgZone listens to in order to trigger change detection.
+
+2. What triggers ApplicationRef.tick() besides onMicrotaskEmpty
+
+Manual call to ApplicationRef.tick()
+ChangeDetectorRef.detectChanges() (local, bypasses zone)
+Router navigation completing
+ChangeDetectorRef.markForCheck() + next zone-triggered tick (not immediate — just flags the component for the next CD run)
+Async pipe emitting a new value
+
+3. Detecting the problem without Angular DevTools
+
+NgZone.isInAngularZone() — call it inside a suspect callback; if false, that code is running outside Angular and won't trigger CD.
+Spy on ApplicationRef.prototype.tick (wrap it, log a counter/stack trace) to see how often and from where CD fires.
+Log inside ngZone.onMicrotaskEmpty.subscribe(...) to see zone-driven tick frequency.
+
+4. Zoneless Angular
+Angular's newer change-detection model that removes Zone.js entirely. Instead of detecting "some async thing happened, re-render everything," it relies on signals — reactive primitives that explicitly notify Angular exactly which components read them. Change detection becomes push-based and fine-grained instead of zone's coarse "recheck the whole tree" approach. This eliminates the entire class of "third-party lib runs outside the zone, UI doesn't update" bugs, because there's no zone to be inside or outside of — updates are driven by signal writes, not async task tracking.
+
+5. detectChanges() vs markForCheck()
+
+detectChanges() — runs change detection immediately, synchronously, on that component and its children. Use when you need instant, explicit re-render (e.g. after mutating data outside Angular's normal flow, like in runOutsideAngular callbacks).
+markForCheck() — doesn't run CD now. It just flags the component (and walks up to ancestors) as "dirty," so it will be checked on the next CD cycle. Use in OnPush components when data changed but you want to piggyback on the next natural tick rather than force one.
+
+6. If the third-party library has its own pause/resume rendering API — still use runOutsideAngular?
+Often yes, and usually both together. The library's pause/resume controls its own internal render loop (e.g. stop redrawing frames) — it says nothing about whether Angular still tries to run change detection every time the library's internal timers/events fire. runOutsideAngular stops those events from triggering Angular CD at all, which is a separate, still-worthwhile win even if the library itself is idle. Skip it only if the library guarantees zero async activity while paused (no timers, no event listeners firing) — otherwise you still get CD-thrashing from a "paused but not silent" library.
 
 ## 10. Interview-Ready Answer
 
