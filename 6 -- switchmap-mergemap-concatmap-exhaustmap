@@ -151,7 +151,7 @@ The clearest way to see the difference is the same trigger timeline run through 
 
 ## 6. When to use?
 
-- **switchMap**: search-as-you-type/autocomplete, live filtering, typeahead — anywhere only the latest request's result matters and earlier ones become instantly irrelevant. Also common for route-parameter-driven data fetching, where navigating away should supersede an in-flight fetch for the previous page.
+- **switchMap**: search-as-you-type/autocomplete, live filtering, typeahead — anywhere only the latest request's result matters and earlier ones become instantly irrelevant. Also common for route-parameter-driven data fetching,situations where an in-flight async operation should be thrown away the moment a newer one starts.
 - **exhaustMap**: submit buttons — payment, form submission, a "like" button that shouldn't register rapid double-taps — any action where starting a second overlapping operation would be actively harmful, and cancelling the first one would be dangerous or incorrect.
 - **concatMap**: operations that must happen strictly in order, one at a time — sequential file uploads, a multi-step wizard save flow where each step depends on the last completing, writing to a queue/log where order matters, or throttling load on a server that can't handle many concurrent requests from one client.
 - **mergeMap**: independent, order-doesn't-matter concurrent work where maximum throughput is the goal — fetching data for each item in a list, handling independent WebSocket messages. Its optional concurrency-limit argument lets you cap parallelism instead of choosing between fully serial and fully unbounded.
