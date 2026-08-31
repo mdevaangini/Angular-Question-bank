@@ -2,7 +2,8 @@
 
 ## 1. What is it?
 
-All four are RxJS "flattening" (higher-order mapping) operators. Each one takes a source stream, maps every emitted value to a new inner Observable — usually some async operation like an HTTP call — and flattens that inner Observable's emissions back into a single output stream. Structurally they all look nearly identical: `source$.pipe(someMap(value => innerObservable$))`. The only thing that actually differs between them is how they handle a **new source value arriving while a previous inner Observable is still active**.
+All four are RxJS "flattening" (higher-order mapping) operators. Each one takes a source stream, maps every emitted value to a new inner Observable — usually some async operation like an HTTP call — and flattens that inner Observable's emissions back into a single output stream. Structurally they all look nearly identical: `source$.pipe(someMap(value => innerObservable$))`.
+The only thing that actually differs between them is how they handle a **new source value arriving while a previous inner Observable is still active**.
 
 ## 2. Why introduced?
 
