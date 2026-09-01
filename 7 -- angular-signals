@@ -22,7 +22,62 @@ This created real problems at scale:
 - It's **hard to reason about** — you often can't tell, just by reading a component, *why* it re-rendered or *when* exactly change detection ran.
 - Working around it required discipline: `ChangeDetectionStrategy.OnPush`, immutable data patterns, and manual `markForCheck()` calls — easy to get subtly wrong, especially in large teams.
 - Using RxJS for local component state (e.g. `BehaviorSubject` + `async` pipe) works, but comes with real boilerplate: subscription management, `takeUntil` cleanup, and a mental model (streams over time) that's overkill for "this component just needs to hold and derive some values."
+///
 
+The old way — RxJS for local state
+
+Before signals existed, a common pattern for holding simple state inside a component looked like this:
+
+ts
+private countSubject = new BehaviorSubject<number>(0);
+count$ = this.countSubject.asObservable();
+
+doubled$ = this.count$.pipe(map(c => c * 2));
+
+increment() {
+  this.countSubject.next(this.countSubject.value + 1);
+}
+
+And in the template you'd use the async pipe:
+
+html
+<p>{{ count$ | async }}</p>
+<p>{{ doubled$ | async }}</p>
+
+This does work. But the sentence is pointing out three costs of doing it this way:
+1. "Subscription management"
+Every Observable you subscribe to manually (in .ts code, not via the async pipe) needs to be unsubscribed from eventually, or you leak memory — the subscription keeps a reference alive even after the component is destroyed. So you end up writing boilerplate like storing a Subscription and calling .unsubscribe() yourself.
+
+2. "takeUntil cleanup"
+A very common pattern to avoid that manual unsubscribe bookkeeping is:
+
+private destroy$ = new Subject<void>();
+
+ngOnInit() {
+  this.someStream$.pipe(takeUntil(this.destroy$)).subscribe(...);
+}
+
+ngOnDestroy() {
+  this.destroy$.next();
+  this.destroy$.complete();
+}
+
+3. "A mental model (streams over time) that's overkill"
+RxJS's whole paradigm is "everything is a stream of values arriving over time, and you compose/transform that stream." That's genuinely powerful for things like HTTP calls, websockets, or search-as-you-type (the switchMap stuff from earlier). But if all you actually want is "this component has a count number that starts at 0 and I want to increment it and show double it" — that's not really a stream problem. There's no "over time" element worth modeling — it's just a value that changes. Forcing it through Subjects, operators, and the async pipe is using a sophisticated tool for a simple job.
+
+The point of the sentence
+
+It's setting up a contrast (presumably the next part of the answer talks about signals as the alternative). With signals, the same thing is just:
+
+count = signal(0);
+doubled = computed(() => this.count() * 2);
+
+increment() {
+  this.count.update(c => c + 1);
+}
+No Subject, no subscription, no takeUntil, no async pipe, no manual cleanup — because signals aren't push-based streams you subscribe to, they're just readable values that Angular tracks automatically. For simple local component state, this is less code and a simpler mental model. RxJS still earns its keep for genuinely asynchronous, event-driven things (HTTP, websockets, debounced search) — the sentence isn't saying "RxJS is bad," it's saying "it's the wrong tool specifically for plain local state."
+
+//
 **Problem without signals:** you had two imperfect options — coarse, zone-driven change detection (simple but wasteful), or RxJS for everything (precise but heavy for simple synchronous state).
 
 **What it solves:** Signals track dependencies automatically and precisely. When a signal changes, Angular knows *exactly* which parts of the template actually depend on it and can update just those parts — without needing Zone.js to "poll" the whole tree. This is also the foundation for **zoneless Angular** (removing Zone.js entirely for better performance and smaller bundles), and it gives local component state a much lighter-weight API than reaching for RxJS every time.
