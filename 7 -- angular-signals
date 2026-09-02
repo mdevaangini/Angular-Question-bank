@@ -51,6 +51,15 @@ Every Observable you subscribe to manually (in .ts code, not via the async pipe)
 2. "takeUntil cleanup"
 A very common pattern to avoid that manual unsubscribe bookkeeping is:
 
+////
+The core idea: takeUntil unsubscribes automatically when another Observable emits
+
+takeUntil(notifier$) is an operator that says: "keep passing through values from my source Observable, until notifier$ emits — the moment it emits, complete (and unsubscribe) automatically."
+
+So this.someStream$.pipe(takeUntil(this.destroy$)) means: "give me values from someStream$, but the instant destroy$ fires, kill this subscription."
+
+////
+
 private destroy$ = new Subject<void>();
 
 ngOnInit() {
