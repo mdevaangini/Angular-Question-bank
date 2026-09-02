@@ -144,8 +144,8 @@ increment() {
 No Subject, no subscription, no takeUntil, no async pipe, no manual cleanup — because signals aren't push-based streams you subscribe to, they're just readable values that Angular tracks automatically. For simple local component state, this is less code and a simpler mental model. RxJS still earns its keep for genuinely asynchronous, event-driven things (HTTP, websockets, debounced search) — the sentence isn't saying "RxJS is bad," it's saying "it's the wrong tool specifically for plain local state."
 
 
-An RxJS Observable is push-based: the source decides when to emit, and it actively pushes that value out to every subscriber, whether they're "ready" or not.
-A signal is pull-based: nobody pushes anything to you. A signal just holds a current value, and you go get it when you need it.
+Push-based (Observables): the source actively sends you values over time, on its own schedule — you must explicitly unsubscribe or it keeps sending forever.
+Pull-based (Signals): you just read the current value whenever you want — there's no ongoing connection to open or close.
 //
 
 
