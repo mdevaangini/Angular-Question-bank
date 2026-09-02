@@ -1,1 +1,109 @@
 
+Step 1: What problem does an Observable solve?
+
+In JavaScript, you already know a few ways to get a value:
+
+js
+const x = 5;               // value exists right now
+const y = fetch('/api');   // value will exist ONCE, in the future (Promise)
+
+But a lot of real things in an app aren't "one value now" or "one value later." They're multiple values, arriving over time, and you don't control when:
+
+Mouse clicks (0, 1, or a thousand of them, whenever the user clicks)
+WebSocket messages (arrive whenever the server feels like sending them)
+Keystrokes in a search box
+A timer ticking every second
+
+There was no built-in JS tool for "a sequence of values over time that I can react to." An Observable is that tool. That's the whole reason it exists — think of it as "a Promise, but for many values instead of one, and repeatable instead of one-shot."
+
+Step 2: What an Observable literally is
+
+Strip away all the RxJS terminology. An Observable is just this:
+
+js
+const myObservable = new Observable(subscriber => {
+  subscriber.next(1);
+  subscriber.next(2);
+  subscriber.next(3);
+  subscriber.complete();
+});
+
+That's it. An Observable is a function wrapped in an object that, when someone asks it to start, calls next() however many times it wants, then optionally calls complete() (finished successfully) or error() (something went wrong). That's the entire vocabulary: next, error, complete.
+
+Step 3: Nothing happens until you subscribe — this is the part everyone gets wrong
+
+Here's the critical thing: creating an Observable does nothing.
+
+js
+const myObservable = new Observable(subscriber => {
+  console.log('I am running!');
+  subscriber.next(1);
+});
+
+console.log('Created the observable');
+// "I am running!" has NOT printed yet
+
+That inner function only runs when you call .subscribe():
+
+js
+myObservable.subscribe(val => console.log('got:', val));
+// NOW "I am running!" prints, and THEN "got: 1" prints
+
+This is called being lazy. Nothing executes until someone subscribes. Compare this to a Promise, which starts running the moment it's created, whether or not anyone is listening. This laziness is a genuinely important difference — it means an Observable is more like a recipe than an event already in progress.
+
+Step 4: Now, "push" — this is the part you asked about
+
+Once you subscribe, who is in control? Not you. The code inside the Observable decides when to call next(). You just hand over a callback and wait to be called.
+
+js
+const clicks$ = new Observable(subscriber => {
+  document.addEventListener('click', (e) => subscriber.next(e));
+});
+
+clicks$.subscribe(e => console.log('clicked at', e.clientX));
+
+You did not write a loop that asks "did the user click yet? did they click yet? did they click yet?" You never pull anything. Instead, the browser fires a click event, and that event handler pushes the value at your callback by calling next(e), whenever it feels like it — could be never, could be 50 times a second.
+
+This is the entire meaning of "push-based": the producer (the thing generating values) is the one deciding when data moves, and it actively sends it to you. You are purely reactive — you wrote "when a value arrives, do this," not "give me the value now."
+
+Contrast with something pull-based, like reading an array:
+
+js
+for (const item of [1, 2, 3]) {
+  console.log(item); // YOU are asking for the next item, on your own timeline
+}
+
+You control the pace here — you decide when to ask for the next item. With an Observable, you never ask. You just wait for next() to be called on you.
+
+Step 5: Why "push" means you have to explicitly stop it
+
+This is the piece that connects to everything we talked about with takeUntil. Since the producer is the one deciding when to send values, and it doesn't know or care whether you still want them, it will keep pushing forever unless you tell it to stop.
+
+js
+const seconds$ = new Observable(subscriber => {
+  const id = setInterval(() => subscriber.next(Date.now()), 1000);
+  // if nobody ever calls unsubscribe, this setInterval NEVER stops
+});
+
+const subscription = seconds$.subscribe(t => console.log(t));
+
+// later...
+subscription.unsubscribe(); // THIS is what stops the pushing
+
+subscribe() returns a Subscription object specifically so you have a handle to say "stop pushing to me now." If you never call .unsubscribe(), that setInterval runs forever, pushing values into a callback that might reference a component that no longer even exists. That's the "ghost radio" from before — now you can see exactly why it happens: the producer (setInterval) has no idea the consumer stopped caring, because nobody ever told it to stop pushing.
+
+Step 6: Putting the full lifecycle together
+
+Here's the complete mental model, start to finish:
+
+Someone defines an Observable — a recipe describing what values to produce and when. Nothing runs yet.
+Someone calls .subscribe(callback) — this actually starts execution of that recipe, right now, for this one subscriber.
+The Observable pushes values by calling next(value) zero, one, or many times, on its own schedule, not yours.
+Eventually it either:
+calls complete() — "I'm done, no more values ever" (e.g. an HTTP call returns once and finishes), or
+calls error(err) — "something went wrong, I'm stopping" (and no complete() follows an error() — it's one or the other), or
+never finishes — keeps pushing forever (clicks, websocket messages, timers) unless manually stopped.
+The subscriber can call .unsubscribe() at any time to say "stop pushing to me" — this is the only way to stop an Observable that never naturally completes on its own.
+Step 7: The one-paragraph explanation you can give someone
+
+"An Observable represents a sequence of values that might arrive over time — not one value, potentially many, and you don't control the timing. Nothing happens until you subscribe; subscribing is what actually starts the work. Once subscribed, the Observable is in control — it calls your callback whenever it has a new value, which is why we call it 'push-based': the source pushes data at you rather than you pulling it on demand. If the Observable never naturally finishes on its own — like a stream of clicks or a websocket — it will keep pushing forever unless you explicitly unsubscribe, which is why cleanup patterns like takeUntil exist."
