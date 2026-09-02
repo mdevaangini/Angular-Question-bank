@@ -7,6 +7,7 @@ All four are RxJS "flattening" operators. Every one of them works on two observa
 - An **OUTER observable** - the stream of triggers. This is whatever keeps firing over time: a keystroke, a button click, a list of files.
 - An **INNER observable** - the async task you start for each trigger. This is usually something like an HTTP call, or here, a fake delayed value standing in for one.
 
+
 The pattern always looks the same: `outer$.pipe(someMap(triggerValue => innerObservable))`. The only thing that changes between the four operators is **what happens if a new value comes from the OUTER observable while the previous INNER observable is still running.**
 
 ## 2. Why introduced?
