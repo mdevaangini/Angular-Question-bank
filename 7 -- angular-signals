@@ -143,7 +143,12 @@ increment() {
 }
 No Subject, no subscription, no takeUntil, no async pipe, no manual cleanup — because signals aren't push-based streams you subscribe to, they're just readable values that Angular tracks automatically. For simple local component state, this is less code and a simpler mental model. RxJS still earns its keep for genuinely asynchronous, event-driven things (HTTP, websockets, debounced search) — the sentence isn't saying "RxJS is bad," it's saying "it's the wrong tool specifically for plain local state."
 
+
+An RxJS Observable is push-based: the source decides when to emit, and it actively pushes that value out to every subscriber, whether they're "ready" or not.
+A signal is pull-based: nobody pushes anything to you. A signal just holds a current value, and you go get it when you need it.
 //
+
+
 **Problem without signals:** you had two imperfect options — coarse, zone-driven change detection (simple but wasteful), or RxJS for everything (precise but heavy for simple synchronous state).
 
 **What it solves:** Signals track dependencies automatically and precisely. When a signal changes, Angular knows *exactly* which parts of the template actually depend on it and can update just those parts — without needing Zone.js to "poll" the whole tree. This is also the foundation for **zoneless Angular** (removing Zone.js entirely for better performance and smaller bundles), and it gives local component state a much lighter-weight API than reaching for RxJS every time.
