@@ -7,6 +7,46 @@ All four are RxJS "flattening" operators. Every one of them works on two observa
 - An **OUTER observable** - the stream of triggers. This is whatever keeps firing over time: a keystroke, a button click, a list of files.
 - An **INNER observable** - the async task you start for each trigger. This is usually something like an HTTP call, or here, a fake delayed value standing in for one.
 
+///
+"flattening" refers to what these operators do to nested Observables, not to the timing behavior we talked about earlier.
+
+The problem they solve
+
+Say you have a source Observable emitting values, and for each value you want to make an API call (which itself returns an Observable):
+
+ts
+trigger$.pipe(
+  map(t => apiCall(t))  // apiCall returns an Observable<Response>
+)
+
+If you use plain map() here, look at what you get: trigger$ was Observable<Trigger>, but now it's Observable<Observable<Response>> — an Observable of Observables. A stream where each emitted item is itself another stream. That's "nested," like an array of arrays: [[1,2],[3,4]].
+
+That's useless to subscribe() to directly — you'd get handed an Observable each time, not the actual response data. You'd have to subscribe again inside your subscribe callback, which is exactly the ugly nested-callback mess RxJS exists to avoid.
+
+What "flattening" means
+
+Flattening is the same concept as Array.prototype.flat() — turning [[1,2],[3,4]] into [1,2,3,4], collapsing one level of nesting. Here it's the same idea applied to Observables: instead of Observable<Observable<Response>>, you want a plain Observable<Response> — the inner Observable's emissions get "unwrapped" and re-emitted directly on the outer stream.
+
+ts
+trigger$.pipe(
+  mergeMap(t => apiCall(t))  // now: Observable<Response>, not Observable<Observable<Response>>
+)
+
+mergeMap, concatMap, switchMap, and exhaustMap all do this same unwrapping — they all take a value, project it to an inner Observable, subscribe to that inner Observable on your behalf, and forward its emitted values straight out onto the outer stream so you never see the nested layer.
+
+So why four different ones, if they all flatten?
+
+Because flattening alone doesn't answer the question: "what happens if a new outer value arrives while a previous inner Observable is still active?" That's exactly the timing question from our very first diagram. The four operators all flatten — they just each pick a different policy for handling overlap:
+
+mergeMap — flatten all of them concurrently, keep everything
+concatMap — flatten them one at a time, in order, queued
+switchMap — flatten only the newest, cancel the rest
+exhaustMap — flatten the current one, ignore new arrivals until it's done
+
+So "flattening operator" is the category name (they all solve the nested-Observable problem), and the operator you pick is really about choosing the concurrency policy on top of that shared flattening behavior.
+
+////
+
 
 The pattern always looks the same: `outer$.pipe(someMap(triggerValue => innerObservable))`. The only thing that changes between the four operators is **what happens if a new value comes from the OUTER observable while the previous INNER observable is still running.**
 
