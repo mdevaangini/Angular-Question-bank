@@ -24,7 +24,7 @@ Without a deliberate choice here, real bugs follow: race conditions where a slow
 
 ## 4. Example
 
-Three simple, self-contained demos - one OUTER observable and one INNER observable each, no fake services needed. All verified live: https://stackblitz.com/run?file=src%2Fapp%2Fapp.component.ts
+Three simple, self-contained demos - one OUTER observable and one INNER observable each, no fake services needed. All verified live: https://stackblitz.com/run?file=src%2Fapp%2Fapp.component.ts ,, ,,,,  one more example to refer ---> https://stackblitz.com/edit/angular-ieh3wfgj?file=src%2Fapp%2Ftimeline-comparison.component.ts,src%2Fapp%2Fmock-api.ts
 
 ```typescript
 // 1) Search box -> switchMap
