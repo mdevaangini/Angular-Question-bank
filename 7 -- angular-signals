@@ -104,6 +104,27 @@ The one sentence to keep
 
 destroy$ is a button you press exactly once, when the component dies. takeUntil(this.destroy$) is how you tell any subscription "listen for that button, and turn yourself off when it's pressed." That's the entire mental model — everything else is just RxJS syntax for wiring that up.
 
+
+--Multiple radios, one button
+
+Say your component has three separate subscriptions doing different jobs:
+
+ts
+ngOnInit() {
+  this.streamA$.pipe(takeUntil(this.destroy$)).subscribe(val => this.doThingA(val));
+  this.streamB$.pipe(takeUntil(this.destroy$)).subscribe(val => this.doThingB(val));
+  this.streamC$.pipe(takeUntil(this.destroy$)).subscribe(val => this.doThingC(val));
+}
+
+Three separate radios, playing three different things. But notice — all three are wired to listen for the same stop button (this.destroy$).
+
+ts
+ngOnDestroy() {
+  this.destroy$.next();
+  this.destroy$.complete();
+}
+
+When you press that one button, all three radios hear it at the same instant and shut off together — because .next() on a Subject broadcasts to every single thing listening to it, not just one. You don't need destroy$A, destroy$B, destroy$C. One button, any number of listeners.
 /////////////////////////////
 
 
