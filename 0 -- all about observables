@@ -58,7 +58,7 @@ Once you subscribe, who is in control? Not you. The code inside the Observable d
 js
 const clicks$ = new Observable(subscriber => {
   document.addEventListener('click', (e) => subscriber.next(e));
-});
+}); 
 
 clicks$.subscribe(e => console.log('clicked at', e.clientX));
 
