@@ -165,7 +165,8 @@ count.update(v => v + 1);   // write: derive the new value from the old one
 ```
 
 - Read it by **calling it as a function**. This is what lets Angular's reactivity system track "who read this."
-- `.set()` replaces the value outright; `.update()` computes the new value from the previous one — always prefer `.update()` when the new value depends on the current one, and always return a **new** object/array reference for objects/arrays (signals compare with `===` by default, so mutating in place won't trigger updates).
+- `.set()` replaces the value outright (You hand it the final value directly. It doesn't care what the old value was.); 
+- .update()` computes the new value from the previous one — always prefer `.update()` when the new value depends on the current one, and always return a **new** object/array reference for objects/arrays (signals compare with `===` by default, so mutating in place won't trigger updates).
 
 ### `computed()`
 
