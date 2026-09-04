@@ -432,6 +432,61 @@ Harder to reason about: signals exist to make data flow explicit ("this depends 
 
 Rule of thumb: if a value is derived from other signals, use computed(). Only use effect() for genuine side effects (logging, DOM writes, API calls) — never to keep another signal in sync.
 
+
+using effect() to trigger API calls is a common anti-pattern. Effects are meant for side effects like logging or DOM sync, not async operations with their own lifecycle (cancellation, loading states, race conditions). Here are the better alternatives.
+
+Option 1: toObservable() + RxJS operators + toSignal()
+
+This is exactly the interop pattern we covered earlier — bridge into RxJS just for the async orchestration, then bridge back.
+
+ts
+searchTerm = signal('');
+
+private results$ = toObservable(this.searchTerm).pipe(
+  debounceTime(300),
+  switchMap(term => this.http.get<Item[]>(`/api/search?q=${term}`))
+);
+
+results = toSignal(this.results$, { initialValue: [] });
+
+Why this is better than effect():
+
+switchMap gives you automatic cancellation of stale requests (the whole point of switchMap from earlier) — effect() gives you none of that for free, you'd have to hand-roll an AbortController and cancel it yourself inside the effect.
+debounceTime, distinctUntilChanged, catchError, retries — the whole RxJS toolkit is available, instead of manually writing that logic inside an effect.
+No risk of the effect accidentally re-triggering itself or running more often than intended, since it's a clean derived pipeline rather than an imperative side-effecting block.
+Option 2: resource() (the newer, purpose-built signals API)
+
+Angular added resource() specifically for "fetch async data based on a reactive signal input" — this is the option designed to replace the effect-triggers-API-call pattern entirely.
+
+ts
+searchTerm = signal('');
+
+searchResource = resource({
+  request: () => this.searchTerm(),
+  loader: async ({ request }) => {
+    const res = await fetch(`/api/search?q=${request}`);
+    return res.json();
+  }
+});
+
+Then in the template or code you get built-in state, not just the data:
+
+ts
+this.searchResource.value();    // the data, once loaded
+this.searchResource.isLoading(); // true while fetching
+this.searchResource.error();     // set if the request failed
+
+Why this is often the cleanest option now:
+
+request is a signal-returning function — whenever searchTerm changes, resource() automatically re-runs the loader with the new value. You never call effect() yourself at all.
+It automatically cancels an in-flight request if searchTerm changes again before the previous one resolves (built-in switchMap-like behavior, no RxJS needed).
+You get isLoading() / error() signals for free — no separate loading = signal(false) bookkeeping.
+If your data source is Observable-based (like Angular's HttpClient) rather than Promise-based, there's rxResource() which takes an Observable-returning loader instead of an async function.
+Which to pick
+If you're already comfortable with RxJS and need operators like debounceTime — Option 1.
+If you want the more modern, built-for-this-purpose API with less boilerplate and built-in loading/error state — Option 2 (resource/rxResource), this is the direction Angular is steering people toward.
+
+Either way, the underlying principle is the same one from the earlier answer: effect() is for side effects, not for deriving state or fetching data — anything that produces a value you'll use later (loading state, fetched data, an error) should come from something purpose-built (computed, toSignal, resource) rather than being manually written into a signal from inside an effect().
 ///
 
 **Q: How do signals interact with RxJS Observables?**
