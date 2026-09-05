@@ -92,6 +92,8 @@ model() is also readable/writable as a signal on both sides — the parent's use
 So: same binding category (two-way, component ↔ view), same desugared shape, same "banana in a box" syntax on the consuming side — model() is just the signals-based implementation of the exact same two-way binding concept the doc describes for [(ngModel)] and custom @Input/@Output components
 
 
+One-line version: ngModel makes a native form element two-way bindable; model() makes a component you write two-way bindable, using a signal instead of the older @Input/@Output/EventEmitter trio.
+
 -----------------
 - Requires `FormsModule` to be imported for `ngModel` specifically (a very common "why isn't this working" gotcha — without the import, Angular throws `Can't bind to 'ngModel' since it isn't a known property`).
 - You can create the same pattern on your **own** components: define `@Input() rating` and `@Output() ratingChange = new EventEmitter<number>()`. Angular's compiler recognizes the `Input`/`InputChange` naming convention and lets a parent write `[(rating)]="userRating"`, which desugars to `[rating]="userRating" (ratingChange)="userRating = $event"` exactly the same way `ngModel` does.
