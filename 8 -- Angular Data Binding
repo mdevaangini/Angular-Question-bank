@@ -101,7 +101,7 @@ One-line version: ngModel makes a native form element two-way bindable; model() 
 
 ## 4. Example
 
-**Live demo (all four binding types + the performance trap below):** [https://stackblitz.com/edit/angular-jtr5ecfb](https://stackblitz.com/edit/angular-jtr5ecfb)
+**Live demo (all four binding types + the performance trap below):** https://stackblitz.com/edit/angular-pjybvacd?file=src%2Fapp%2Fapp.component.ts
 
 ```ts
 // app.component.ts
