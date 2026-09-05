@@ -47,6 +47,52 @@ Before frameworks like Angular, keeping the UI in sync with application state me
   <input [ngModel]="searchTerm" (ngModelChange)="searchTerm = $event" />
   ```
 
+---- Yes — model() is a two-way data binding, just built on signals instead of the manual @Input/@Output pair.
+
+Why it counts as data binding
+
+Data binding, per the doc, is Angular keeping the template and component in sync automatically without you manually touching the DOM — and model() does exactly that, just with less boilerplate.
+
+What it replaces
+
+Recall the manual pattern from the doc:
+
+ts
+@Input() rating = 0;
+@Output() ratingChange = new EventEmitter<number>();
+
+setRating(value: number): void {
+  this.rating = value;
+  this.ratingChange.emit(value);
+}
+
+Two separate declarations, plus you have to remember to call .emit() yourself every time you change the value.
+
+With model():
+
+ts
+rating = model(0); // one declaration, does the job of both @Input and @Output
+
+setRating(value: number): void {
+  this.rating.set(value); // updating the signal automatically notifies the parent too
+}
+How the parent side stays identical
+
+The consuming template doesn't change at all:
+
+html
+<app-star-rating [(rating)]="userRating"></app-star-rating>
+
+Angular still recognizes rating + the implicit ratingChange signal it generates under the hood, and expands [(rating)] the same way it always did — [rating]="userRating" (ratingChange)="userRating = $event". So it's still two-way binding, still "banana in a box," still the same desugaring rule from the doc — the only thing that changed is what's inside the child component: a signal that auto-emits on write, instead of you manually calling .emit() after mutating a plain property.
+
+The one meaningful difference
+
+model() is also readable/writable as a signal on both sides — the parent's userRating can itself be a signal, and reading rating() inside the child gives you live, tracked reactivity (usable in computed(), effect(), etc.) the same way any other signal would. The old @Input/@Output pair gives you a plain property and an EventEmitter — no signal reactivity built in unless you separately wrap it.
+
+So: same binding category (two-way, component ↔ view), same desugared shape, same "banana in a box" syntax on the consuming side — model() is just the signals-based implementation of the exact same two-way binding concept the doc describes for [(ngModel)] and custom @Input/@Output components
+
+
+-----------------
 - Requires `FormsModule` to be imported for `ngModel` specifically (a very common "why isn't this working" gotcha — without the import, Angular throws `Can't bind to 'ngModel' since it isn't a known property`).
 - You can create the same pattern on your **own** components: define `@Input() rating` and `@Output() ratingChange = new EventEmitter<number>()`. Angular's compiler recognizes the `Input`/`InputChange` naming convention and lets a parent write `[(rating)]="userRating"`, which desugars to `[rating]="userRating" (ratingChange)="userRating = $event"` exactly the same way `ngModel` does.
 - (Newer Angular versions also offer `model()` — a signal-based input that generates the paired input/output automatically — as a more modern alternative to the manual `@Input`/`@Output` pair.)
