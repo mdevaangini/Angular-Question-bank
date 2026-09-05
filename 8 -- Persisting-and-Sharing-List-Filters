@@ -1,6 +1,3 @@
-> **Suggested filename:** `persisting-sharing-list-filters-url.md`
-> **Suggested folder:** `interview-notes/angular/scenarios/`
-
 # [Scenario] Users lose their order-list filters when they visit a detail page and come back. They also want to share a filtered view with a teammate. How do you fix both?
 
 ## 1. What is it?
