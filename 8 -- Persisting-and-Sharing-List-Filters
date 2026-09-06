@@ -180,6 +180,21 @@ export class OrdersListComponent implements OnDestroy {
 </form>
 ```
 
+
+//// this is how the code is working
+Read it top to bottom, ignoring the RxJS operator names for a second:
+
+this.route.queryParamMap — this is a stream that tells you the current URL's query params, and re-announces itself every time they change.
+.subscribe((params) => {...}) — "whenever that happens, run this code."
+Inside: params.get('status') — pull the status value out of the URL (e.g. from ?status=active, this gives 'active'). If it's missing, default to 'all'.
+Same for q (the search text).
+this.filterForm.patchValue({ status, q }, ...) — take those two values and write them into the form. So if the URL says status=active, the dropdown in the UI now shows "active" — the form visually updates to match the URL.
+this.applyFilters(status, q) — actually go filter the displayed list using those values.
+
+In plain English: "Whenever the URL's query params change (for any reason), read them out, and update both the form UI and the filtered list to match."
+
+////////
+
 **Why `emitEvent: false` matters:** Picture what happens without it. The URL changes, so the code updates the form to match. But updating the form normally counts as "the form changed," which fires off `valueChanges`, which is exactly the code that pushes the form's value back into the URL. So the URL update would trigger a form update, which would trigger another URL update, which would trigger another form update — an endless loop, all happening instantly, freezing the page. `emitEvent: false` just means "update this control quietly, don't tell anyone it changed." That breaks the loop: only real, actual user typing or clicking ever triggers a URL update.
 
 **Why the two fields are handled separately instead of watching the whole form at once:** because they need different behavior. A dropdown selection is one clean action — react to it immediately. A text box is typed one letter at a time — reacting immediately would mean firing off a URL change (and a browser history-adjacent update) after every single letter, which is wasteful and would make the URL flicker constantly while someone is mid-word.
