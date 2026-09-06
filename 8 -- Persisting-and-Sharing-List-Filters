@@ -33,6 +33,16 @@ Put another way: `/orders?status=shipped` and `/orders?status=pending` really ar
 - The list component never keeps its own private copy of "what filter is currently selected." Instead, it always reads the current filter straight from the URL, using Angular's `ActivatedRoute.queryParamMap`.
 - When the user changes a filter, the component doesn't save that choice anywhere itself — it just tells the router to change the URL, using `router.navigate([], { queryParams: {...}, queryParamsHandling: 'merge' })`. That URL change is what the component sees and reacts to, which is what makes the list re-filter.
 
+//////
+So who "changes the route"? The component itself does — through Router
+
+It's not some external, mysterious force — the same component that reads the filter is also the one that triggers the URL change, using Router.navigate(). The reason this design still counts as "not storing state locally" is: the component never keeps selectedFilter = 'electronics' sitting in its own variable to represent the current selection. Instead, it says "go change the URL to say this," and then goes back to reading whatever the URL currently says, via the separate ActivatedRoute.queryParamMap stream. The URL becomes the actual home of the value — the component just writes to it and reads from it, rather than owning a private copy.
+
+Why bother routing through the URL instead of just setting a variable directly
+
+Because Router.navigate() doesn't just quietly update some internal value — it does a real browser navigation: it pushes a new entry onto browser history (so back/forward works) and changes the actual address bar (so refresh/share/bookmark work). A plain this.selectedFilter = 'electronics' would update your component's memory instantly, but none of those other browser behaviors, because it never touches the URL at all.
+//////
+
 So the flow is: **user does something → the URL changes → the URL is what the page reads to decide what to show.** There's only one place the filter lives — the address bar — so there's nothing that can ever get out of sync with anything else, because there's no "anything else."
 
 Compare that to the more obvious way of doing it: save the filter in a variable, *and* also try to keep the URL updated to match it. Now there are two copies of the same fact, and every time you change one, you have to remember to change the other too. Forget once, and they disagree — the dropdown says "Shipped" but the link you copy says nothing, so the link you share is wrong. Making the URL the *only* copy means that specific bug simply can't happen, because there's no second copy to fall out of sync.
