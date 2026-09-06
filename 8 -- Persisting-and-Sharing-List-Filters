@@ -297,6 +297,13 @@ Block 2 never ran here at all — the user didn't touch the dropdown, they click
 
 - Reaching straight for "put it in a shared service" or "put it in localStorage" as *the* answer. Both of those fix losing filters on navigation — neither one fixes sharing. A strong answer notices out loud that these are two requirements, and picks the one idea that happens to satisfy both.
 - Not knowing that `queryParamsHandling="preserve"` already exists as a built-in option on `routerLink`. Some people reinvent this by hand — manually reading the current query params and re-attaching them to every link — which works, but is unnecessary extra code for something the router already does declaratively.
+--------tells the router: "keep whatever query params already exist, don't touch them" — but this actually means it ignores the new [queryParams] you passed in favor of the existing ones entirely (that's what "preserve" means literally — preserve what's there, don't merge). So this option is really about not losing existing params when you don't want to touch them at all.
+
+The more commonly useful sibling option: "merge"
+
+If you actually want to combine old and new params (keep status=active&q=phone but also add page=2), you use "merge" instead:
+<a routerLink="/products" [queryParams]="{ page: 2 }" queryParamsHandling="merge">
+
 - Not thinking about history spam: calling `router.navigate` on every single keystroke without `replaceUrl: true` (or a typing delay) fills up the back button with dozens of near-identical stops.
 - Assuming Angular keeps a routed component alive by default when you navigate away and back. It doesn't, unless you set up a custom reuse strategy. The right response to "the component gets rebuilt" isn't to fight that — it's to stop relying on the component remembering anything at all, and read everything fresh from the URL instead.
 - Forgetting to handle a bad or missing query param gracefully — a shared link with a typo in it should fall back to sensible defaults, not show a blank list or throw an error.
