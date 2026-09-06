@@ -217,19 +217,58 @@ export class OrdersListComponent implements OnDestroy {
 
 
 Execution flow -> 
+Block 1 does NOT change the URL. It only reacts to it.
+ts
+this.route.queryParamMap
+  .pipe(takeUntil(this.destroy$))
+  .subscribe((params) => {
+    const status = params.get('status') ?? 'all';
+    const q = params.get('q') ?? '';
+    this.filterForm.patchValue({ status, q }, { emitEvent: false });
+    this.applyFilters(status, q);
+  });
 
-~ The two blocks together — one full cycle, concretely
+This block is a listener only. It's sitting there watching the URL, doing nothing to it. It's like a doorbell camera — it doesn't open the door, it just notices when the door opens and reacts.
 
-Say the user clicks "Active" in the status dropdown:
+Nowhere in this block is there a router.navigate(...) call. There's no code here that writes to the URL. It only reads (params.get(...)) and then updates the form (patchValue) and the displayed list (applyFilters). That's all it does.
+So what actually changes the URL then?
 
-Block 2's valueChanges fires (real user action, not suppressed).
-pushFiltersToUrl() runs → URL becomes ?status=active.
-Because the URL changed, queryParamMap (Block 1) fires.
-Block 1 reads status=active from the URL, calls patchValue({ status: 'active' }, { emitEvent: false }).
-Because of emitEvent: false, this patchValue does not re-fire Block 2's valueChanges.
-Loop stops here. Done.
+Three possible things, all external to this block:
 
-If step 4 didn't have emitEvent: false, step 5 would instead re-trigger Block 2, which would call pushFiltersToUrl() again, which would trigger Block 1 again... forever.
+The user clicks the status dropdown → Block 2 fires → Block 2 calls pushFiltersToUrl() → that function (defined elsewhere, not shown) calls this.router.navigate(...) → that's what actually changes the URL.
+The user clicks the browser's back/forward button.
+The user pastes/opens a link like yoursite.com/products?status=active.
+The key mental shift
+
+queryParamMap isn't something you write to. It's something you subscribe to, and it tells you whenever the URL happens to change — no matter why it changed (could be your own router.navigate() call, could be the back button, could be a fresh page load with a link in the address bar).
+
+Block 1's entire job is: "I don't care why the URL changed or who changed it. I just make sure that whatever the URL currently says, the form and the list on screen match it."
+
+Walking through a concrete example, very literally
+
+Scenario A: Page loads fresh with URL /products?status=active
+
+Component is created.
+Block 1's .subscribe(...) runs immediately with whatever the current URL already says (this is a property of queryParamMap — it emits the current value right away on subscribe, not just future changes).
+params.get('status') → 'active'.
+Form gets patched to show "active" in the dropdown.
+The URL never changed here. It was already ?status=active from the start (maybe the user pasted this link). Block 1 just made the form match what was already in the address bar.
+
+Scenario B: User clicks the dropdown, picks "Active"
+
+Block 2 notices the dropdown value changed (real user action).
+Block 2 calls pushFiltersToUrl().
+That function (elsewhere in the code, using Router) does the actual URL-changing: router.navigate([], { queryParams: { status: 'active' } }).
+Now the URL becomes ?status=active.
+Because the URL changed, queryParamMap fires again — Block 1 wakes up.
+Block 1 reads status=active back out, patches the form (which already shows "active" from the user's click — this is somewhat redundant here, but harmless and necessary for the other scenarios like back/forward).
+
+Scenario C: User clicks the browser's back button
+
+Browser changes the URL back to whatever it was before (this is the browser's own native behavior, nothing in your Angular code does this).
+Because the URL changed, queryParamMap fires — Block 1 wakes up.
+Block 1 reads the (now older) params, patches the form to match.
+Block 2 never ran here at all — the user didn't touch the dropdown, they clicked a browser button. Only Block 1 was involved.
 
 
 
