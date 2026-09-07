@@ -1,0 +1,281 @@
+# Registration Form: Debounced Username Availability Check
+
+## 1. What is it?
+
+A real-time "is this username taken?" check that hits an API as the user types, but is engineered so that: (1) it does **not** fire a request on every keystroke, (2) a **stale** response can never overwrite a **newer** one, and (3) the submit button stays disabled for the entire time a check is in flight. The mechanism is an Angular **async validator** that debounces itself internally and relies on Angular's built-in "cancel the previous check when a new one starts" behavior — combined with binding the submit button to the form's aggregate `pending` state.
+
+## 2. Why was it introduced?
+
+Without this, the naive version — call the API directly from a `(keyup)`/`valueChanges` subscription — breaks in predictable ways:
+
+- **Hammering the endpoint.** Typing "adamalexander" fires 13 requests, one per keystroke, for a check nobody needed 12 of.
+- **Race conditions on the response.** If request #3 (for "ada") is slow and request #5 (for "adam") is fast, the slow response for "ada" can arrive *after* the fast one and incorrectly overwrite the UI's "available" state for "adam" with stale data from an earlier, now-irrelevant keystroke.
+- **No natural way to disable submit.** If the check is just a side-effect subscription, you need a separate manually-managed `isChecking` boolean to gate the submit button — easy to forget to reset on error, easy to get out of sync with the actual form validity.
+
+Angular's Reactive Forms already have a first-class concept for "this control has an in-progress async check": `AsyncValidatorFn` and the `PENDING` status. Using it means the debounce, the cancellation-of-stale-checks, and the submit-button-gating all come from the same mechanism instead of three separately-hand-rolled pieces of state.
+
+## 3. How does it work?
+
+**The core trick: debounce *inside* the async validator using `timer()`, not outside it.**
+
+```ts
+return timer(DEBOUNCE_MS).pipe(
+  switchMap(() => api.checkAvailability(value)),
+  map(isAvailable => (isAvailable ? null : { usernameTaken: true }))
+);
+```
+
+Angular calls the async validator function again on every value change (with the default `updateOn: 'change'`), and — this is the documented, load-bearing behavior — **if a previous async validation is still pending when a new one starts, Angular cancels the old subscription before starting the new one.** So if the user types five characters in 200ms:
+
+- Keystroke 1 starts a `timer(400)`. Before it fires, keystroke 2 arrives — Angular cancels that pending timer.
+- This repeats for keystrokes 2, 3, 4.
+- Only after keystroke 5, when the user actually pauses for 400ms, does the timer finally elapse, and *only then* does `api.checkAvailability(...)` get called — exactly once.
+
+This is the same "debounce via cancellation" idea as RxJS's `switchMap`, except the cancellation is Angular's own async-validator plumbing doing it for you, for free, rather than something you wire up by hand against `valueChanges`.
+
+**Submit button gating.** `AbstractControl.pending` (and the aggregate `form.pending`) becomes `true` **synchronously**, the instant an async validator starts running — before its observable/timer has emitted anything. So `[disabled]="form.invalid || form.pending"` is a complete, correct guard: invalid for sync failures (required/minlength), pending for "we don't know yet."
+
+**Avoiding a stale positive/negative.** Because Angular only ever acts on the *last* async validator run's result (older ones are cancelled), the control's error state can never be overwritten by a response to an out-of-date value — this solves the race condition described above without any manual request-ID bookkeeping.
+
+**A small further optimization**: memoize the last checked value/result inside the validator's closure, so retyping the exact same value (e.g., typed then backspaced back to the original) doesn't trigger a redundant network call.
+
+## 4. Example
+
+**StackBlitz (compiles; initial state verified live — see note below):**----  https://stackblitz.com/run?file=src%2Fapp%2Fapp.component.ts,src%2Fapp%2Fapp.component.html
+
+```ts
+// username-api.service.ts
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Observable, map } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class UsernameApiService {
+  private http = inject(HttpClient);
+  callCount = 0;
+
+  checkAvailability(username: string): Observable<boolean> {
+    this.callCount++;
+    return this.http
+      .get<{ available: boolean }>('/api/username-available', { params: { username } })
+      .pipe(map(res => res.available));
+  }
+}
+```
+
+```ts
+// username-availability.validator.ts
+import { AbstractControl, AsyncValidatorFn, ValidationErrors } from '@angular/forms';
+import { Observable, of, timer } from 'rxjs';
+import { switchMap, map, catchError } from 'rxjs/operators';
+import { UsernameApiService } from './username-api.service';
+
+const DEBOUNCE_MS = 400;
+
+export function usernameAvailabilityValidator(api: UsernameApiService): AsyncValidatorFn {
+  let lastChecked: string | null = null;
+  let lastResult: ValidationErrors | null = null;
+
+  return (control: AbstractControl): Observable<ValidationErrors | null> => {
+    const value = (control.value ?? '').trim();
+
+    if (!value) {
+      return of(null);
+    }
+
+    if (value === lastChecked) {
+      // Same value already checked — skip hitting the API again.
+      return of(lastResult);
+    }
+
+    return timer(DEBOUNCE_MS).pipe(
+      switchMap(() => api.checkAvailability(value)),
+      map(isAvailable => {
+        lastChecked = value;
+        lastResult = isAvailable ? null : { usernameTaken: true };
+        return lastResult;
+      }),
+      catchError(() => of(null)) // network failure: fail-open rather than permanently block signup
+    );
+  };
+}
+```
+
+```ts
+// app.component.ts
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormBuilder, FormControl, ReactiveFormsModule, Validators } from '@angular/forms';
+import { usernameAvailabilityValidator } from './username-availability.validator';
+import { UsernameApiService } from './username-api.service';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule, ReactiveFormsModule],
+  templateUrl: './app.component.html'
+})
+export class AppComponent implements OnInit {
+  private fb = inject(FormBuilder);
+  private api = inject(UsernameApiService);
+
+  log = signal<string[]>([
+    'Type a username above. Rapid keystrokes are debounced (400ms) before the availability check ever hits the API — try typing fast, the API call count only increases once you pause.'
+  ]);
+
+  registrationForm = this.fb.group({
+    username: this.fb.control('', {
+      validators: [Validators.required, Validators.minLength(3)],
+      asyncValidators: [usernameAvailabilityValidator(this.api)],
+      updateOn: 'change'
+    })
+  });
+
+  get username(): FormControl<string> {
+    return this.registrationForm.get('username') as FormControl<string>;
+  }
+
+  ngOnInit(): void {
+    // Trigger one check immediately so the PENDING state (and disabled submit button)
+    // is visible right away — Angular flips status to PENDING synchronously the instant
+    // an async validator starts, well before its observable/timer resolves.
+    this.username.setValue('newuser');
+  }
+
+  submit(): void {
+    this.addLog('Submitted with username "' + this.username.value + '"');
+  }
+
+  private addLog(message: string): void {
+    this.log.update(entries => [...entries, message]);
+  }
+}
+```
+
+```html
+<!-- app.component.html -->
+<div class="page">
+  <h1>Registration — Debounced Username Availability</h1>
+  <p>An <code>AsyncValidatorFn</code> that debounces via an internal <code>timer()</code>, relying on Angular's built-in cancel-on-restart behavior so the API call never fires until typing actually pauses. The submit button stays disabled while the check is pending.</p>
+
+  <form [formGroup]="registrationForm" (ngSubmit)="submit()">
+    <label>
+      Username
+      <input formControlName="username" autocomplete="off" />
+    </label>
+
+    <div class="status">
+      @if (username.pending) {
+        <span class="checking">Checking availability…</span>
+      } @else if (username.errors?.['required']) {
+        <span class="error">Username is required</span>
+      } @else if (username.errors?.['minlength']) {
+        <span class="error">At least 3 characters</span>
+      } @else if (username.errors?.['usernameTaken']) {
+        <span class="error">Username is taken</span>
+      } @else if (username.valid) {
+        <span class="ok">Username available</span>
+      }
+    </div>
+
+    <button type="submit" [disabled]="registrationForm.invalid || registrationForm.pending">
+      Create account
+    </button>
+  </form>
+</div>
+```
+
+```ts
+// fake-backend.interceptor.ts (demo-only: simulates the real API)
+import { HttpInterceptorFn, HttpResponse } from '@angular/common/http';
+import { of } from 'rxjs';
+import { delay } from 'rxjs/operators';
+
+const TAKEN_USERNAMES = new Set(['admin', 'root', 'test', 'ada']);
+
+export const fakeBackendInterceptor: HttpInterceptorFn = (req, next) => {
+  if (req.url === '/api/username-available') {
+    const username = (req.params.get('username') || '').toLowerCase();
+    const available = !TAKEN_USERNAMES.has(username);
+    return of(new HttpResponse({ status: 200, body: { available } })).pipe(delay(500));
+  }
+  return next(req);
+};
+```
+
+> **Verified live:** the project compiles, and on load `ngOnInit` sets the username to `"newuser"`, which correctly resolves through the debounce + fake 500ms API call to **"Username available"**, with the submit button enabled — confirming the validator, the interceptor, and the template bindings are all wired correctly end-to-end. (Angular actually flips the control to `PENDING` — and disables the submit button — synchronously the instant a check starts, before the 400ms timer or the API call resolves; that transient state is real but too brief a window to reliably capture in this session's screenshot tooling, so it's described here rather than shown.) The debounce/cancel-on-restart behavior itself (typing fast producing only one API call, not five) is Angular's documented async-validator mechanism — described in detail in section 5 — rather than something re-verified with a live multi-second typing simulation in this pass, after an earlier attempt in this session hit a browser-tool timing limitation. Open the link and try typing quickly yourself to see it in action.
+
+## 5. Example Explanation / Execution Flow
+
+1. `registrationForm`'s `username` control is built with `fb.control('', { validators: [...], asyncValidators: [usernameAvailabilityValidator(this.api)], updateOn: 'change' })` — async validators only run after all sync validators pass.
+2. Every time the control's value changes, Angular calls `usernameAvailabilityValidator(...)`'s returned function again. If a previous call's returned Observable hasn't completed yet, **Angular unsubscribes it first** — this is the mechanism that makes "type fast, only the last one survives" work, without any `switchMap` in the outer subscription (the cancellation happens at the framework level, driven by the `timer()` at the start of the pipeline).
+3. The first thing the validator does each time is check `value === lastChecked` — if the user retyped something already checked, it returns the cached result instantly via `of(lastResult)`, with **no** new timer and **no** new API call.
+4. Otherwise, `timer(DEBOUNCE_MS)` starts. If the control changes again before 400ms elapses, this timer (and everything chained after it) is cancelled by Angular before it ever reaches `switchMap(() => api.checkAvailability(value))` — meaning the HTTP call is never made for values the user has already moved past.
+5. Once the user pauses for a full 400ms, the timer fires, `api.checkAvailability(value)` is called exactly once, and its boolean result is mapped to either `null` (valid) or `{ usernameTaken: true }`.
+6. While all of this is happening, the template's `@if (username.pending)` shows "Checking availability…", and `[disabled]="registrationForm.invalid || registrationForm.pending"` keeps the submit button disabled — both driven directly off the same control, with no separate manually-managed loading flag anywhere in the component.
+7. `catchError(() => of(null))` is a deliberate product decision baked into the code: if the availability check itself fails (network error), the username is treated as valid rather than permanently blocking the user from signing up because of an unrelated infrastructure hiccup — worth calling out explicitly in an interview, since "fail open" vs. "fail closed" here is a genuine judgment call, not an obvious default.
+
+## 6. When should we use it?
+
+- Any "check against the server as the user types" field: username/email availability, promo code validation, slug/handle uniqueness.
+- Anywhere the check is expensive or rate-limited enough that per-keystroke calls would be wasteful or would risk hitting a rate limit.
+- Anywhere the UI needs to block a destructive/final action (submit, purchase, publish) until an async check is known to have resolved — the `form.pending` pattern generalizes beyond just username checks.
+- Not necessary for validation that's purely synchronous (format, required, length) — those should stay as plain `Validators`, not async ones; async validators only run after sync validators already pass, and only reach for them when the check genuinely requires a network round trip.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- Debounce, cancellation-of-stale-results, and submit-gating all come from the same built-in mechanism — no hand-rolled `isChecking` flag, no manual request-ID comparison to guard against races.
+- The pattern is entirely inside the validator function — reusable across any field/form that needs the same kind of check, by just supplying a different API call.
+- `PENDING` state is synchronous and framework-native, so it's trivially available anywhere in the template or in code (`control.pending`, `form.pending`).
+
+**Disadvantages**
+- The debounce delay is invisible in the validator's public signature — someone reading `asyncValidators: [usernameAvailabilityValidator(api)]` doesn't see "400ms" anywhere without opening the validator, worth a comment.
+- Async validators only re-run on value changes by default; if the *server-side* state can change independently (someone else just took the username), the UI won't know until the user's control value changes again or the form is resubmitted.
+- Testing requires either real timers with `fakeAsync`/`tick()` or `TestScheduler` marble tests — slightly more setup than testing a plain synchronous validator.
+
+## 8. Common Interview Traps
+
+- Debouncing with `valueChanges.pipe(debounceTime(...))` in the component and manually toggling a `checking` boolean, instead of using `AsyncValidatorFn` — works, but reinvents state (`pending`, cancellation) Angular already gives you for free, and is a strictly worse answer for this specific question.
+- Putting the debounce **outside** the async validator (e.g., debouncing a separate subscription that then calls `setErrors()` manually) — this bypasses Angular's own pending/cancellation machinery and is easy to get subtly wrong (e.g., forgetting to clear pending state on error).
+- Forgetting that `catchError` is required inside the validator — an uncaught error in an async validator's observable can leave the control stuck in `PENDING` forever, which silently disables submit with no way out for the user.
+- Not knowing that async validators run only after sync validators pass — a candidate might otherwise worry (incorrectly) about the API being hit for an empty or too-short username.
+- Confusing `updateOn: 'change'` (default; validates on every keystroke) with `updateOn: 'blur'`/`'submit'` — the latter would avoid the debounce problem entirely by only checking once focus leaves the field, which is a legitimate alternative worth mentioning, with the trade-off of later feedback.
+
+## 9. Interview Follow-up Questions
+
+**Q: Why not just use `debounceTime` + `switchMap` on `valueChanges` directly instead of an async validator?**
+A: You can — it's a valid alternative, and some teams prefer it because it's plain RxJS with no Angular-forms-specific behavior to learn. But then you must manually manage a `checking` signal/flag and manually call `setErrors()`/clear it, and manually make sure submit is gated on that flag in sync with actual form validity. The async validator approach gets `pending`, cancellation, and error-state integration from the framework directly.
+
+**Q: What happens if the user submits the form while a check is still pending?**
+A: They can't — `[disabled]="registrationForm.invalid || registrationForm.pending"` keeps the button disabled for the whole time `pending` is true, and `pending` only clears once the async validator's observable emits.
+
+**Q: How would you unit test the debounce behavior without waiting 400ms in real time in your test suite?**
+A: Use Angular's `fakeAsync` + `tick(400)` (or RxJS `TestScheduler` marble testing) to advance virtual time deterministically, asserting the mock API was called exactly once even after simulating several rapid `setValue()` calls within the debounce window.
+
+**Q: How would you show the user *why* a username is taken (e.g., "taken by a deleted account, contact support") instead of a generic message?**
+A: Have `checkAvailability` return richer data (not just a boolean) and put that detail into the validator's error object, e.g. `{ usernameTaken: { reason: 'reserved' } }`, then branch on it in the template.
+
+**Q: What would you change for a field where staleness matters even more, e.g. real-time price/stock checks?**
+A: Consider not caching/memoizing at all (skip the `lastChecked` optimization) so a value is always re-verified even if unchanged, and potentially re-validate on a timer/focus event too, not just on user-driven value changes, since the "truth" can change from the server side independent of typing.
+
+## 10. Interview-Ready Answer
+
+"I'd implement the check as an Angular async validator rather than a manual subscription. Inside the validator, I start with a `timer(400)` before calling the API — Angular's own behavior is that if the control's value changes again while a previous async validation is still pending, it cancels that pending check before starting a new one. So if someone types five characters quickly, four of those timers get cancelled before they ever fire, and only the last one — once typing actually pauses — reaches the API call. That gives me debouncing without needing `debounceTime` in a separate subscription, and it also solves the race-condition problem for free, since a stale, cancelled check can never resolve and overwrite a newer result. For the submit button, Angular sets the control's — and the form's — status to `PENDING` synchronously the moment an async validator starts, before its observable resolves, so binding `[disabled]` to `form.invalid || form.pending` is a complete, correct guard with no separate loading flag to manage. I'd also memoize the last checked value inside the validator so retyping the same text doesn't trigger a redundant call, and wrap the API call in `catchError` so a network failure doesn't leave the field stuck in a permanent pending state."
+
+## 11. Quick Revision
+
+- **What:** A registration username field that checks availability against an API without spamming it on every keystroke, using an `AsyncValidatorFn`.
+- **Why:** Naive per-keystroke calls waste requests, risk race conditions where a stale response overwrites a newer one, and require manually-managed loading state to gate submit.
+- **Problem solved:** Debounce via an internal `timer()` combined with Angular's built-in "cancel the previous async validation when a new one starts" behavior — plus `form.pending` as a free, correct submit-button guard.
+- **How:** `asyncValidators: [usernameAvailabilityValidator(api)]`, where the validator pipes `timer(400) -> switchMap(apiCall) -> map(toValidationErrors)`, with `catchError` to avoid a stuck pending state, and a simple memo to skip redundant identical checks.
+- **Use when:** Any field needing a server round-trip check while typing, or any action that must stay blocked until an async check resolves.
+- **Important:** Debounce goes *inside* the validator's observable, not as a separate `valueChanges` subscription; always `catchError` inside an async validator.
+- **Remember:** `pending` flips synchronously the instant validation starts — that's what makes `[disabled]="form.invalid || form.pending"` correct with zero extra state.
+
+## 12. Memory Trick
+
+**"Timer inside, cancel automatic, pending for free."**
+- **Timer inside** — put the debounce `timer()` as the first step inside the async validator itself, not outside it.
+- **Cancel automatic** — Angular cancels a still-pending async validation the moment the value changes again; that's what makes debounce actually work.
+- **Pending for free** — `control.pending`/`form.pending` flips synchronously when validation starts, so submit-button gating needs no separate flag.
