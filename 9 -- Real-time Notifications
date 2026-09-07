@@ -288,6 +288,45 @@ Walking through exactly what happens, step by step:
 - Reaching for `localStorage`'s built-in `'storage'` event as a shortcut instead of BroadcastChannel — it has the exact same "doesn't fire in the tab that made the change" limitation, plus its own unrelated quirks (size limits, needing to serialize everything to a string). BroadcastChannel is the tool actually built for this job.
 - Only updating local/broadcast state when marking something as read, and forgetting to also tell the server (e.g., a `PATCH` request) — broadcasting keeps open tabs in sync with each other, but a page refresh or a brand-new tab needs the server to remember it too.
 
+
+
+//NOTE:
+it's not that the same code gets written twice — it's that one function (applyMessage) gets called from two different places. The logic itself lives in exactly one spot.
+
+Look at where applyMessage actually gets invoked in the example:
+
+ts
+private becomeLeader(): void {
+  ...
+  this.mockServerTimer = setInterval(() => {
+    ...
+    const message: BroadcastMessage = { type: 'NEW_NOTIFICATION', notification };
+    this.applyMessage(message);        // call site #1: update MY OWN state directly
+    this.channel.postMessage(message); // tell every OTHER tab
+  }, 8000);
+}
+
+constructor(...) {
+  this.channel.onmessage = (event) => {
+    this.zone.run(() => this.applyMessage(event.data)); // call site #2: react to THEIR broadcast
+  };
+}
+
+applyMessage — the actual "add this to the list, bump the count, maybe show a toast" logic — is written exactly once. It just gets triggered from two different moments:
+
+Right when this tab causes a change itself (the leader hearing from the server, or any tab handling a user click like "mark as read") — called directly, synchronously, no round trip needed.
+Whenever some other tab's broadcast arrives — called from onmessage.
+
+So yes, your instinct is correct that the tab causing the change has to update itself separately from broadcasting — postMessage alone will never touch that tab's own UI. But the reason that's not "writing it twice" is that both call sites hand off to the same one function. If you ever need to change what happens when a notification arrives, you change applyMessage once, and both paths — local action and remote broadcast — pick up the fix automatically.
+
+One more precision: this isn't actually leader-specific. It applies to whichever tab originates a change. The leader happens to be the one originating "new notification" events (since it's the one with the connection), but a follower tab is just as capable of originating a "mark as read" event when the user clicks it there — and that follower has to do the exact same "apply locally, then broadcast" two-step, for the exact same reason.
+
+/////////
+
+
+
+
+
 ## 9. Interview Follow-up Questions
 
 **Q1: Why not just let every tab open its own WebSocket?**
