@@ -232,6 +232,47 @@ this.route.paramMap.pipe(...).subscribe((u) => (this.user = u));
 it's not asking "what's the id right now" (a one-time question with a one-time answer). It's saying "keep telling me whenever this changes, for as long as I'm subscribed." ngOnInit still only runs once — but all it's doing there is setting up a subscription, not reading a value. The subscription itself is a standing instruction that stays active for the component's entire life, and it keeps firing every time the underlying ActivatedRoute (the thing tied to the route, not the component) emits a new param map — which happens on every relevant navigation, whether or not the component instance was recreated.
 
 A useful mental model: route.snapshot is a photograph — accurate the moment it's taken, frozen forever after. route.paramMap is a live camera feed — you only have to point it (subscribe) once, but you keep getting new frames indefinitely. The bug in the original code wasn't that it used ngOnInit — the fix uses ngOnInit too. The bug was pairing ngOnInit with a photograph instead of a camera feed.
+difference between , paramsMap and queryParamsMap
+
+These are two different pieces of a URL, and each has its own Observable/snapshot on ActivatedRoute. Let's separate them using an actual URL.
+
+
+Take this URL as the example
+/products/42?status=active&sort=price
+42 — this is a route parameter (paramMap)
+status=active&sort=price — these are query parameters (queryParamMap)
+paramMap — the path segments defined in your route config
+These come from placeholders you defined in the route path itself, using a colon:
+
+ts
+{ path: 'products/:id', component: ProductDetailComponent }
+The :id in the route config is what makes 42 in /products/42 a route param. You read it like this:
+
+ts
+this.route.paramMap.subscribe(params => {
+  const id = params.get('id'); // '42'
+});
+Key traits:
+
+Part of the route's defined path structure — the route literally can't match without it (if :id is required and missing, that URL doesn't match this route at all).
+Usually identifies which specific resource you're looking at — /products/42 means "the product with id 42," not "products, optionally filtered by 42."
+Changing it typically means you're navigating to a fundamentally different thing (product 42 vs product 99), often even a different component instance if the route isn't reused.
+queryParamMap — the stuff after the ?
+These are not part of the route path definition at all — you never declare them in the route config. They're optional, free-form key-value pairs.
+
+ts
+this.route.queryParamMap.subscribe(params => {
+  const status = params.get('status'); // 'active'
+  const sort = params.get('sort');     // 'price'
+});
+Key traits:
+
+Not defined in the route config — any query param can appear on any route, Angular doesn't restrict or require them.
+Used for things that modify or filter the current view, without changing what you're looking at — filters, sort order, pagination, search text. This is exactly the filter/search example from a few messages ago.
+Available on every route, globally — same queryParamMap mechanism works whether you're on /products or /products/42 or /checkout.
+
+
+
 //
 ## 12. Quick Revision
 
