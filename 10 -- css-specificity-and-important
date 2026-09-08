@@ -103,3 +103,67 @@ Specificity tuple: `(inline, #id count, .class/[attr]/:pseudo-class count, eleme
 ## 13. Memory Trick
 
 **"Inline beats ID beats Class beats Element — never add, always compare left to right. `!important` doesn't play the specificity game at all; it just cuts the line."**
+
+## 14. Follow-up: cascade layers, `:where()` vs `:is()`, Angular encapsulation, and living with `!important`
+
+### 14.1 Does `@layer` override specificity?
+
+Not exactly "override" — it's checked *before* specificity, so it usually decides the winner before specificity ever gets a say. The full cascade order (ignoring `!important` for a moment) is: origin → **layer order** → specificity → source order. Layers are compared first. That means a `#id` selector sitting in an earlier-declared layer loses to a plain `.class` selector in a later-declared layer, full stop — specificity is never even consulted, because the layer comparison already picked a winner.
+
+One easy detail to miss: unlayered author CSS (plain rules not wrapped in any `@layer` at all) is treated as if it sits in an implicit final layer that comes *after every named layer*. So ordinary unlayered CSS beats all layered CSS regardless of specificity, unless you deliberately put your "must win" styles into a layer too.
+
+```css
+@layer base, components;
+
+@layer base {
+  #title { color: blue; } /* ID selector - huge specificity */
+}
+@layer components {
+  .title { color: red; } /* class selector - tiny specificity */
+}
+/* .title wins - components was declared after base, and layer order is checked first */
+```
+
+`!important` flips the direction: `!important` declarations are compared in *reverse* layer order (the earliest-declared layer's `!important` wins over a later layer's `!important`), and unlayered `!important` is treated as the *lowest* priority among `!important` rules - the opposite of how normal declarations behave. This reversal exists on purpose, so a "base/reset" layer can use `!important` as a genuine hard floor that later layers can't casually stomp on.
+
+### 14.2 `:where()` vs `:is()` — the specificity difference
+
+Both accept a selector list and match if *any* selector in the list matches, so they select the same elements. The difference is entirely in what specificity they contribute:
+
+- `:is(...)` takes on the specificity of its **most specific** argument.
+- `:where(...)` always contributes **zero** specificity, no matter what's inside it.
+
+```css
+:is(#header, .nav) p    /* specificity = ID + element (from #header) - high */
+:where(#header, .nav) p /* specificity = just element - as if :where(...) wasn't there at all */
+```
+
+That makes `:where()` the right tool for reset/base styles you *want* to be trivially overridable by almost anything else, and `:is()` more of a grouping convenience that still affects the specificity math - it isn't "free" the way `:where()` is.
+
+### 14.3 How Angular's `ViewEncapsulation.Emulated` quietly changes specificity
+
+Emulated encapsulation (Angular's default) fakes style scoping without real Shadow DOM: it rewrites your component's selectors to add a unique attribute selector, and stamps that same attribute onto every element the component renders. So `.title { color: red; }` compiles to something like `.title[_ngcontent-c12] { color: red; }`, and the element itself gets rendered as `<h1 _ngcontent-c12>`.
+
+An attribute selector counts exactly the same as a class in the specificity tuple - it adds one to the "c" column. So *every* emulated-component style silently gets +1 specificity that isn't visible anywhere in your actual source code. This causes a genuinely surprising bug: a global `.title { color: blue; }` (specificity `(0,0,1,0)`) can lose to a component's own `.title { color: red; }`, which actually compiles to `(0,0,2,0)` - even though both look like a single, identical class selector in the source.
+
+A few related pieces worth knowing: `:host` compiles to an attribute selector on the component's own root element (`[_nghost-xxx]`); `::ng-deep` (deprecated, but still functional) stops the attribute from being appended to selectors after it, which is exactly how it "pierces" encapsulation - and also why using it changes the real specificity output, not just how far the selector reaches. `ViewEncapsulation.None` skips all of this rewriting entirely (fully global styles, normal specificity). `ViewEncapsulation.ShadowDom` sidesteps the whole question - real Shadow DOM boundaries mean outside selectors can't reach in at all, so it stops being a specificity contest and becomes a hard wall instead.
+
+### 14.4 When is `!important` actually justified?
+
+A short, defensible list:
+
+- Overriding inline styles or CSS from a third-party widget/CMS you don't control and can't edit at the source. Inline styles already beat almost every ordinary selector, so `!important` is sometimes the only lever left.
+- Accessibility overrides - a `.sr-only` (screen-reader-only) utility class, or user/browser accessibility stylesheets (forced colors, larger text), are *supposed* to win no matter what, by design, so they shouldn't get silently broken by an unrelated specificity fight somewhere else in the app.
+- Narrow, single-purpose utility classes in a utility-first framework (Tailwind's `!` prefix, or a plain `.hidden { display: none !important; }`) - deliberate and contained, because the entire point of a utility class is "this wins, unconditionally," not "this wins, unless something else happens to be more specific."
+- Print stylesheets, where print-specific rules genuinely need to override screen rules regardless of source order elsewhere.
+
+Not justified: reaching for it mid-feature-work because an override "isn't winning." That's a symptom of a specificity or cascade-ordering problem, and `!important` just papers over the symptom instead of fixing the cause - which is exactly how the mess in the next question accumulates.
+
+### 14.5 Refactoring a codebase with dozens of `!important` overrides
+
+1. **Audit before deleting anything.** Search the codebase for every `!important`, and sort each one into "legitimate" (matches the list in 14.4) versus "band-aid" (fighting an ordinary specificity war).
+2. **Fix the root cause for the band-aid group, not the symptom.** Almost always the real problem is overly specific or overly nested selectors somewhere, or stylesheets loading in an order that fights itself - `!important` was patching around that, not solving it.
+3. **Introduce `@layer` tiers** (`reset`, `base`, `components`, `utilities`, `overrides`) so priority is expressed by *layer order* instead of by escalating specificity or reaching for `!important`. Most "I need `!important` just to win" situations disappear once "win by being declared in a later layer" is available instead.
+4. **Use `:where()` on reset/base selectors** so they contribute zero specificity, letting ordinary component styles win against them without needing a fight in the first place.
+5. **Remove `!important` incrementally, one component or file at a time, with a visual check after each removal** rather than one big-bang sweep - some of those existing `!important` rules may be quietly holding a broken layout together, and a single mass removal is a rough way to discover that.
+6. **Keep and clearly comment the genuinely justified ones**, so a future maintainer doesn't "clean up" an accessibility override by accident.
