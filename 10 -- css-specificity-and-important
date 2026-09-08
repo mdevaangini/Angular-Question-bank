@@ -132,6 +132,27 @@ One easy detail to miss: unlayered author CSS (plain rules not wrapped in any `@
 
 `!important` flips the direction: `!important` declarations are compared in *reverse* layer order (the earliest-declared layer's `!important` wins over a later layer's `!important`), and unlayered `!important` is treated as the *lowest* priority among `!important` rules — the opposite of how normal declarations behave. This reversal exists on purpose, so a "base/reset" layer can use `!important` as a genuine hard floor that later layers can't casually stomp on.
 
+### Before Q2: what `:is()` and `:where()` actually are, in plain terms
+
+Both are just a shortcut for "match any of these selectors," so you don't have to repeat the rest of the selector for each one.
+
+Without them, if you wanted the same style on a paragraph inside a header, a nav, or a list item, you'd write it out three times:
+
+```css
+#header p, .nav p, li p { color: blue; }
+```
+
+With `:is()` or `:where()`, you write the shared part once and list the alternatives inside the parentheses:
+
+```css
+:is(#header, .nav, li) p { color: blue; }
+:where(#header, .nav, li) p { color: blue; }
+```
+
+Both lines above select exactly the same paragraphs. Neither one changes *what* gets styled — only *how much specificity weight* the rule ends up carrying, which decides how easily some other rule can beat it later.
+
+Think of it like this: the elements inside the parentheses are just "candidates," and the browser picks whichever one actually matched to decide the specificity. `:is()` says "use the heaviest candidate's weight." `:where()` says "pretend this whole group weighs nothing, no matter which candidate matched." That's the entire difference — same matching, different weight.
+
 **Q2: How does `:where()` differ from `:is()` in terms of specificity contribution?**
 
 Both accept a selector list and match if *any* selector in the list matches, so they select the same elements. The difference is entirely in what specificity they contribute:
