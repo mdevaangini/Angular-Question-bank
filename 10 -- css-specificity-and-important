@@ -157,6 +157,31 @@ Think of it like this: the elements inside the parentheses are just "candidates,
 
 Both accept a selector list and match if *any* selector in the list matches, so they select the same elements. The difference is entirely in what specificity they contribute:
 
+/////NOTE:
+It means OR, not AND.
+
+:is(#header, .nav, li) reads as: "an element that matches #header, OR matches .nav, OR matches li." Not an element that has to match all three — just any one of them is enough to count as a match.
+
+So take this HTML:
+
+html
+<div id="header">A</div>
+<div class="nav">B</div>
+<li>C</li>
+<p>D</p>
+
+:is(#header, .nav, li) matches A (it has id="header"), matches B (it has class="nav"), and matches C (it's an li) — three separate elements, none of which need to satisfy more than one of the conditions. D matches none of the three, so it's excluded.
+
+Now attach p after it: :is(#header, .nav, li) p. This means "a p that's inside one of those matched elements" — so it finds any paragraph nested inside a header-id element, or inside a nav-class element, or inside an li, and applies the same style to all of them, as if you'd written:
+
+css
+#header p,
+.nav p,
+li p { color: blue; }
+
+That's the "select the same elements" part — :is(#header, .nav, li) p and the three-line version above target exactly the same paragraphs. The only thing :is()/:where() change is how much specificity that combined rule carries, not which elements it reaches.
+/////
+
 - `:is(...)` takes on the specificity of its **most specific** argument.
 - `:where(...)` always contributes **zero** specificity, no matter what's inside it.
 
@@ -166,6 +191,29 @@ Both accept a selector list and match if *any* selector in the list matches, so 
 ```
 
 That makes `:where()` the right tool for reset/base styles you *want* to be trivially overridable by almost anything else, and `:is()` more of a grouping convenience that still affects the specificity math — it isn't "free" the way `:where()` is.
+/////because--->
+It means: since :where() adds zero specificity no matter what's inside it, anything you style with :where() is easy for later, simpler CSS to override — which is exactly what you want for reset/base styles.
+
+A "reset" is generic starter CSS meant to be a starting point, not the final word — you expect your actual component styles to override it everywhere. If you write your reset using :where(), that guarantee is built in automatically:
+
+css
+:where(ul, ol) { list-style: none; margin: 0; padding: 0; }
+
+This has zero specificity — same weight as writing nothing at all in front of ul, ol. So later, even a plain single class can beat it without a fight:
+
+css
+.my-list { list-style: disc; }   /* (0,0,1,0) — beats the :where() reset easily */
+
+Now compare what happens if you'd used :is() instead:
+
+css
+:is(ul, ol) { list-style: none; margin: 0; padding: 0; }
+
+This picks up real specificity from its matched selector (ul/ol, an element selector) — small, but not zero. It's not usually a big problem here since element selectors are weak anyway, but the point stands: :is() still adds something to fight against, while :where() deliberately adds nothing.
+
+So the rule of thumb: use :where() for anything you want to be a "quiet floor" — resets, base typography, defaults from a library — that any component style should be able to casually override. Use :is() when grouping selectors for convenience but you're fine with (or want) the extra specificity weight it carries.
+////
+
 
 **Q3: How do Angular's `ViewEncapsulation.Emulated` attribute selectors affect specificity math in practice?**
 
