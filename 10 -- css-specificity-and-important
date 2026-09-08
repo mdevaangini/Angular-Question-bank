@@ -76,6 +76,42 @@ Treating specificity as one summed number (saying "10 classes beat 1 ID" — fal
 
 ## 9. Interview Follow-up Questions
 
+### Before Q1: what `@layer` actually is, in plain terms
+
+`@layer` ("CSS Cascade Layers") is a way to group your CSS rules into named buckets, and then explicitly say which bucket should win when two buckets disagree — regardless of how the individual selectors inside them compare.
+
+Before `@layer` existed, there were only two ways to decide which rule wins: specificity (ID beats class beats element), and, as a last resort, source order (whichever rule was written later wins if specificity ties). So if a CSS reset, a component library's styles, and your own app styles all touched the same element, the winner depended entirely on accidents of selector complexity and file-loading order — exactly the kind of thing behind confusing "why isn't my style applying" bugs. `@layer` gives you a second, more direct way to decide: declare the buckets in the priority order you want, and the browser respects that order first, before it even looks at specificity.
+
+```css
+/* Declare the buckets and their priority order, once, up front.
+   Later in this list = wins more. */
+@layer reset, base, components, utilities;
+
+@layer reset {
+  /* your CSS reset - lowest priority, meant to be overridden by everything */
+  * { margin: 0; padding: 0; }
+}
+
+@layer base {
+  /* your general site-wide styles */
+  body { font-family: sans-serif; }
+}
+
+@layer components {
+  /* your actual component styles - buttons, cards, etc. */
+  .button { padding: 8px 16px; }
+}
+
+@layer utilities {
+  /* small helper classes meant to always win, like Tailwind-style utilities */
+  .hidden { display: none; }
+}
+```
+
+Think of it like folders stacked on a desk, where you've decided ahead of time "whatever's in the top folder wins." It doesn't matter if a sheet of paper in the bottom folder has more writing on it (more "specific") — if it's in the bottom folder, it loses to anything in a folder above it. Once that clicks, Q1 below is simple: the browser checks *which folder a rule is in* first, and only compares selector specificity when two rules are competing *inside the same folder*.
+
+`@layer` is a relatively recent addition to CSS, but not brand new: it shipped in Chrome 99, Firefox 97, and Safari 15.4, all within a few weeks of each other in March 2022. It's been safe to use in production for a few years now, no polyfill needed — plenty of real codebases, especially ones with design systems or component libraries, use it today to get predictable override behavior without a specificity arms race.
+
 **Q1: How does the CSS cascade layer (`@layer`) interact with specificity — does it override it?**
 
 Not exactly "override" — it's checked *before* specificity, so it usually decides the winner before specificity ever gets a say. The full cascade order (ignoring `!important` for a moment) is: origin → **layer order** → specificity → source order. Layers are compared first. That means a `#id` selector sitting in an earlier-declared layer loses to a plain `.class` selector in a later-declared layer, full stop — specificity is never even consulted, because the layer comparison already picked a winner.
