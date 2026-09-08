@@ -13,6 +13,19 @@ Without this, the naive version — call the API directly from a `(keyup)`/`valu
 - **No natural way to disable submit.** If the check is just a side-effect subscription, you need a separate manually-managed `isChecking` boolean to gate the submit button — easy to forget to reset on error, easy to get out of sync with the actual form validity.
 
 Angular's Reactive Forms already have a first-class concept for "this control has an in-progress async check": `AsyncValidatorFn` and the `PENDING` status. Using it means the debounce, the cancellation-of-stale-checks, and the submit-button-gating all come from the same mechanism instead of three separately-hand-rolled pieces of state.
+////NOTE:
+Think of asyncValidators: [usernameAvailableValidator(this.api)] as handing Angular a function and saying: "run this every time the value changes, and however long it takes, track that for me." That one line is what gives you all three things for free.
+
+1. Debounce — the function itself starts with timer(400) before doing anything. So every time you type, Angular calls the function, but the function just... waits 400ms before touching the network. That's the entire debounce — no Subject, no debounceTime operator, just a delay inside the function you handed over.
+
+2. Cancelling stale checks — this part isn't something you wrote at all. It's a rule Angular follows automatically: "if this control's value changes again while its async validator is still running, throw away the old run and start a fresh one." So if you type "j", "jo", "joh" fast, Angular starts three validator runs, but cancels the first two the instant a newer keystroke arrives — only the last one (for "joh", after you pause) ever gets to finish and report back. You get "only the latest matters" behavior without asking for it.
+
+3. Submit-button gating — while step 1's function is sitting inside timer(400) or waiting on the API, Angular marks the control's status as 'PENDING'. That's just a label Angular maintains on the control the whole time your function hasn't resolved yet. So submitDisabled = form.invalid || status === 'PENDING' isn't a flag you set and clear — it's just asking Angular "is anything still running?"
+
+ALso The actual cancellation of a stale keystroke's check happens one level up, outside this function entirely: every time the control's value changes, Angular calls usernameAvailableValidator(...) again, which creates a brand-new timer(400).pipe(...) observable from scratch. Angular then unsubscribes from whatever the previous call's observable was, before subscribing to the new one. That unsubscribe is what kills an in-flight timer or in-flight checkAvailability call from an earlier keystroke — it's Angular tearing down the whole previous observable, not switchMap reacting to a new emission on the same one.
+The one-sentence version: you write one function that waits, then checks, then returns pass/fail — and by registering it as an async validator instead of calling it yourself, you get Angular's built-in bookkeeping (pending status, auto-cancellation) attached to it automatically. Three behaviors, one function, because the "in-progress" tracking was never something you had to build — it's a side effect of using the async validator slot instead of a plain method call.
+////////
+
 
 ## 3. How does it work?
 
