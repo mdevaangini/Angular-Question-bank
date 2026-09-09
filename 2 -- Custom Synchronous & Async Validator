@@ -1,0 +1,332 @@
+# Custom Synchronous & Async Validators, and How Angular Handles the PENDING State
+
+## 1. What is it?
+
+Angular Reactive Forms let you plug in your own validation logic beyond the built-in `Validators.required`, `Validators.minLength`, etc.
+
+There are two kinds of custom validators:
+
+- **Synchronous validator (`ValidatorFn`)** — a plain function that runs immediately and returns either `null` (valid) or a `ValidationErrors` object (invalid). No API calls, no waiting.
+- **Asynchronous validator (`AsyncValidatorFn`)** — a function that returns an `Observable<ValidationErrors | null>` (or a `Promise`), used when validity can only be determined by calling a server (e.g. "is this username already taken?").
+
+While an async validator's Observable is still running, Angular marks the control's `status` as `'PENDING'`. This is the core mechanic interviewers are probing for in this question.
+
+## 2. Why was it introduced?
+
+Built-in validators only cover generic, self-contained checks (required, min/max length, pattern, email format). Real forms need two things built-ins can't do:
+
+- **Cross-field checks** — e.g. "password" and "confirm password" must match. This can't live on a single `FormControl` because it needs to compare two sibling controls; it has to run at the `FormGroup` level. That's why synchronous validators can be attached to groups, not just individual controls.
+- **Checks that depend on the outside world** — e.g. "is this username free?" can only be answered by the server. A synchronous function can't return a `boolean` for something it hasn't received yet, so Angular needed a validator type that returns an Observable/Promise and a form `status` that can represent "still deciding" — hence `AsyncValidatorFn` and the `PENDING` status.
+
+Without this, developers would hand-roll their own loading flags and manually wire them to disable buttons and show spinners — duplicating logic Angular already standardizes.
+
+## 3. How does it work?
+
+### Synchronous validator
+
+A `ValidatorFn` has the signature:
+
+```ts
+(control: AbstractControl) => ValidationErrors | null
+```
+
+- Return `null` → valid.
+- Return an object like `{ someErrorKey: true }` → invalid, and that key shows up in `control.errors`.
+- Runs synchronously, on every value change (or per the control's `updateOn` setting).
+
+For a **cross-field** check, you attach the validator to the parent `FormGroup` instead of a single control — inside it you call `group.get('fieldA')` / `group.get('fieldB')` to read sibling values.
+
+### Async validator
+
+An `AsyncValidatorFn` has the signature:
+
+```ts
+(control: AbstractControl) => Observable<ValidationErrors | null>
+```
+
+Key behaviors Angular guarantees:
+
+1. **Sync validators run first.** Angular only runs async validators if all synchronous validators on that control already pass. (No point calling the server to check a username that's already invalid for being too short.)
+2. **Status flips to `PENDING` synchronously**, the instant the async validator starts — before the Observable/Promise ever emits. You don't need to set this yourself.
+3. **Angular subscribes to the returned Observable** and waits for its first emission to resolve the control back to `VALID` or `INVALID`.
+4. **Angular automatically cancels the previous run** if the control's value changes again before the async validator resolves (it unsubscribes the stale Observable). This is what makes it safe to put a `timer(400)` as the *first* step inside the async validator's own pipe as a self-contained debounce — no external `debounceTime()` on `valueChanges` is needed, because a new keystroke automatically kills the in-flight timer/request.
+5. **`pending` propagates upward.** If a child control is `PENDING`, its parent `FormGroup`/`FormArray` (and the root form) also reports `PENDING`, even though only one child is actually waiting on the server. This is why checking `form.pending` (not just `control.pending`) is the reliable way to gate a submit button.
+
+### The status/pending surface
+
+- `control.status` → `'VALID' | 'INVALID' | 'PENDING' | 'DISABLED'`
+- `control.pending` → shorthand boolean for `status === 'PENDING'`
+- `control.valid` / `control.invalid` → both are `false` while `PENDING` (neither true nor false — genuinely "unknown yet")
+- `control.statusChanges` → an Observable you can subscribe to (or pipe through `toSignal()`) to react to `VALID`/`INVALID`/`PENDING` transitions
+
+This is fundamentally different from a hand-rolled `isLoading` boolean: Angular's `pending` is wired into the *same* validity system used for `valid`/`invalid`, so `[disabled]="form.invalid || form.pending"` correctly blocks submission in exactly one expression, and it automatically aggregates from any number of nested async validators anywhere in the form tree — you don't need to manually AND together loading flags from every field.
+
+## 4. Example
+
+**`passwords-match.validator.ts`** — custom synchronous, cross-field validator:
+
+```ts
+import { AbstractControl, ValidationErrors, ValidatorFn } from '@angular/forms';
+
+// Custom SYNCHRONOUS validator: a cross-field (FormGroup-level) check.
+export function passwordsMatchValidator(passwordKey: string, confirmKey: string): ValidatorFn {
+  return (group: AbstractControl): ValidationErrors | null => {
+    const password = group.get(passwordKey)?.value;
+    const confirm = group.get(confirmKey)?.value;
+
+    if (!password || !confirm) {
+      return null; // let Validators.required handle the empty case on each field
+    }
+
+    return password === confirm ? null : { passwordsMismatch: true };
+  };
+}
+```
+
+**`username-api.service.ts`**:
+
+```ts
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Observable, map } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class UsernameApiService {
+  private http = inject(HttpClient);
+
+  checkAvailability(username: string): Observable<boolean> {
+    return this.http
+      .get<{ available: boolean }>('/api/username-available', { params: { username } })
+      .pipe(map(res => res.available));
+  }
+}
+```
+
+**`username-availability.validator.ts`** — custom asynchronous validator:
+
+```ts
+import { AbstractControl, AsyncValidatorFn, ValidationErrors } from '@angular/forms';
+import { Observable, of, timer } from 'rxjs';
+import { switchMap, map, catchError } from 'rxjs/operators';
+import { UsernameApiService } from './username-api.service';
+
+// Custom ASYNCHRONOUS validator: debounces itself, then calls the API.
+export function usernameAvailabilityValidator(api: UsernameApiService): AsyncValidatorFn {
+  return (control: AbstractControl): Observable<ValidationErrors | null> => {
+    const value = (control.value ?? '').trim();
+
+    if (!value) {
+      return of(null);
+    }
+
+    return timer(400).pipe(
+      switchMap(() => api.checkAvailability(value)),
+      map(isAvailable => (isAvailable ? null : { usernameTaken: true })),
+      catchError(() => of(null)) // fail open on network error
+    );
+  };
+}
+```
+
+**`fake-backend.interceptor.ts`** (demo-only mock backend):
+
+```ts
+import { HttpInterceptorFn, HttpResponse } from '@angular/common/http';
+import { of } from 'rxjs';
+import { delay } from 'rxjs/operators';
+
+const TAKEN_USERNAMES = new Set(['admin', 'root', 'test', 'ada']);
+
+export const fakeBackendInterceptor: HttpInterceptorFn = (req, next) => {
+  if (req.url === '/api/username-available') {
+    const username = (req.params.get('username') || '').toLowerCase();
+    const available = !TAKEN_USERNAMES.has(username);
+    return of(new HttpResponse({ status: 200, body: { available } })).pipe(delay(500));
+  }
+  return next(req);
+};
+```
+
+**`app.component.ts`**:
+
+```ts
+import { Component, OnInit, inject } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormBuilder, FormControl, ReactiveFormsModule, Validators } from '@angular/forms';
+import { passwordsMatchValidator } from './passwords-match.validator';
+import { usernameAvailabilityValidator } from './username-availability.validator';
+import { UsernameApiService } from './username-api.service';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule, ReactiveFormsModule],
+  templateUrl: './app.component.html'
+})
+export class AppComponent implements OnInit {
+  private fb = inject(FormBuilder);
+  private api = inject(UsernameApiService);
+
+  registrationForm = this.fb.group(
+    {
+      username: this.fb.control('', {
+        validators: [Validators.required, Validators.minLength(3)],
+        asyncValidators: [usernameAvailabilityValidator(this.api)],
+        updateOn: 'change'
+      }),
+      password: ['', [Validators.required, Validators.minLength(6)]],
+      confirmPassword: ['', Validators.required]
+    },
+    { validators: passwordsMatchValidator('password', 'confirmPassword') }
+  );
+
+  get username(): FormControl<string> {
+    return this.registrationForm.get('username') as FormControl<string>;
+  }
+
+  ngOnInit(): void {
+    // Seed the form so both the sync cross-field validator and the async
+    // validator's PENDING state are visible immediately, with no interaction needed.
+    this.registrationForm.patchValue({
+      password: 'secret123',
+      confirmPassword: 'different456'
+    });
+    this.username.setValue('newuser');
+  }
+
+  submit(): void {}
+}
+```
+
+**`app.component.html`**:
+
+```html
+<div class="page">
+  <h1>Custom Sync + Async Validators</h1>
+  <p>A cross-field <b>synchronous</b> validator (passwords must match) and a debounced <b>asynchronous</b> validator (username availability), both on one form.</p>
+
+  <form [formGroup]="registrationForm" (ngSubmit)="submit()">
+    <label>
+      Username
+      <input formControlName="username" autocomplete="off" />
+    </label>
+    <div class="status">
+      @if (username.pending) {
+        <span class="checking">Checking availability… (control status: {{ username.status }})</span>
+      } @else if (username.errors?.['required']) {
+        <span class="error">Username is required</span>
+      } @else if (username.errors?.['minlength']) {
+        <span class="error">At least 3 characters</span>
+      } @else if (username.errors?.['usernameTaken']) {
+        <span class="error">Username is taken</span>
+      } @else if (username.valid) {
+        <span class="ok">Username available</span>
+      }
+    </div>
+
+    <label>
+      Password
+      <input formControlName="password" type="password" />
+    </label>
+    <label>
+      Confirm password
+      <input formControlName="confirmPassword" type="password" />
+    </label>
+    @if (registrationForm.errors?.['passwordsMismatch']) {
+      <div class="status error">Passwords do not match</div>
+    }
+
+    <button type="submit" [disabled]="registrationForm.invalid || registrationForm.pending">
+      Create account
+    </button>
+
+    <div class="summary">
+      <div>Form status: <b>{{ registrationForm.status }}</b> (VALID / INVALID / PENDING / DISABLED)</div>
+      <div>Form pending: {{ registrationForm.pending }}</div>
+      <div>Username control status: {{ username.status }}</div>
+    </div>
+  </form>
+</div>
+```
+
+**StackBlitz (forked, live, fully verified — zero interaction needed):**
+https://stackblitz.com/edit/angular-jfhrycj6
+
+## 5. Example Explanation / Execution Flow
+
+1. On load, `ngOnInit()` runs `patchValue({ password: 'secret123', confirmPassword: 'different456' })` — two different values, so the group-level `passwordsMatchValidator` immediately returns `{ passwordsMismatch: true }`. This is synchronous, so the error is visible the instant change detection runs.
+2. `ngOnInit()` then calls `this.username.setValue('newuser')`. Because `'newuser'` passes both `Validators.required` and `Validators.minLength(3)`, Angular proceeds to run the async validator.
+3. The moment the async validator starts, Angular synchronously sets `username.status = 'PENDING'` (and therefore `registrationForm.status` also becomes influenced by it, since a pending child makes the parent pending too — though here the parent ultimately reports `INVALID` once the sync cross-field error is also factored in).
+4. Inside `usernameAvailabilityValidator`, `timer(400)` fires after 400ms, then `switchMap` calls `api.checkAvailability('newuser')`, which hits the `fakeBackendInterceptor` (500ms simulated delay). `'newuser'` is not in the `TAKEN_USERNAMES` set, so it resolves `{ available: true }` → `map` turns that into `null` (no error).
+5. Angular receives the `null` emission, sets `username.status = 'VALID'`, and `username.pending` becomes `false`.
+6. Final rendered state (confirmed via live screenshot, no clicks needed): Username field shows "Username available"; Password/Confirm password show "Passwords do not match"; the submit button is disabled (because `registrationForm.invalid` is `true` from the cross-field error, even though `username` itself is fully `VALID`); and the summary block reads:
+   - `Form status: INVALID`
+   - `Form pending: false`
+   - `Username control status: VALID`
+
+This final trio is the whole point of the demo: it proves a single child control can be fully resolved and `VALID` while the aggregate form is still `INVALID` for an unrelated reason (the group-level sync validator) — the two validator layers are independent and Angular merges them correctly.
+
+## 6. When should we use it?
+
+- **Synchronous custom validator**: any rule that can be evaluated instantly from data already in the form — cross-field comparisons (password confirmation, date-range start ≤ end), conditional requireds (e.g. "state" required only if "country" is US), custom format checks beyond `Validators.pattern`.
+- **Asynchronous custom validator**: any rule that needs to ask an external source — uniqueness checks (username/email availability), server-side business rule checks (e.g. "this coupon code is valid"), anything that requires a network round trip to answer.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- Reuses Angular's existing validity model (`status`, `errors`, `pending`) instead of inventing a parallel state system.
+- Automatic cancellation of stale async checks prevents race conditions (an older, slower response overwriting a newer one) since Angular resubscribes fresh on every value change.
+- `pending` propagates through the form tree automatically, so gating a submit button is a one-line expression regardless of how many async validators exist across however many nested controls.
+- Sync validators are cheap and composable — attach as many as needed per control or per group.
+
+**Disadvantages / things to watch for**
+
+- Async validators only run after sync validators pass, so a genuinely invalid value (e.g. too short) never triggers an unnecessary API call — good for network cost, but easy to forget when debugging "why isn't my async validator running."
+- If the async validator's Observable never completes or errors (e.g. a dropped request with no `catchError`), the control gets stuck in `PENDING` forever, permanently blocking submission — always guard with `catchError` and consider a timeout.
+- Overusing `updateOn: 'change'` with async validators that don't self-debounce can hammer the backend; the `timer()`-inside-the-validator trick (rather than `debounceTime` on `valueChanges`) is the idiomatic Angular way to avoid this.
+
+## 8. Common Interview Traps
+
+- Saying async validators run in parallel with sync validators — they don't; sync must fully pass first.
+- Forgetting that `pending` is `false` for BOTH `valid` and `invalid` — it's a third, distinct state, not a boolean flag layered on top.
+- Assuming you need `debounceTime()` on `valueChanges` to debounce an async validator — putting `timer(ms)` as the first operator inside the validator itself is more idiomatic and leverages Angular's automatic cancel-on-restart behavior.
+- Forgetting `catchError` in the async validator pipe — an unhandled error observable can leave the control permanently `PENDING` or throw.
+- Confusing control-level `pending` with form-level `pending` — checking only `username.pending` to disable a submit button misses async validators on other fields; always check the root form's `pending`.
+- Not realizing a `FormGroup`-level validator (like `passwordsMatchValidator`) attaches its error to the **group's** `errors`, not to either child control's `errors` — so `password.errors` and `confirmPassword.errors` stay empty; you must read `registrationForm.errors?.['passwordsMismatch']`.
+
+## 9. Interview Follow-up Questions
+
+**Q: What happens if the user types again while an async validator is still pending?**
+A: Angular unsubscribes the in-flight Observable and starts a fresh one for the new value — the stale request's eventual result is discarded, avoiding race conditions.
+
+**Q: Can a single control have multiple async validators?**
+A: Yes — pass an array to `asyncValidators`; Angular runs them and the control stays `PENDING` until all have resolved, merging any errors together.
+
+**Q: How would you show a spinner only for the field that's checking, not the whole form?**
+A: Bind to that specific control's `pending` (e.g. `username.pending`) in the template rather than the form's aggregate `pending`.
+
+**Q: Why put `timer()` inside the validator instead of debouncing `valueChanges` externally?**
+A: Because Angular's async validator machinery already re-invokes and cancels the validator function on every value change — an internal `timer()` piggybacks on that same cancellation, so no separate debounce/subscription management is needed.
+
+**Q: How do you unit test an async validator?**
+A: Call it directly with a mock/stub control (or a real `FormControl`), subscribe to the returned Observable, and use `fakeAsync`/`tick()` (or marble testing) to advance past the `timer()`/HTTP call and assert the emitted `ValidationErrors | null`.
+
+## 10. Interview-Ready Answer
+
+"A synchronous validator is just a function that takes a control and immediately returns `null` or an errors object — I use these for things like cross-field checks, for example comparing password and confirm-password, which I attach to the `FormGroup` rather than a single control so it can read both sibling values. An async validator has the same shape but returns an Observable of `ValidationErrors | null`, and I use it for anything that needs a server round trip, like checking username availability. The moment Angular starts running an async validator, it flips that control's `status` to `PENDING` synchronously — before the Observable ever emits — and that `pending` flag propagates up to any parent `FormGroup`, so I can just check `form.pending` to disable a submit button, regardless of how many async validators are buried in the form. A nice side effect is that Angular automatically cancels a still-running async validator if the value changes again, so I put a small `timer()` as the first step inside the validator itself instead of debouncing `valueChanges` separately — it gets debouncing and race-condition safety for free. The main thing to watch for is handling errors inside the validator with `catchError`, otherwise a failed request can leave the control stuck in `PENDING` forever."
+
+## 11. Quick Revision
+
+- **What**: `ValidatorFn` (sync, returns `null`/errors immediately) and `AsyncValidatorFn` (returns `Observable<null | errors>`) for custom validation beyond Angular's built-ins.
+- **Why**: Built-ins can't do cross-field checks or checks requiring a server call; Angular needed a `PENDING` status to represent "still waiting on validation."
+- **Problem solved**: Standardizes cross-field rules and async/server-backed rules inside the same validity model, instead of hand-rolled loading flags.
+- **How**: Sync validators run first; only if they pass does Angular run async validators, immediately setting `status = 'PENDING'`, subscribing to the returned Observable, and resolving to `VALID`/`INVALID` on its first emission — cancelling any prior in-flight run automatically on a new value.
+- **Use when**: Cross-field logic → sync `FormGroup`-level validator. Server-dependent checks (uniqueness, etc.) → async validator.
+- **Important**: `pending` is a third state, distinct from both `valid` and `invalid`; it propagates from child controls up to parent groups/forms.
+- **Remember**: Debounce inside the async validator with `timer()`, not externally with `debounceTime` — Angular's auto-cancel-on-restart makes that sufficient.
+
+## 12. Memory Trick
+
+**"SYNC = now, ASYNC = PENDING till proven otherwise."**
+Sync validators answer instantly. Async validators put the control in limbo (`PENDING`) the second they start — not when the server actually responds — and only clear that limbo when the Observable emits.
