@@ -1,0 +1,103 @@
+live eg -> https://claude.ai/public/artifacts/dd49d3ac-e7c0-477c-b065-7b7ad3fb8d14
+
+
+const { Subject, BehaviorSubject, ReplaySubject, AsyncSubject } = rxjs;
+
+function make(kind){
+  if(kind==='subject')  return new Subject();
+  if(kind==='behavior') return new BehaviorSubject('init');
+  if(kind==='replay')   return new ReplaySubject(2);   // buffer size = 2
+  if(kind==='async')    return new AsyncSubject();
+}
+
+let subject = make(kind);
+
+// Sub A subscribes immediately
+subject.subscribe({
+  next: v => console.log('A got:', v),
+  complete: () => console.log('A: complete')
+});
+
+subject.next('v1');
+subject.next('v2');
+
+// Sub B subscribes LATE — this is the whole point of the demo
+subject.subscribe({
+  next: v => console.log('B got:', v),
+  complete: () => console.log('B: complete')
+});
+
+subject.complete(); // only matters for AsyncSubject
+
+
+
+
+--------------------------------  
+
+Subject = a live announcement over a loudspeaker
+If you're not standing there when it's announced, you missed it. Walk in a minute late? Too bad, no replay.
+
+"Free pizza in the lobby!" shouted once. If you were in the bathroom, you don't get pizza.
+
+BehaviorSubject = a whiteboard with the current status written on it
+Anyone who walks up to the board — now or later — immediately sees whatever is currently written, even if it was written 10 minutes ago.
+
+Board says "Office is: OPEN". Doesn't matter when you look at it, you always see the current status.
+
+ReplaySubject = a group chat
+If you join late, you can scroll up and see the last few messages that were sent before you joined.
+
+You join the WhatsApp group late → you see the last 2-3 messages that were sent before you got added.
+
+AsyncSubject = a sealed envelope opened only at the end
+Nothing happens the whole time — until the event is over. Then everyone (early or late) finds out only the final result, once.
+
+Exam results: doesn't matter when you check the portal during the exam — you get told nothing until it's officially over, and then you just see the final score.
+
+That's really the whole concept:
+
+Subject → no memory
+BehaviorSubject → always shows current value
+ReplaySubject → shows a few past values
+AsyncSubject → shows nothing until it's done, then shows only the final one
+
+
+----------------------------------------- USAGE
+
+Subject — "fire and forget" events
+
+Use when you don't care about history, only about things happening right now while someone is listening.
+
+Click/event bus between unrelated components (e.g. a global "logout button clicked" event).
+Form validation triggers — "user just clicked Submit, run validation now."
+WebSocket message stream where you only care about new incoming messages, not a replay of old ones.
+Modal close/open signals — "close all modals" broadcast.
+Custom event emitters replacing @Output() when you need something more flexible than a single component's EventEmitter.
+BehaviorSubject — "current state that things depend on"
+
+Use for any piece of state where a late-arriving component still needs to know the current value. This is the most common one in real apps.
+
+Logged-in user / auth state in an AuthService — every component that mounts, whenever, should know who's logged in right now.
+Theme (dark/light mode) — a component mounted 5 minutes into the session still needs to know the current theme immediately.
+Selected language/locale for i18n.
+Loading spinner state (isLoading$) — any component checking "are we currently loading" needs the current answer, not just future changes.
+Shopping cart contents — cart icon in the header needs the current cart count the moment it renders, regardless of when it mounted.
+Form field's live value shared across sibling components (e.g. a wizard where step 3 needs step 1's current input).
+ReplaySubject — "catch me up on recent history"
+
+Use when a late subscriber needs to see the last few things that happened, not just the current single value.
+
+Recent notifications/toast history — a notification panel opened mid-session should show the last 5 notifications that already fired.
+Chat message history buffer — when a chat component mounts, show the last 20 messages that arrived before it existed (cached locally, before hitting the backend).
+Undo/redo action log — keep the last N actions so a newly opened "recent actions" panel can show them.
+Analytics/logging buffer — buffer the last N logs so a debug panel opened later can see recent activity.
+Route/navigation history — "last 3 pages visited" shown in a breadcrumb or back-button preview, available immediately even if the breadcrumb component just mounted.
+AsyncSubject — "give me only the final result, once done"
+
+Use when you only care about a terminal result of a process, not intermediate updates — closer to how a Promise behaves.
+
+HTTP request wrapped manually as a Subject (rare now since HttpClient returns Observables that already behave like this) — but conceptually: "give me the final parsed response, not partial chunks."
+File upload completion — not progress (that should be a BehaviorSubject or plain Subject), but "upload is done, here's the final URL" signal, fired once at the very end.
+Multi-step wizard/form final submission result — you don't care about every intermediate step's state, just "here's the final combined payload once the whole flow finishes."
+Caching the result of an expensive one-time computation — compute once, .complete(), and every future subscriber (even ones that ask minutes later) gets that one final cached result instantly.
+App bootstrap/initialization complete signal — "app finished initializing, here's the final config" — nothing matters until that's truly done.
