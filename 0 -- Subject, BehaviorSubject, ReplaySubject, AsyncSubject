@@ -1,33 +1,134 @@
 live eg -> https://claude.ai/public/artifacts/dd49d3ac-e7c0-477c-b065-7b7ad3fb8d14
 
+TS-----
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { Subject, BehaviorSubject, ReplaySubject, AsyncSubject, Subscription } from 'rxjs';
 
-const { Subject, BehaviorSubject, ReplaySubject, AsyncSubject } = rxjs;
+type Kind = 'subject' | 'behavior' | 'replay' | 'async';
 
-function make(kind){
-  if(kind==='subject')  return new Subject();
-  if(kind==='behavior') return new BehaviorSubject('init');
-  if(kind==='replay')   return new ReplaySubject(2);   // buffer size = 2
-  if(kind==='async')    return new AsyncSubject();
+interface Card {
+  kind: Kind;
+  title: string;
+  desc: string;
+  subject: any;
+  counter: number;
+  completed: boolean;
+  subBActive: boolean;
+  subASub?: Subscription;
+  subBSub?: Subscription;
+  logA: string[];
+  logB: string[];
+  current: string;
 }
 
-let subject = make(kind);
+function makeSubject(kind: Kind) {
+  switch (kind) {
+    case 'subject': return new Subject<string>();
+    case 'behavior': return new BehaviorSubject<string>('init');
+    case 'replay': return new ReplaySubject<string>(2);
+    case 'async': return new AsyncSubject<string>();
+  }
+}
 
-// Sub A subscribes immediately
-subject.subscribe({
-  next: v => console.log('A got:', v),
-  complete: () => console.log('A: complete')
-});
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule],
+  templateUrl: './app.component.html',
+})
+export class AppComponent {
+  cards: Card[] = [
+    { kind: 'subject', title: 'Subject', desc: 'No memory. Late subscribers get nothing that already happened.', subject: null, counter: 0, completed: false, subBActive: false, logA: [], logB: [], current: 'n/a' },
+    { kind: 'behavior', title: 'BehaviorSubject', desc: 'Always has a current value. New subscribers get it immediately.', subject: null, counter: 0, completed: false, subBActive: false, logA: [], logB: [], current: 'init' },
+    { kind: 'replay', title: 'ReplaySubject(2)', desc: 'Replays the last 2 values to every new subscriber.', subject: null, counter: 0, completed: false, subBActive: false, logA: [], logB: [], current: '—' },
+    { kind: 'async', title: 'AsyncSubject', desc: 'Emits nothing until complete() — then only the final value.', subject: null, counter: 0, completed: false, subBActive: false, logA: [], logB: [], current: 'not completed yet' },
+  ];
 
-subject.next('v1');
-subject.next('v2');
+  constructor() {
+    this.cards.forEach(c => this.initCard(c));
+  }
 
-// Sub B subscribes LATE — this is the whole point of the demo
-subject.subscribe({
-  next: v => console.log('B got:', v),
-  complete: () => console.log('B: complete')
-});
+  private initCard(c: Card) {
+    c.subject = makeSubject(c.kind);
+    c.subASub = c.subject.subscribe({
+      next: (v: string) => c.logA.push(this.stamp() + '  next → ' + v),
+      complete: () => c.logA.push(this.stamp() + '  complete()'),
+    });
+  }
 
-subject.complete(); // only matters for AsyncSubject
+  private stamp(): string {
+    const d = new Date();
+    return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+  }
+
+  emit(c: Card) {
+    if (c.completed) return;
+    c.counter++;
+    c.subject.next('v' + c.counter);
+    this.updateCurrent(c);
+  }
+
+  lateJoin(c: Card) {
+    if (c.subBActive) return;
+    c.subBActive = true;
+    c.logB.push(this.stamp() + '  subscribing now…');
+    c.subBSub = c.subject.subscribe({
+      next: (v: string) => c.logB.push(this.stamp() + '  next → ' + v),
+      complete: () => c.logB.push(this.stamp() + '  complete()'),
+    });
+  }
+
+  complete(c: Card) {
+    if (c.completed) return;
+    c.completed = true;
+    c.subject.complete();
+    this.updateCurrent(c);
+  }
+
+  reset(c: Card) {
+    c.subASub?.unsubscribe();
+    c.subBSub?.unsubscribe();
+    c.counter = 0;
+    c.completed = false;
+    c.subBActive = false;
+    c.logA = [];
+    c.logB = [];
+    this.initCard(c);
+    this.updateCurrent(c);
+  }
+
+  private updateCurrent(c: Card) {
+    if (c.kind === 'behavior') c.current = c.subject.value;
+    else if (c.kind === 'replay') c.current = c.counter === 0 ? '—' : `last ${Math.min(c.counter, 2)} of ${c.counter} emitted`;
+    else if (c.kind === 'async') c.current = c.completed ? `completed → v${c.counter}` : 'not completed yet';
+  }
+}
+
+app.component.html
+
+html
+<div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:20px;">
+  <div *ngFor="let c of cards" style="border:1px solid #ccc;border-radius:8px;padding:16px;">
+    <h3>{{ c.title }}</h3>
+    <p style="font-size:13px;color:#666;">{{ c.desc }}</p>
+    <button (click)="emit(c)">Emit next value</button>
+    <button (click)="lateJoin(c)">Late-join Sub B</button>
+    <button (click)="complete(c)">Complete</button>
+    <button (click)="reset(c)">Reset</button>
+    <p><b>current:</b> {{ c.current }}</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+      <div>
+        <div style="font-size:11px;color:#888;">SUB A (early)</div>
+        <div *ngFor="let line of c.logA" style="font-family:monospace;font-size:12px;">{{ line }}</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:#888;">SUB B (late)</div>
+        <div *ngFor="let line of c.logB" style="font-family:monospace;font-size:12px;">{{ line }}</div>
+      </div>
+    </div>
+  </div>
+</div>
 
 
 
