@@ -1,4 +1,18 @@
 # How would you reduce the JavaScript bundle size?
+The simplest one: just run a production build.
+
+ng build --configuration production
+
+The Angular CLI prints a bundle size table straight to the terminal after the build finishes — initial chunk names, raw size, and estimated transfer (gzipped) size. If you've set size budgets in angular.json (a budgets array with maximumWarning/maximumError thresholds), this same command will warn or fail the build if a bundle crosses them — that's the version worth mentioning in an interview, since it shows you enforce this in CI rather than checking manually.
+
+If you want to see why a bundle is big, not just how big, go one step further:
+
+ng build --stats-json
+npx webpack-bundle-analyzer dist/<project-name>/stats.json
+
+That opens an interactive treemap in the browser showing exactly which packages are taking up space — this is how you'd catch something like an unshaken lodash or moment.js import bloating the bundle. source-map-explorer is the other common tool for the same job, working off real source maps instead of the webpack stats file.
+
+
 
 ## 1. What is it?
 
