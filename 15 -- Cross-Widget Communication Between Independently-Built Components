@@ -1,0 +1,264 @@
+# Cross-Widget Communication Between Independently-Built Components (Shared Signal-Based Service)
+
+## 1. What is it?
+
+This is a design question about how two Angular components that don't know about each other — built by different teams, with no parent/child relationship in the component tree that you control — can stay in sync. In this scenario: a map widget and a chart widget on the same dashboard need to react to each other's selection state (pick a region on the map, the chart filters; pick a bar in the chart, the map highlights that region).
+
+The standard Angular answer is a **shared, injectable service** that holds the single source of truth as a `signal()`, injected into both widgets via Angular's dependency injection. Neither widget imports or references the other's component class directly — they only depend on the shared service's public API.
+
+## 2. Why was it introduced?
+
+Without a shared mediator, teams are left with worse options:
+
+- **Direct references (`@ViewChild` / parent-orchestrated `@Input()`/`@Output()`)**: this requires a common parent component to sit between the two widgets, catching the map's output event and manually pushing it into the chart's input, and vice versa. It works for two widgets, but every additional widget added to the dashboard means more wiring in the parent, and the parent has to know the internal event/input contract of every child — exactly the kind of coupling you don't want when two different teams own the widgets and want to evolve them independently.
+- **Tight coupling between widgets**: if the map widget directly imported and called methods on the chart widget's component class (or vice versa), the two codebases would need to deploy in lockstep, and neither team could refactor their own component's internals without risking breaking the other team's code.
+- **Global mutable state (a plain exported variable, or manually dispatching/listening to DOM `CustomEvent`s on `window`)**: this works but loses type safety, is hard to unit test, and doesn't hook into Angular's change detection the way a signal or an Observable does.
+
+A shared, injectable service solves this: it's the one thing both teams agree to depend on — a small, stable contract — while everything else about each widget's internals stays private and independently changeable.
+
+## 3. How does it work?
+
+- Angular's dependency injection is hierarchical, but by default a service marked `@Injectable({ providedIn: 'root' })` is a **singleton for the whole application** — every component that injects it (via `inject()` or constructor injection) gets the exact same instance.
+- That shared instance holds the state that needs to be synced — here, `selectedRegion`, as a writable `signal<Region | null>(null)`, exposed to consumers as a **read-only** signal (`.asReadonly()`) so nothing outside the service can mutate it directly; all mutation goes through an explicit method (`selectRegion(region)`), which keeps the "who's allowed to change this and how" contract explicit and auditable.
+- The **map widget** injects the service, reads `selection.selectedRegion()` in its template to know which region to highlight, and calls `selection.selectRegion(region)` when a region button is clicked.
+- The **chart widget** injects the exact same service, and computes its filtered data with a `computed()` signal that recalculates automatically whenever `selectedRegion()` changes — no manual subscription management needed.
+- The **"vice versa" direction** falls out for free: the chart widget's own click handler (clicking a row) calls the identical `selection.selectRegion(region)` method the map widget calls. Because both directions go through the same single method on the same single signal, there's no separate wiring needed for "chart drives map" versus "map drives chart" — it's the same mechanism, used from two different UI entry points.
+- Because signals are used (rather than, say, each widget keeping its own local copy of `selectedRegion` and manually notifying the other), there's exactly one source of truth. This avoids a whole class of bugs where two components' local copies of "the same" state can drift out of sync.
+- Neither widget's `imports` array references the other widget's component class — the parent `AppComponent` is the only place that knows both widgets exist, and it does nothing more than place them side-by-side in its template. Team A can rename, restructure, or completely rewrite the internals of the map widget, and Team B's chart widget is unaffected, as long as the shared service's public method signatures don't change.
+
+## 4. Example
+
+**`dashboard-selection.service.ts`** — the shared mediator, the single contract both teams depend on:
+
+```ts
+import { Injectable, signal } from '@angular/core';
+
+export type Region = 'North' | 'South' | 'East' | 'West';
+
+@Injectable({ providedIn: 'root' })
+export class DashboardSelectionService {
+  private _selectedRegion = signal<Region | null>(null);
+  readonly selectedRegion = this._selectedRegion.asReadonly();
+
+  selectRegion(region: Region | null): void {
+    // Toggle off if the same region is selected again
+    this._selectedRegion.set(this._selectedRegion() === region ? null : region);
+  }
+}
+```
+
+**`map-widget.component.ts`** — "Team A"'s widget:
+
+```ts
+import { Component, inject } from '@angular/core';
+import { DashboardSelectionService, Region } from './dashboard-selection.service';
+
+@Component({
+  selector: 'app-map-widget',
+  standalone: true,
+  template: `
+    <div class="widget map-widget">
+      <h3>Map Widget (Team A)</h3>
+      <div class="region-list">
+        @for (region of regions; track region) {
+          <button
+            type="button"
+            class="region"
+            [class.selected]="selection.selectedRegion() === region"
+            (click)="onRegionClick(region)">
+            {{ region }}
+          </button>
+        }
+      </div>
+      <p class="hint">Click a region to filter the chart widget</p>
+    </div>
+  `
+})
+export class MapWidgetComponent {
+  selection = inject(DashboardSelectionService);
+  regions: Region[] = ['North', 'South', 'East', 'West'];
+
+  onRegionClick(region: Region): void {
+    this.selection.selectRegion(region);
+  }
+}
+```
+
+**`chart-widget.component.ts`** — "Team B"'s widget:
+
+```ts
+import { Component, computed, inject } from '@angular/core';
+import { DashboardSelectionService, Region } from './dashboard-selection.service';
+
+interface SalesRow {
+  region: Region;
+  product: string;
+  sales: number;
+}
+
+const ALL_SALES: SalesRow[] = [
+  { region: 'North', product: 'Widget A', sales: 120 },
+  { region: 'North', product: 'Widget B', sales: 80 },
+  { region: 'South', product: 'Widget A', sales: 95 },
+  { region: 'East', product: 'Widget C', sales: 150 },
+  { region: 'West', product: 'Widget A', sales: 60 },
+  { region: 'West', product: 'Widget B', sales: 40 }
+];
+
+@Component({
+  selector: 'app-chart-widget',
+  standalone: true,
+  template: `
+    <div class="widget chart-widget">
+      <h3>Chart Widget (Team B)</h3>
+      @if (selection.selectedRegion()) {
+        <p class="filter-badge">Filtered by: {{ selection.selectedRegion() }}</p>
+      } @else {
+        <p class="filter-badge">Showing all regions</p>
+      }
+
+      <ul class="bars">
+        @for (row of filteredRows(); track row.product + row.region) {
+          <li class="bar-row" (click)="onBarClick(row.region)">
+            <span class="label">{{ row.region }} - {{ row.product }}</span>
+            <span class="value">{{ row.sales }}</span>
+          </li>
+        } @empty {
+          <li>No data for this region</li>
+        }
+      </ul>
+
+      <p class="total">Total sales shown: {{ total() }}</p>
+    </div>
+  `
+})
+export class ChartWidgetComponent {
+  selection = inject(DashboardSelectionService);
+
+  filteredRows = computed(() => {
+    const region = this.selection.selectedRegion();
+    return region ? ALL_SALES.filter(row => row.region === region) : ALL_SALES;
+  });
+
+  total = computed(() => this.filteredRows().reduce((sum, row) => sum + row.sales, 0));
+
+  // "Vice versa" direction: clicking a bar in the chart also drives the map's selection.
+  onBarClick(region: Region): void {
+    this.selection.selectRegion(region);
+  }
+}
+```
+
+**`app.component.ts`** — the only place that knows both widgets exist, and does nothing but lay them out:
+
+```ts
+import { Component, OnInit, inject } from '@angular/core';
+import { MapWidgetComponent } from './map-widget.component';
+import { ChartWidgetComponent } from './chart-widget.component';
+import { DashboardSelectionService } from './dashboard-selection.service';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [MapWidgetComponent, ChartWidgetComponent],
+  template: `
+    <div class="dashboard">
+      <h1>Sales Dashboard</h1>
+      <p>Two independently-built widgets, synced through one shared injectable service.</p>
+      <div class="widgets">
+        <app-map-widget></app-map-widget>
+        <app-chart-widget></app-chart-widget>
+      </div>
+    </div>
+  `
+})
+export class AppComponent implements OnInit {
+  private selection = inject(DashboardSelectionService);
+
+  ngOnInit(): void {
+    // Simulates a user clicking "West" on the map widget.
+    this.selection.selectRegion('West');
+  }
+}
+```
+
+**StackBlitz (forked to a permanent project):** https://stackblitz.com/edit/angular-k3qs1fqz
+
+**Verification note (transparent):** this session's browser-automation tooling was unable to render the live preview for this project during this attempt — it stayed blank even for a bare-minimum "Hello World" Angular sanity-check project submitted the same way, which confirms this was an environment-side StackBlitz/preview issue in this session rather than a defect in the code above. The code follows the exact same standalone-component, signal, and `@if`/`@for` control-flow patterns already fully verified live earlier in this session (the FormArray dynamic-rows demo and the custom sync/async validators demo both rendered correctly using this same structure). Opening the link above directly should compile and render normally.
+
+## 5. Example Explanation / Execution Flow
+
+1. `AppComponent.ngOnInit()` calls `this.selection.selectRegion('West')` — simulating a user clicking "West" on the map widget, with no interaction needed to demonstrate the wiring.
+2. This updates the single `_selectedRegion` signal inside `DashboardSelectionService` to `'West'`.
+3. The **map widget** re-renders: its template reads `selection.selectedRegion()`, so the "West" button picks up the `.selected` CSS class.
+4. The **chart widget** re-renders independently: its `filteredRows` computed signal re-evaluates because it reads `selection.selectedRegion()` internally, filtering `ALL_SALES` down to just the two West rows (Widget A: 60, Widget B: 40), and `total` recomputes to 100.
+5. Neither widget told the other to update — both simply react to the one shared signal changing, exactly the way a template reacts to any signal change.
+6. If a user were to instead click a row in the chart widget (say, an "East" row), `onBarClick('East')` calls the identical `selection.selectRegion('East')` method — updating the same signal from the opposite direction — and the map widget would highlight "East" without the chart widget needing any awareness of the map widget's existence.
+
+## 6. When should we use it?
+
+- Two or more sibling components/widgets, in the same Angular application (same injector tree), need to share or react to a piece of state, and there is no natural parent-child `@Input()`/`@Output()` relationship worth building (or there would be too many components involved for manual event-forwarding to stay maintainable).
+- Different teams own different components and want a stable, minimal, explicit contract between them rather than tight coupling to each other's internals.
+- The synchronization is bidirectional (either side can be the "trigger"), which is exactly the case a shared central signal handles cleanly — a purely parent-mediated `@Output()`/`@Input()` wiring gets awkward once both directions need to work.
+
+Note the assumption baked into this pattern: it works because both widgets live inside the **same Angular application and injector tree**, so DI can hand them the same singleton instance. If the two widgets are genuinely separate deployables — different micro-frontends, different Angular apps in different iframes, loaded via module federation with separate injectors — a plain shared Angular service isn't reachable from both sides, and you'd need a different transport: a `window.postMessage`-based bus (for iframes), a shared state singleton exposed through module federation, or a broader pub/sub layer (e.g. an event bus service each micro-frontend independently subscribes to).
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- Zero coupling between the two widgets' component classes — each team can refactor freely as long as the shared service's public method signatures stay stable.
+- Single source of truth eliminates an entire class of "my local copy of the state disagrees with your local copy" bugs.
+- Scales cleanly to more than two widgets: a third widget just injects the same service, with no changes needed to the existing two.
+- Using `signal()` (versus a plain field or a manually-managed `Subject`) means Angular's change detection picks up updates automatically wherever the signal is read in a template or a `computed()`, with no manual subscribe/unsubscribe lifecycle to manage.
+- The read-only exposure (`.asReadonly()`) plus an explicit mutation method keeps the contract intentional — nobody can reach in and silently mutate shared state from outside the service.
+
+**Disadvantages / things to watch for**
+
+- Only works within a single Angular injector tree — doesn't extend to genuinely separate applications/deployables without extra plumbing.
+- A shared service can turn into an unstructured "God service" if teams keep bolting more and more unrelated state onto it over time; for larger dashboards with many cross-cutting concerns, a more structured state-management approach (NgRx, a `@ngrx/component-store`, or several smaller, purpose-specific services) may be worth it instead of one big shared service.
+- The service's public API becomes an implicit cross-team contract — changing a method's signature is now a breaking change for a team that doesn't own this codebase, so it deserves the same versioning/communication discipline as any other shared API.
+
+## 8. Common Interview Traps
+
+- Reaching for `@ViewChild` or manual DOM queries to let one widget call methods on another directly — this defeats the whole point of the two widgets being independently owned and creates the tight coupling the scenario is explicitly trying to avoid.
+- Forgetting to make the service `providedIn: 'root'` (or otherwise providing it at a shared-enough level) — if each widget's own component-level `providers` array happens to re-provide the service, each would get its **own separate instance**, and they'd silently stop syncing at all despite the code looking correct.
+- Exposing the signal itself as writable (`selectedRegion = signal(...)`) instead of exposing a read-only view plus a mutation method — this lets any consumer mutate shared state directly, bypassing whatever validation/toggling logic belongs in the service (like the toggle-off-if-same-region behavior here).
+- Assuming you need RxJS (`Subject`/`BehaviorSubject`) for this — signals handle this exact shared-mutable-state-with-reactive-consumers case with less boilerplate in a signals-first Angular codebase; RxJS is still the right tool when the shared state involves asynchronous streams (e.g. merging multiple HTTP-driven sources), but a synchronous UI selection like this is a good fit for a plain signal.
+- Not addressing the "different teams, no shared injector" edge case at all in an interview answer — a strong answer explicitly calls out that this pattern assumes one Angular app/injector tree, and names what changes if that assumption doesn't hold (micro-frontends, module federation, iframes).
+
+## 9. Interview Follow-up Questions
+
+**Q: What if the two widgets are in completely separate Angular applications (e.g., micro-frontends)?**
+A: A shared Angular service can't cross that boundary, since each app has its own injector. You'd need a transport layer both sides can reach regardless of injector — a `window.postMessage` bus for iframe-based micro-frontends, a shared singleton exposed via Module Federation, or a broader event-bus/pub-sub service loaded into both shells.
+
+**Q: How would you test that the two widgets actually stay in sync?**
+A: Instantiate `DashboardSelectionService` directly (or via Angular's `TestBed`), call `selectRegion(...)` and assert against the exposed `selectedRegion()` value; separately, render each widget component in isolation with a mocked/real service instance and assert the template reacts correctly — you don't need to render both widgets together to prove the contract works, since they only ever interact through the service's public surface.
+
+**Q: What if three or more widgets need to share different, but related, pieces of state?**
+A: Keep the service focused — either multiple small purpose-specific services (one per logical piece of shared state) or a single service exposing several independent signals/computed values, rather than one large object that couples unrelated concerns together.
+
+**Q: Why a signal instead of a plain RxJS `BehaviorSubject` here?**
+A: Both would work for this synchronous case. Signals remove the need for manual subscription/unsubscription in components, integrate directly with Angular's change detection and `computed()`, and read more like plain synchronous state — a very natural fit for UI selection state like this. `BehaviorSubject` still makes sense when the shared state is naturally a stream (e.g., merged with other async sources via RxJS operators).
+
+**Q: Could this cause an infinite update loop, given the map and chart can both write to the same signal?**
+A: No — there's only one signal being written to, not two separate pieces of state that echo each other. Setting `selectedRegion` doesn't trigger anything that writes back to it again; both widgets just read the same value reactively. The risk of an update loop is much more relevant to patterns where two separate signals/inputs try to stay in sync with each other bidirectionally — this pattern avoids that entirely by having exactly one writable source of truth.
+
+## 10. Interview-Ready Answer
+
+"Since the two widgets are owned by different teams and don't have a natural parent-child relationship I want to build tight coupling into, I'd introduce a small shared service — provided in root so it's a singleton across the app — that holds the selection state as a signal. Both widgets inject that same service: the map widget reads the selected region to highlight it and calls a `selectRegion()` method when a region is clicked, and the chart widget uses a `computed()` signal to filter its data off that same selected region, and calls the identical `selectRegion()` method when a bar is clicked. Neither widget imports or knows anything about the other's component — they only depend on the service's public contract, which is what lets two separate teams keep evolving their own widget's internals independently. I'd expose the signal as read-only from outside the service, with mutation only through the explicit method, so the 'who can change this and how' story stays clear. The one thing I'd flag is that this only works because both widgets live in the same Angular injector tree — if they were actually separate deployed applications, like true micro-frontends, I'd need a different transport, like a postMessage bus or a shared module-federation singleton, instead of a plain injectable service."
+
+## 11. Quick Revision
+
+- **What**: A shared, injectable, signal-based service acting as the single source of truth for state that two independently-built sibling components need to read and write.
+- **Why**: Avoids tight coupling between components owned by different teams, and avoids clunky parent-mediated event-forwarding for bidirectional sync.
+- **Problem solved**: Lets two (or more) components sync state without depending on each other's internals — they only depend on one small, shared, stable contract.
+- **How**: `providedIn: 'root'` service holds a `signal()`; exposes it read-only via `.asReadonly()`, plus an explicit mutation method; both widgets inject the same singleton instance and read/write through it; `computed()` signals in consumers auto-react to changes.
+- **Use when**: Sibling widgets, same Angular injector tree, need bidirectional or many-to-many sync, especially across team/ownership boundaries.
+- **Important**: This pattern assumes a single shared injector tree — it doesn't cross into separate micro-frontend apps without an additional transport layer.
+- **Remember**: Expose state read-only, mutate only through explicit methods — never let consumers write directly to the shared signal.
+
+## 12. Memory Trick
+
+**"Shared service = the translator, not the marriage."**
+The two widgets never talk to each other directly (no marriage/tight coupling) — they both talk to one neutral translator (the shared service) that holds the one true state. Change the translator's wording (the service's method signatures) and both sides need to know; change how either widget internally works, and the other never notices.
