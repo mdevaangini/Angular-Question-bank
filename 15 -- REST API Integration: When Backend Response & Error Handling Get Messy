@@ -335,6 +335,8 @@ bootstrapApplication(AppComponent, {
 
 ## 8. Common Interview Traps
 
+Common interview trap on this exact topic: assuming catchError alone is enough to handle all API failures. If you skip the map() check, a 200-with-success:false response silently flows through as a "successful" HTTP call, and any code checking .subscribe({ next, error }) will hit next instead of error — meaning your UI can wrongly treat a business failure as a success.
+
 - Giving a vague answer like "the API sometimes failed and I added error handling" with no specifics — interviewers want the *actual shape* of the problem (what did the response look like, why did normal handling miss it).
 - Not distinguishing retryable from non-retryable errors — a candidate who says "I just wrapped it in a retry" without mentioning they excluded 4xx errors raises a flag.
 - Forgetting that a 200-with-error-body won't trigger `HttpErrorResponse`/`catchError` at all — that's the whole crux of failure mode #1, and missing it suggests the candidate hasn't actually hit this in practice.
