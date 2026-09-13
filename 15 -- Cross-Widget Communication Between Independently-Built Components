@@ -1,4 +1,6 @@
 # Cross-Widget Communication Between Independently-Built Components (Shared Signal-Based Service)
+---> two dashboard widgets (map + chart), owned by different teams, need to stay in sync both ways — pick a region on the map and the chart filters to it, pick a bar on the chart and the map highlights that region.
+
 
 ## 1. What is it?
 
