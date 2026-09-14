@@ -4,7 +4,7 @@
 
 "Push" vs. "pull" describes **who decides when a value gets produced/recomputed**.
 
-- **RxJS is push-based**: an Observable's *producer* (the source — a DOM event, an HTTP call, a timer) decides when something happens, and immediately pushes that value down through the operator chain to every subscriber, whether or not anyone is actively looking at the result right now.
+- **RxJS is push-based: think of an Observable like a news notification on your phone. The news app (the producer — could be a DOM click, an HTTP response, a timer) decides when something newsworthy happens, and the instant it does, it pushes that notification straight to your phone screen — you didn't have to open the app and check. Every subscriber (every screen that's listening) gets that push immediately, whether or not they were actively looking at their phone at that moment.
 - **Signals are pull-based**: a signal just holds a value. When a dependency changes, a `computed()` signal doesn't recompute right then — it's only marked "stale." The actual recomputation happens lazily, later, only when a *consumer* reads it (pulls it). Nothing computes until something asks for the value.
 
 **Glitch-free execution** is the guarantee that a `computed()` signal is recomputed **exactly once** per underlying change, using fully up-to-date inputs — never recomputed redundantly, and never observed in a transient, partially-updated, internally-inconsistent state, even when its dependency graph isn't a simple straight line (e.g., it depends on two other signals that both ultimately depend on the same root signal).
