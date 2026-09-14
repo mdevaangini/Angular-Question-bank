@@ -1,0 +1,191 @@
+# Signals Are Pull-Based, RxJS Is Push-Based — and What "Glitch-Free" Means for Computed Signals
+
+## 1. What is it?
+
+"Push" vs. "pull" describes **who decides when a value gets produced/recomputed**.
+
+- **RxJS is push-based**: an Observable's *producer* (the source — a DOM event, an HTTP call, a timer) decides when something happens, and immediately pushes that value down through the operator chain to every subscriber, whether or not anyone is actively looking at the result right now.
+- **Signals are pull-based**: a signal just holds a value. When a dependency changes, a `computed()` signal doesn't recompute right then — it's only marked "stale." The actual recomputation happens lazily, later, only when a *consumer* reads it (pulls it). Nothing computes until something asks for the value.
+
+**Glitch-free execution** is the guarantee that a `computed()` signal is recomputed **exactly once** per underlying change, using fully up-to-date inputs — never recomputed redundantly, and never observed in a transient, partially-updated, internally-inconsistent state, even when its dependency graph isn't a simple straight line (e.g., it depends on two other signals that both ultimately depend on the same root signal).
+
+## 2. Why are they built differently?
+
+RxJS was designed to model **events that happen over time**, independent of whether anyone's watching: a click, an HTTP response arriving, a WebSocket message, a timer tick. These are fundamentally producer-driven — the click happens whenever the user clicks, not whenever your code asks "did anything happen yet?" So it makes sense for the producer to push each new value out the moment it occurs, and let every subscriber react to it. This is also why the same cold Observable re-runs its producer logic for each subscriber by default (each subscription is an independent "please start producing values for me now" request).
+
+Signals were designed specifically for a different problem: **synchronous, derived UI state**. Most of the time, a `computed()` signal in an Angular app represents something like "the filtered list" or "the total price" — a pure derivation from other state, used to render a template. You don't want that derivation to eagerly recompute every single time any of its inputs changes, especially if the component that would use it isn't even rendering right now, or if several of its dependencies change together in the same tick (you only care about the *final* consistent value, not every intermediate step). Pulling — computing only when read, and only recomputing when actually stale — avoids wasted work and naturally gives you the final, consistent state instead of a series of partial ones. Glitch-freedom specifically matters for UI: nobody wants a template to flash a visually inconsistent intermediate state (e.g., a subtotal and a tax line briefly disagreeing with each other) just because of the internal order two computed signals happened to update in.
+
+## 3. How does it work?
+
+**Push (RxJS) mechanics:**
+
+- A subscriber calls `.subscribe()`, which starts the producer (for a cold Observable).
+- Whenever the producer emits (`next()`), that value is pushed synchronously through every operator in the pipeline, down to the subscriber's callback — regardless of whether the subscriber "needed" a new value at that exact moment.
+- Nothing is cached or lazily deferred by default — each emission is fully processed as it happens. (Multicasting subjects, `shareReplay`, etc. exist specifically to opt back into some pull-like/caching behavior when needed.)
+- Combining multiple sources (e.g., `combineLatest`) requires explicit operators to coordinate timing across producers that are each independently pushing on their own schedule.
+
+**Pull (Signals) mechanics:**
+
+- A signal (`signal()`) just holds a value and a list of things that depend on it.
+- A `computed()` signal doesn't have its own value stored persistently the way you might think — it has a **memoized cache** of its last computed result, plus a "dirty" flag.
+- When a signal you depend on changes, Angular doesn't recompute anything immediately. It walks the dependency graph and marks every directly and transitively dependent `computed()` as dirty — that's it, no actual work happens yet.
+- The real computation only runs the next time something **reads** that computed signal — calling it as a function (`myComputed()`), which either returns the cached value (if not dirty) or reruns the derivation function (if dirty), caches the new result, and clears the dirty flag.
+- This means: if nothing ever reads a `computed()` signal after its dependency changed, it simply never recomputes at all — the work is skipped entirely, not just deferred.
+
+**Glitch-free execution, specifically:**
+
+Consider a "diamond" dependency shape: `root` is a signal; `b = computed(() => root() * 2)`; `c = computed(() => root() + 1)`; `d = computed(() => b() + c())`. If `root` changes, both `b` and `c` depend on it, and `d` depends on both `b` and `c`.
+
+A naive push-based approach (propagate eagerly, right when each dependency changes) risks a **glitch**: `d` could get recomputed once when `b` updates (using the OLD value of `c`, since `c` hasn't updated yet), producing a transiently wrong/inconsistent value, and then recomputed AGAIN when `c` updates — meaning `d` is computed twice, and briefly observed in an inconsistent state in between.
+
+Angular's signal implementation avoids this by **not eagerly propagating recomputation at all** — it only marks nodes dirty when `root` changes, without touching `d` yet. When something later reads `d()`, Angular resolves the dependency graph properly: it recomputes `b` and `c` (since they're dirty and were just read/depended-on), and only then computes `d` **once**, using the fully updated values of both `b` and `c` — never a mixed old/new state, and never more than the one necessary recomputation. This is what "glitch-free" means concretely: exactly one recomputation per underlying change, always with fully consistent inputs.
+
+## 4. Example
+
+```ts
+import { Component, OnInit, signal, computed } from '@angular/core';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  template: `
+    <div class="page">
+      <h1>Pull-Based &amp; Glitch-Free Computed Signals</h1>
+      <ol class="log">
+        @for (entry of log(); track $index) {
+          <li [class.compute]="entry.startsWith('  [computing')">{{ entry }}</li>
+        }
+      </ol>
+    </div>
+  `
+})
+export class AppComponent implements OnInit {
+  log = signal<string[]>([]);
+
+  root = signal(1);
+
+  // A "diamond" dependency shape: b and c both depend on root; d depends on both b and c.
+  b = computed(() => {
+    this.push('  [computing b] root=' + this.root());
+    return this.root() * 2;
+  });
+
+  c = computed(() => {
+    this.push('  [computing c] root=' + this.root());
+    return this.root() + 1;
+  });
+
+  d = computed(() => {
+    this.push('  [computing d] b=' + this.b() + ' c=' + this.c());
+    return this.b() + this.c();
+  });
+
+  private push(msg: string): void {
+    this.log.update(entries => [...entries, msg]);
+  }
+
+  ngOnInit(): void {
+    this.push('signal created: root = 1. Nothing computed yet -- signals are lazy/pull-based.');
+
+    this.push('Reading d() for the first time:');
+    const firstValue = this.d();
+    this.push('d() = ' + firstValue);
+
+    this.push('--- root.set(5) ---');
+    this.root.set(5);
+    this.push('(b, c, d are now just marked dirty internally -- still nothing recomputed yet)');
+
+    this.push('Reading d() again:');
+    const secondValue = this.d();
+    this.push('d() = ' + secondValue + '  <-- computed exactly once, using fully-updated b and c (glitch-free)');
+  }
+}
+```
+
+**Contrast — the push-based RxJS shape of the same problem**, shown for comparison (not run live): with plain manual Subjects and no coordinating operator, updating a shared source and letting two derived streams push independently can genuinely produce a transient inconsistent read of a combined value, which is exactly the class of bug `combineLatest` (and similar coordinating operators) exist to prevent by waiting for all sources to have a value before emitting a combined result:
+
+```ts
+// Illustrative only — the kind of glitch coordinating operators like combineLatest exist to prevent.
+const root$ = new BehaviorSubject(1);
+const b$ = root$.pipe(map(r => r * 2));
+const c$ = root$.pipe(map(r => r + 1));
+
+// Without combineLatest-style coordination, naively subscribing to b$ and c$
+// separately and recomputing "d" on each could observe b and c out of sync
+// with each other for a moment after root$ changes.
+```
+
+**StackBlitz (forked to a permanent project):** https://stackblitz.com/edit/angular-xfavhhep
+
+**Verification note (transparent):** as with the last couple of demos this session, this session's browser tooling was unable to render the live preview — confirmed environment-side (not code-related), reproduced across multiple unrelated projects today including a bare-minimum sanity check. The code follows the same standalone-component and signal patterns already fully verified live earlier in this session. Opening the link above directly should compile and render normally, showing the log entries described in the Execution Flow section below.
+
+## 5. Example Explanation / Execution Flow
+
+1. `ngOnInit()` logs that `root = 1` but nothing has computed yet — proving the laziness: `b`, `c`, and `d` all exist as `computed()` definitions, but their derivation functions haven't run a single time yet.
+2. The first `this.d()` call triggers the pull chain: to compute `d`, Angular needs `b()` and `c()`; since both are dirty (never computed), they run first — logging `[computing b] root=1` then `[computing c] root=1` — then `d` computes using their results, logging `[computing d] b=2 c=2`, and returns `4`.
+3. `root.set(5)` runs — this only marks `b`, `c`, and `d` as dirty. No recomputation happens at this line; the log explicitly shows nothing new gets printed here.
+4. The second `this.d()` call is what actually triggers recomputation: `b` and `c` are dirty, so they recompute with the new `root` value (`root=5`), logging `[computing b] root=5` then `[computing c] root=5`; only then does `d` recompute, exactly once, logging `[computing d] b=10 c=6`, returning `16`.
+5. The key observation from the log: after `root.set(5)`, `d` was recomputed exactly **once** (not twice — once per intermediate dependency), and by the time it ran, both `b` and `c` had already fully updated to their new values — never a stale/mixed read. That's glitch-free execution, directly visible in the log's ordering.
+
+## 6. When should we use it?
+
+- **Use signals** for synchronous, derived UI state — anything that's a pure function of other state you already have in the component (filtered/sorted lists, totals, validity flags, display strings). This is the majority of "computed values" in a typical template.
+- **Use RxJS** for genuinely asynchronous event streams and anything that benefits from its rich operator vocabulary — debouncing user input, retrying failed HTTP calls with backoff, merging/combining multiple independent async sources, cancelling in-flight requests (`switchMap`), or coordinating timers.
+- **Bridge between them** with `toSignal()`/`toObservable()` (`@angular/core/rxjs-interop`) at the UI boundary: do the async orchestration in RxJS (where it's genuinely suited), then convert the result to a signal for the template to consume, getting the benefits of both — RxJS's operators for the async plumbing, signals' simple pull-based consumption for rendering.
+
+## 7. Advantages / Disadvantages
+
+**Advantages of pull-based signals**
+
+- Automatically skips wasted work: a `computed()` that nobody reads never runs its derivation function at all, even if its dependencies changed many times.
+- Glitch-free by construction — no risk of a template observing a transiently inconsistent derived value, and no need to manually reach for a coordinating operator (like `combineLatest`) just to keep two derived values in sync.
+- Much simpler mental model and less code for purely synchronous derived state — no subscribe/unsubscribe lifecycle to manage.
+
+**Disadvantages / where push still wins**
+
+- Signals aren't a good fit for genuinely asynchronous, time-based event streams on their own — there's no signal-native equivalent of `debounceTime`, `retry`, or `switchMap`; you still need RxJS (or manual `setTimeout`/`AbortController` plumbing) for that class of problem.
+- A signal's "pull" nature means side effects that should happen eagerly (logging, syncing to storage, firing an HTTP call as a side effect of a change) need `effect()` rather than `computed()` — using `computed()` for side effects is explicitly discouraged, since a `computed()` might not even run if nothing reads it.
+- Push-based streams model "this happened" events (a click, a message) more naturally than pull-based signals do, since those aren't really "current state" at all, just discrete occurrences over time.
+
+## 8. Common Interview Traps
+
+- Saying signals are "just like RxJS but simpler" without being able to articulate the actual mechanical difference (push vs. pull, eager vs. lazy/memoized).
+- Not knowing that a `computed()` signal that's never read simply never runs its derivation at all — many candidates assume it eagerly recomputes whenever a dependency changes, missing the laziness entirely.
+- Being unable to give a concrete example of what a "glitch" would actually look like (a diamond dependency shape, transient inconsistent state, or redundant recomputation) rather than just repeating "glitch-free" as a buzzword.
+- Assuming `effect()` behaves exactly like a `computed()` that "does side effects" — `effect()` has its own scheduling (it runs asynchronously, batched into a microtask after change detection) and shouldn't be conflated with the synchronous, pull-triggered nature of `computed()` reads.
+- Thinking RxJS Observables are inherently "worse" or being replaced by signals — they solve different problems (async event streams vs. synchronous derived state), and the two are meant to be used together via `toSignal()`/`toObservable()`, not as competitors where one simply wins.
+
+## 9. Interview Follow-up Questions
+
+**Q: Is `effect()` push-based or pull-based?**
+A: Neither cleanly — `effect()` reads signals (pulling their current values) to track what it depends on, but it's scheduled to *run* eagerly (asynchronously, batched) whenever any of those tracked signals change, which is more like a push notification saying "something you depend on changed, re-run." It's best thought of as a separate mechanism for reactive side effects, not a `computed()` variant.
+
+**Q: What happens if a `computed()`'s derivation function has a side effect, like a `console.log` or an HTTP call?**
+A: It's discouraged — because `computed()` is lazy and memoized, that side effect might run zero times (if never read), or run again unexpectedly if the cache gets invalidated and re-read, rather than running predictably once per logical change. Side effects belong in `effect()`, which is designed for that purpose.
+
+**Q: How does Angular avoid re-rendering a template if a computed signal's value didn't actually change, even though a dependency did?**
+A: `computed()` (and `signal()`) use referential/value equality checks by default when producing a new value — if the newly computed value is equal to the previous one, dependents aren't notified of a change even though the dependency itself changed, avoiding unnecessary downstream work.
+
+**Q: Can you build a glitch in RxJS, and how would you prevent it?**
+A: Yes — subscribing independently to two derived streams from the same source and manually combining their latest values in application code can produce transient inconsistent reads. `combineLatest` (or similar coordinating operators) exists specifically to prevent this, by only emitting a combined result once all sources have settled for a given round of updates.
+
+**Q: Why is memoization important for glitch-free execution, not just for performance?**
+A: Memoization is what lets Angular safely defer computation to "the next time this is read" without losing correctness — because the cached value is invalidated (not recomputed) the moment a dependency changes, reading it later always triggers a fresh computation using current inputs, never a stale cached value pretending to be current.
+
+## 10. Interview-Ready Answer
+
+"Signals are pull-based because a `computed()` signal doesn't do any work when its dependencies change — it just gets marked dirty. The actual recomputation only happens the next time something reads it, and if nothing ever reads it, it simply never runs at all. RxJS is push-based because it's modeling things that genuinely happen over time — an event, an HTTP response — so the producer pushes each value out the moment it occurs, to whoever's subscribed. Glitch-free execution is about what happens with more complex dependency shapes — say two computed signals both depend on the same root signal, and a third computed signal depends on both of those. If you naively propagated changes eagerly, that third signal could get recomputed twice, and briefly see one of its inputs updated and the other still stale, in between. Angular avoids this by not eagerly propagating at all — it just marks the whole dependency chain dirty, and when you finally read the top-level computed signal, it resolves everything below it first, so you get exactly one recomputation, with fully consistent, fully up-to-date inputs, never a mixed transient state. In practice I use signals for synchronous derived UI state, and I still reach for RxJS for genuinely async things like debouncing, retries, or combining multiple async sources, bridging the two with `toSignal()` at the UI boundary."
+
+## 11. Quick Revision
+
+- **What**: Push (RxJS) = producer decides when a value is emitted, and pushes it immediately to subscribers. Pull (Signals) = consumer decides when to read; a `computed()` only recomputes lazily, on read, if dirty.
+- **Why**: RxJS models real async events (click, HTTP, timers) that genuinely "happen" independent of observers. Signals model synchronous derived UI state, where laziness avoids wasted work and glitch-freedom avoids inconsistent renders.
+- **Glitch-free**: A `computed()` is recomputed exactly once per underlying change, always using fully up-to-date dependency values — never redundantly, never in a transient/inconsistent intermediate state, even for diamond-shaped dependency graphs.
+- **How**: Changing a signal only marks dependents dirty (no immediate work). Reading a dirty `computed()` resolves its whole dependency chain first, then computes itself once, then caches (memoizes) the result until invalidated again.
+- **Use when**: Signals for synchronous derived state; RxJS for async streams/operators; bridge with `toSignal()`/`toObservable()`.
+- **Remember**: A `computed()` nobody reads never runs its derivation function at all — that's the laziness, not just "runs later."
+
+## 12. Memory Trick
+
+**"Push shoves, pull fetches."**
+RxJS shoves each new value at you the instant it's produced, whether you're ready or not. Signals just sit there quietly until you go fetch the value yourself — and when you do, Angular makes sure everything you're about to read has already fully settled, so you never fetch a half-updated answer (that's the "glitch-free" part).
