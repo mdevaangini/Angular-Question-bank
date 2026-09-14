@@ -2,32 +2,30 @@
 
 ## 1. What is it?
 
-`ChunkLoadError: Loading chunk 42 failed` is a runtime error thrown when a code-split, lazy-loaded application tries to fetch a separate JavaScript "chunk" file at runtime — and that fetch fails, usually because the file simply isn't there anymore. It's not a bug in your component logic; it's a mismatch between the JavaScript the user's browser already has loaded in memory and the files currently sitting on your server/CDN. The blank page happens because the failed `import()` rejects, Angular's router (or whatever triggered the lazy load) never gets the module it needed, and nothing renders — often with no visible error banner unless you've wired one up.
+`ChunkLoadError: Loading chunk 42 failed` means the app tried to download a small JS file it needed (a "chunk") and that file wasn't there. It's not a bug in your component code. It's a mismatch: the browser tab is running an old version of the app, but the server now only has the new version's files. Because the download fails, the page that was supposed to load never shows up — so the user just sees blank.
 
 ## 2. Why does this happen?
 
-Modern Angular apps are built with **code-splitting**: instead of one giant JS bundle, the build tool (esbuild/webpack under the hood) breaks the app into smaller chunk files — typically one per lazy-loaded route (`loadComponent`/`loadChildren`). Each chunk file is named with a content hash baked into the filename, e.g. `chunk-42.8f3a1c2.js`, so browsers can cache it aggressively and safely forever (the hash changes if the content changes).
+Angular splits your app into smaller JS files instead of one giant file. Each lazy-loaded route (like a "Reports" page) gets its own file, and that file's name includes a hash, like `chunk-42.8f3a1c2.js`. Here's the simple play-by-play:
 
-Here's the sequence that produces this exact symptom:
-
-- A user loads the app. Their browser downloads `index.html` and the main bundle, which references specific chunk filenames by hash — say, `chunk-42.8f3a1c2.js` for a "Reports" feature they haven't visited yet.
-- The user keeps that tab open (or doesn't refresh) while your team ships a new release. The new build produces **new** hashed chunk filenames — `chunk-42.9b7e0d1.js` — and, critically, the deployment process overwrites/replaces the old build output, so `chunk-42.8f3a1c2.js` no longer exists on the server.
-- The still-open tab is still running the OLD main bundle in memory, which still thinks the Reports chunk is called `chunk-42.8f3a1c2.js`. When the user navigates to Reports, the app tries to dynamically `import()` that exact old filename.
-- The server/CDN returns a 404 for a file that no longer exists → the dynamic `import()` promise rejects → the bundler's runtime wraps that rejection as `ChunkLoadError` (webpack) or a `TypeError: Failed to fetch dynamically imported module` (native ESM/Vite/esbuild) → since nothing catches it, it becomes an uncaught error and the router never finishes navigating, leaving a blank page.
-- A hard refresh fixes it because it forces the browser to re-fetch `index.html` from scratch — and the CURRENT `index.html` references the CURRENT chunk hashes, which DO exist on the server. The user is now running the new build entirely, with no mismatched references left over.
+- A user opens your app. Their browser loads the main file, which knows the Reports page lives in `chunk-42.8f3a1c2.js`.
+- They leave the tab open. Meanwhile, you ship a new release. The new build makes a new file with a new hash, `chunk-42.9b7e0d1.js`, and the old file gets deleted from the server.
+- The user, still on the old tab, clicks over to Reports. Their browser tries to fetch the OLD file — `chunk-42.8f3a1c2.js` — because that's still what their copy of the app remembers.
+- That file is gone now, so the server says "not found." The download fails, nothing loads, and the page stays blank.
+- A hard refresh fixes it because it throws away everything and starts over — it loads the current version of the app, which correctly points to files that actually exist.
 
 ## 3. How does it work?
 
-- **Build time**: Angular's build (esbuild-based since Angular 17) emits one JS file per lazy route/chunk, each filename fingerprinted with a content hash. `index.html` and the main bundle's internal chunk-manifest reference these exact filenames.
-- **Deploy time**: a typical deploy pipeline uploads the new build output and replaces the old one at the same path/CDN origin — this is the step that removes the old chunk files the still-open tab depends on.
-- **Runtime, in the browser**: Angular's router resolves a lazy route by calling the loader function you gave it (`loadComponent: () => import('./reports.component')`), which the bundler has rewritten into a real dynamic `import()` call pointing at that specific hashed chunk URL.
-- **The failure**: `import()` is just a `fetch` for a script under the hood. If that URL 404s (file gone) or the network genuinely fails, the returned promise rejects. Frameworks generally don't retry this automatically — the rejection propagates as an uncaught error, `ErrorHandler.handleError()` (Angular's global error hook) receives it, and if nothing is registered to catch and react to this specific error, the app just silently fails to render that route.
-- **The specific fix — detect and self-heal**: register a custom `ErrorHandler` (or a `window.addEventListener('error', ...)`/`unhandledrejection` listener) that recognizes this error shape (`error.name === 'ChunkLoadError'`, or the message pattern) and forces a full reload — `window.location.reload()` — which re-fetches the current `index.html` and gets the user back onto a build where all the chunk references are valid. This turns "silent blank page, user has to figure out to hard-refresh themselves" into "automatic self-healing, usually invisible to the user."
-- **The loop-guard**: a naive auto-reload can retrigger the same error on a browser that's genuinely offline or a chunk that's missing for some other real reason, causing an infinite reload loop. Guard it with a flag (a `sessionStorage` key, or a URL query param) so it only auto-reloads once per session; a second occurrence shows a manual "please refresh" prompt instead of silently looping.
+- **When you build the app**: Angular creates a separate file per lazy route, each with a hash in the name.
+- **When you deploy**: the new files go up, and the old ones usually get deleted or overwritten.
+- **When the user navigates**: Angular's router tries to fetch the exact chunk file it thinks it needs.
+- **When that fetch fails**: the browser gets a 404, the download fails, and this shows up as `ChunkLoadError` (or a similar "failed to fetch module" message). If nothing is watching for this, the app just quietly fails — no error message on screen, just a blank page.
+- **The fix**: write a small piece of code that watches for errors, notices when one looks like a `ChunkLoadError`, and automatically reloads the page for the user — so they get the working, current version without having to figure out "hard refresh" themselves.
+- **One important safety check**: only auto-reload once. If you don't add that check, and the reload doesn't actually fix things (say, the user's internet is just down), the page could try to reload over and over, forever. So the fix needs to remember "I already tried this" and only show a manual "please refresh" message the second time.
 
 ## 4. Example
 
-**`chunk-error-handler.ts`** — detects the error shape and self-heals once, then falls back to a manual prompt:
+**`chunk-error-handler.ts`** — watches for the error, reloads once, then just asks nicely after that:
 
 ```ts
 import { ErrorHandler, Injectable, signal } from '@angular/core';
@@ -45,8 +43,8 @@ export function isChunkLoadError(error: unknown): boolean {
 
 @Injectable({ providedIn: 'root' })
 export class ChunkErrorHandler implements ErrorHandler {
-  // Exposed only so this demo can show what happened; in a real app you'd
-  // typically just call window.location.reload() directly, no log needed.
+  // This log is just so the demo below can show what happened.
+  // In a real app you'd usually just call window.location.reload() directly.
   log = signal<string[]>([]);
 
   handleError(error: unknown): void {
@@ -58,22 +56,24 @@ export class ChunkErrorHandler implements ErrorHandler {
     const alreadyTriedReload = sessionStorage.getItem(RELOAD_FLAG_KEY) === 'true';
 
     if (!alreadyTriedReload) {
+      // First time this happens: remember that we tried, then reload.
       sessionStorage.setItem(RELOAD_FLAG_KEY, 'true');
       this.log.update(entries => [
         ...entries,
-        'ChunkLoadError detected (1st time this session) -> forcing a full reload so the browser re-fetches the current index.html and current chunk manifest. In production: window.location.reload().'
+        'First time seeing this error -> reloading the page. In real code: window.location.reload().'
       ]);
     } else {
+      // Already tried reloading once and it happened again — don't loop forever.
       this.log.update(entries => [
         ...entries,
-        'ChunkLoadError detected again after an automatic reload already happened this session -> NOT reloading again (that would loop forever). Showing a manual "New version available, please refresh" banner instead.'
+        'Seeing this error again after already reloading once -> NOT reloading again. Show a "please refresh" message instead.'
       ]);
     }
   }
 }
 ```
 
-**How the real lazy routes and this handler get wired up** (the actual mechanism this whole scenario is about):
+**How this connects to your real routes** (this is the actual setup you'd use in a real app):
 
 ```ts
 // app.routes.ts
@@ -97,12 +97,12 @@ import { ChunkErrorHandler } from './app/chunk-error-handler';
 bootstrapApplication(AppComponent, {
   providers: [
     provideRouter(routes),
-    { provide: ErrorHandler, useClass: ChunkErrorHandler }
+    { provide: ErrorHandler, useClass: ChunkErrorHandler } // plug our handler in here
   ]
 }).catch(err => console.error(err));
 ```
 
-**`app.component.ts`** — this demo simulates two consecutive chunk failures directly (rather than relying on an actual missing file over the network) so the handler's two branches are both visible with zero interaction:
+**`app.component.ts`** — this just fakes two chunk errors happening in a row, so you can see both outcomes (reload vs. don't-loop) without needing an actual broken deploy:
 
 ```ts
 import { Component, OnInit, inject } from '@angular/core';
@@ -113,8 +113,8 @@ import { ChunkErrorHandler } from './chunk-error-handler';
   standalone: true,
   template: `
     <div class="page">
-      <h1>ChunkLoadError Self-Healing Demo</h1>
-      <p>Simulating two consecutive "Loading chunk failed" errors, the way they'd occur after a release replaces old chunk files.</p>
+      <h1>ChunkLoadError Demo</h1>
+      <p>Pretending two "chunk failed to load" errors happened in a row, the way they would right after a release.</p>
       <ol class="log">
         @for (entry of handler.log(); track entry) {
           <li>{{ entry }}</li>
@@ -127,13 +127,12 @@ export class AppComponent implements OnInit {
   handler = inject(ChunkErrorHandler);
 
   ngOnInit(): void {
-    sessionStorage.removeItem('chunk-error-reload-attempted'); // clean slate for the demo
+    sessionStorage.removeItem('chunk-error-reload-attempted'); // start fresh for the demo
 
-    // 1st failure: e.g. the user navigates to /reports right after a release shipped.
+    // Pretend this is the first time a user hits the error after a release.
     this.handler.handleError(Object.assign(new Error('Loading chunk 42 failed.'), { name: 'ChunkLoadError' }));
 
-    // 2nd failure: simulates a chunk failure happening again shortly after
-    // the auto-reload already fired once this session -> loop-guard kicks in.
+    // Pretend it happens again right after — this is where the "don't loop" check kicks in.
     this.handler.handleError(Object.assign(new Error('Loading chunk 17 failed.'), { name: 'ChunkLoadError' }));
   }
 }
@@ -141,84 +140,84 @@ export class AppComponent implements OnInit {
 
 **StackBlitz (forked to a permanent project):** https://stackblitz.com/edit/angular-u7qqc1vq
 
-**Verification note (transparent):** as with the previous question's demo, this session's browser tooling was unable to render the live preview for this project — it stayed blank the same way. This has now been confirmed environment-side (not code-related) across multiple attempts this session, including a bare-minimum sanity-check project. The code itself follows the same standalone-component and signal patterns already fully verified live earlier in this session. Opening the link above directly should compile and render normally.
+**A quick honest note:** this session's browser tool couldn't get the live preview to show up (it happened on a few demos in a row today, even a totally blank test project, so it's a tooling hiccup, not a problem with this code). The code itself uses the same patterns that already worked and were verified live earlier in the session. The link above should work fine if you open it yourself.
 
 ## 5. Example Explanation / Execution Flow
 
-1. On load, `ngOnInit()` clears any leftover reload flag so the demo always starts clean, then immediately calls `handler.handleError(...)` twice in a row with two different `ChunkLoadError`-shaped errors — no timers, no clicks, both outcomes visible in the very first render.
-2. The first call: `isChunkLoadError()` recognizes the error (by `name` and message pattern), checks `sessionStorage` and finds no reload flag set yet, so it takes the "auto-heal" branch — sets the flag and logs that it would force a full reload.
-3. The second call: same recognition, but this time `sessionStorage` already has the flag set (from step 2), so it takes the "already tried, don't loop" branch — logs that it's falling back to a manual refresh prompt instead of reloading again.
-4. Both log lines render in the `@for` loop, giving a clear side-by-side view of both branches of the mitigation logic in one screenshot.
-5. In a real deployment, step 1 corresponds to: user is on an old build, navigates to a lazy route, the dynamic `import()` 404s, `ErrorHandler.handleError()` receives the rejection, and `window.location.reload()` actually runs — fetching the fresh `index.html`, which references the current (existing) chunk hashes, so the reloaded page works normally. Step 2 corresponds to a second, unrelated failure (e.g., a genuinely offline user) where reloading again wouldn't help, so the app stops trying and asks the human to act instead.
+1. The app starts, clears any leftover "already reloaded" flag, and immediately pretends two chunk errors happened one after another.
+2. First error: nothing was flagged yet, so the handler says "okay, first time — let's reload" and sets the flag.
+3. Second error: the flag is already set from step 2, so the handler says "already tried that — I'll just show a message instead of reloading again."
+4. Both messages show up in a simple list, so you can see both paths happen side by side.
+5. In real life: step 1 is what happens the first time a real user hits a missing chunk — the app reloads them automatically and they probably don't even notice. Step 2 is what happens if reloading genuinely didn't help (like the user's internet being down) — the app stops trying and just asks the person to refresh manually instead of getting stuck in a loop.
 
 ## 6. When should we use it?
 
-Any production single-page app that uses lazy loading/code-splitting (which is virtually every non-trivial Angular app with `loadComponent`/`loadChildren` routes) should have this kind of handling in place — it's not optional hardening, it's a routine consequence of deploying more than once. It matters most for:
+Basically any real Angular app that lazy-loads routes should have something like this — which is most apps, since lazy loading is the default recommended way to build routes. It matters most for:
 
-- Apps with frequent deploys (multiple releases per day/week increase the odds a given open tab straddles a deploy).
-- Apps users tend to leave open in a background tab for hours (dashboards, admin panels, "always-on" internal tools) — the longer a tab stays open across a deploy, the more likely this hits it.
-- High-traffic consumer apps, where even a small percentage of users hitting this translates to a real support/error-tracking volume.
+- Apps you deploy often (more releases = more chances a user's tab is open across one).
+- Apps people leave open for a long time, like dashboards or internal tools.
+- Apps with a lot of users, where even a small percentage hitting this adds up to real complaints.
 
 ## 7. Advantages / Disadvantages
 
-**Advantages of the auto-reload-with-loop-guard approach**
+**Why the auto-reload-with-a-limit approach is good**
 
-- Fully automatic for the common case — most users never even notice a blank page happened; the reload is often faster than they'd notice.
-- Cheap to implement — one custom `ErrorHandler`, no infrastructure changes required.
-- The loop-guard prevents the single worst failure mode (endlessly reloading a genuinely broken/offline page).
+- Most users never even notice — it just quietly fixes itself.
+- Easy to add — one small file, no extra infrastructure needed.
+- The "only once" rule stops the worst-case scenario: an endless reload loop.
 
-**Disadvantages / limitations**
+**Where it falls short**
 
-- It's a client-side band-aid, not a root-cause fix — it doesn't prevent the mismatch, it just recovers from it quickly. The real root-cause fix is deploy-side (below).
-- A silent auto-reload can lose in-progress user input (an unsaved form) if it fires mid-interaction — worth pairing with a confirmation prompt for apps with significant unsaved-state risk, rather than reloading instantly and silently.
-- Doesn't help at all if the *current* deploy's assets are broken (not a stale-reference problem) — in that case reloading just repeats the same failure, which is exactly why the loop-guard existing is not optional.
+- It only treats the symptom, not the cause — it doesn't stop the mismatch from happening, it just recovers from it quickly.
+- If someone was in the middle of typing something into a form, an unexpected reload could wipe that out — worth warning the user first if that's a real risk in your app.
+- If the reload doesn't actually fix anything (say the new deploy itself is broken), this won't help — which is exactly why you need the "don't loop forever" rule.
 
-**The real, deploy-side prevention (addresses the root cause, not just the symptom)**
+**The better, root-cause fix (this lives on your servers, not in your app's code)**
 
-- **Keep old chunk files around for a retention window** instead of deleting them on every deploy — e.g., deploy each release to its own versioned path/folder on the CDN and don't purge old releases for some hours/days. This means an old tab's stale references to old-hash chunk files still resolve successfully even after a new deploy, eliminating the error entirely for most users (until their tab eventually refreshes naturally).
-- **Set short/no-cache headers on `index.html`** specifically (while the hashed chunk files themselves are cached long-term/immutably, which is correct and desired). If `index.html` itself is aggressively cached, users get stuck on a stale entry point for a long time, making the mismatch window — and this error — far more likely.
-- **Proactively prompt for updates** rather than only reacting to failures: poll a small `version.json` (or use Angular's `SwUpdate` if using a service worker) and show a "new version available, refresh to update" banner as soon as a new deploy is detected, so most users refresh voluntarily before ever hitting a broken lazy-load.
+- **Don't delete old files right away.** Keep each release's files around for a while after deploying a new one, so a tab that's still using old file names can still find them.
+- **Don't let the browser cache `index.html` for too long.** The actual chunk files can be cached forever (that's fine and intended), but `index.html` itself should refresh often so users don't get stuck on a really old version for a long time.
+- **Tell users proactively.** Check every so often if a new version has shipped, and show a small "new version available, refresh to update" banner — so most people update on their own terms instead of hitting a broken page first.
 
 ## 8. Common Interview Traps
 
-- Treating this as a JavaScript bug to "fix in the code" rather than recognizing it's fundamentally a deployment/infrastructure timing issue between client-cached references and server-side build artifacts.
-- Proposing an auto-reload without a loop-guard — this is the single most common gap in a rushed answer, and interviewers will often follow up specifically asking "what if reloading doesn't fix it?"
-- Forgetting to mention `index.html`'s cache headers — even a perfect auto-reload/retention strategy doesn't help if `index.html` itself is stuck being served from a stale CDN/browser cache for a long time.
-- Confusing this with a *build-time* chunking misconfiguration (e.g., incorrect `webpackChunkName` or route-level `loadChildren` typos) — those cause a chunk to fail to load consistently for everyone, immediately after every deploy, not intermittently and specifically for users who had the app open across a release.
-- Not distinguishing chunk-hash mismatch (this scenario) from a transient network blip — a simple retry-the-fetch strategy helps with the latter but does nothing for the former, since the file is genuinely gone, not just slow to respond.
+- Treating this like a code bug you'd "fix" in a component, instead of recognizing it's really about deploy timing.
+- Suggesting an auto-reload but forgetting the "only try once" safety check — interviewers love to follow up with "what if the reload doesn't help?"
+- Forgetting to mention `index.html`'s caching — even a great retry strategy doesn't help if people are stuck loading a very old `index.html` for a long time.
+- Mixing this up with a real chunk-configuration bug (like a typo in a route's import path) — that kind of bug breaks the page for everyone immediately after every deploy, not just for people who happened to have an old tab open.
+- Treating it the same as a normal flaky network error — retrying the same request won't help here, because the file is genuinely gone, not just slow.
 
 ## 9. Interview Follow-up Questions
 
-**Q: What if the auto-reload doesn't fix it?**
-A: That's exactly what the loop-guard handles — after one automatic reload attempt this session, a second occurrence of the same error class stops auto-reloading and instead shows the user a manual "please refresh" prompt (or a "contact support" fallback), so the app never gets stuck silently reloading forever.
+**Q: What if reloading doesn't fix it?**
+A: That's what the "only try once" rule is for. After one automatic reload, if it happens again, stop trying and show the person a manual "please refresh" message instead of looping forever.
 
-**Q: How would you avoid losing user input during an unexpected auto-reload?**
-A: Either detect meaningful unsaved state (a dirty form, in-progress upload) and show a confirmation dialog before reloading instead of reloading silently, or persist the in-progress input to `sessionStorage`/`localStorage` just before reloading and restore it after the reload completes.
+**Q: How do you avoid losing someone's unsaved work if this reload happens mid-typing?**
+A: Either ask for confirmation before reloading if there's unsaved data, or quickly save what they typed to browser storage first and put it back after the reload.
 
-**Q: How would you proactively detect a new deployment before a user even hits a broken chunk?**
-A: Poll a lightweight `version.json` (or a response header) at an interval and compare its build ID against the one baked into the currently running app; on mismatch, show a "new version available" banner prompting a refresh. If using Angular's service worker (`@angular/service-worker`), `SwUpdate.versionUpdates` gives you this natively.
+**Q: How could you warn users about a new version before they even hit this error?**
+A: Periodically check a small file (like `version.json`) for the current version number, and if it's changed, show a banner telling people to refresh. Angular's built-in service worker support has a feature for this too.
 
-**Q: Why does keeping old chunk files around actually prevent the error, rather than just delaying it?**
-A: Because most users refresh naturally within a reasonably short window (closing/reopening tabs, normal navigation, periodic full reloads). If old-hash chunk files stay available for a retention window that comfortably covers typical tab lifetimes, very few users ever actually hit the moment where their stale reference points at a now-deleted file — the mismatch window closes before it's noticed by most people.
+**Q: Why does keeping old files around actually solve the problem instead of just delaying it?**
+A: Because most people refresh their tab naturally within a day or so anyway. If old files stick around a bit longer than that, most users will have already refreshed before their old files would've been deleted, so they never even see the error.
 
-**Q: Is this specific to Angular?**
-A: No — it's a general consequence of code-splitting bundlers (webpack, esbuild, Vite/Rollup) combined with typical "replace the old deployment" release processes. Angular's CLI uses esbuild for this since v17, and the failure shows up as a rejected dynamic `import()` regardless of framework; React (`React.lazy`), Vue, and any other lazy-loading SPA framework can hit the exact same failure mode.
+**Q: Is this only an Angular thing?**
+A: No — any app that splits its code into separate files (basically every modern framework: React, Vue, etc.) can hit this exact problem. It's really about how deployments work, not specific to one framework.
 
 ## 10. Interview-Ready Answer
 
-"This happens because the app uses code-splitting — each lazy route is its own JS file with a content hash in its filename. A user has the app open, and while their tab sits there, we ship a new release that replaces the old build output, including deleting the old hashed chunk files. Their browser is still running the old main bundle, which still references the old chunk filenames, so when they navigate to a route that hasn't loaded yet, the app tries to fetch a file that no longer exists — that's the `ChunkLoadError`. A hard refresh fixes it because it re-fetches the current `index.html`, which points at the current, still-existing chunk files. To prevent this, I'd do two things: on the client, register a global `ErrorHandler` that recognizes this specific error and automatically does a full reload — but with a guard, using something like a `sessionStorage` flag, so it only tries once per session and doesn't loop forever if reloading genuinely doesn't help. On the deploy side, which is really the root-cause fix, I'd keep old chunk files around on the CDN for a retention window after each deploy instead of deleting them immediately, and make sure `index.html` itself is served with short cache headers so the mismatch window between what a client has and what the server has stays as small as possible."
+"This happens because the app is split into smaller files, and each one has a version-specific name. If someone has the app open in a tab and we ship a new release while they're still there, their tab is still looking for the old file names — but we've already deleted those files from the server. So when they click to a page they haven't visited yet, the download fails, and they just see a blank screen. A hard refresh fixes it because it reloads everything fresh, matching what's actually on the server right now. To prevent this from being a bad experience, I'd add a global error handler that notices this specific kind of error and automatically reloads the page for the user — but only once, so it doesn't get stuck in a loop if reloading genuinely doesn't help. And on the deploy side, which is really the root fix, I'd keep old files around for a little while after each release instead of deleting them right away, and make sure the main HTML file itself doesn't get cached for too long, so people naturally catch up to new releases quickly."
 
 ## 11. Quick Revision
 
-- **What**: `ChunkLoadError` — a lazy-loaded JS chunk fails to fetch at runtime, usually a 404 for a file that no longer exists.
-- **Why**: Code-splitting + hashed chunk filenames + a deploy that deletes/replaces old build output while a user's tab is still running the old bundle, which still references the old (now-gone) chunk filenames.
-- **Problem solved (by the fix)**: Self-heals the blank-page symptom automatically instead of requiring the user to figure out "hard refresh" themselves.
-- **How**: Custom `ErrorHandler` detects the error shape; on first occurrence per session, forces `window.location.reload()` (re-fetches current `index.html` + current chunk manifest); on a repeat occurrence, stops auto-reloading and shows a manual prompt instead (loop-guard via `sessionStorage`).
-- **Use when**: Any production SPA with lazy-loaded routes — essentially always, especially with frequent deploys or long-lived open tabs.
-- **Important**: The client-side reload is a symptom fix; the real prevention is deploy-side — retain old chunk files for a window, keep `index.html` cache-control short, and proactively prompt users about new versions.
-- **Remember**: Never auto-reload without a loop-guard.
+- **What**: A chunk (small JS file) fails to load — usually because it's been deleted after a new release.
+- **Why**: The app is split into files with version-specific names; a user's open tab can still be pointing at old, now-deleted files.
+- **What the fix does**: Automatically reloads the page once so the user gets unstuck without noticing.
+- **How**: A custom error handler checks for this specific error, reloads the page the first time, and shows a manual message instead if it happens again.
+- **Use when**: Pretty much any real Angular app with lazy-loaded routes — especially ones deployed often or kept open a long time.
+- **Important**: The reload is a quick fix, not the real solution. The real solution is on the deploy side — keep old files around a bit, don't cache `index.html` too long.
+- **Remember**: Never auto-reload without a "only try once" limit.
 
 ## 12. Memory Trick
 
 **"Old map, new city."**
-The user's browser is holding an old map (the old bundle) with street addresses (chunk filenames) that pointed to real buildings — but the city (the server) tore those buildings down and put up new ones at new addresses when it "redeveloped" (deployed). A hard refresh is getting a brand-new map that matches the current city. Auto-healing means the app notices the map is stale and fetches a new one for you — once, not on an endless loop if the city itself is having a bad day.
+Your browser has an old map with street addresses that used to be real — but the city tore those buildings down and built new ones somewhere else when it "redeveloped." A hard refresh gets you a fresh map that matches how the city actually looks now. Auto-healing just means the app notices its map is outdated and grabs a new one for you automatically — just once, not forever, in case the city itself is having a bad day.
