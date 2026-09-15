@@ -275,6 +275,15 @@ Answer: `@Self()` restricts the lookup to only the current element injector — 
 **Q: Why might a service registered with `providedIn: 'root'` still end up with more than one instance in an app?**
 Answer: If some component further down the tree also lists that same service in its own `providers` array, that component (and everything under it) will resolve to a fresh instance created at that component's element injector instead of ever reaching the root environment injector — the root registration still exists, but that subtree never asks it.
 
+"What's the significance of providedIn: 'root' if a component can just override it anyway?"
+
+The significance is: it sets the sensible default for the 95% case (one shared instance across your whole app, zero setup), while still leaving the door open for the 5% case where a specific subtree genuinely needs its own isolated instance — without that override ability, providedIn: 'root' would be too rigid to use safely in real apps, because you'd never be able to carve out an exception when you needed one.
+
+One line to remember
+
+"providedIn: 'root' is the default, not a hard rule — it gives you an app-wide singleton for free with zero setup, while still allowing any specific component to deliberately opt out and get its own private instance when that's actually what the feature needs."
+
+
 **Q: Does a component-provided service get cleaned up automatically?**
 Answer: Yes — Angular calls `ngOnDestroy()` on any service instance owned by a component's element injector when that component is destroyed, which is a natural place to put teardown logic tied to that component's lifetime.
 
