@@ -34,7 +34,9 @@ Angular actually maintains **two** injector hierarchies at once:
 5. **If found in an environment injector**, return the cached singleton for that injector (environment-injector-registered services are cached once per injector — this is exactly why `providedIn: 'root'` really does mean "one instance for the whole app").
 6. **If the token is never found anywhere in the entire chain** and there's no `@Optional()` fallback, Angular throws `NullInjectorError: No provider for X`.
 
-**Why this creates "a new instance per component":** every component *instance* — not every component *class* — gets its own element injector node. So if a component's `providers` array lists a service, and you render three instances of that component on screen, each of those three instances gets its **own separate** instance of that service, created the first time each one actually needs it. This is also exactly why an ancestor's provided instance is shared by however many descendants ask for it *without* providing their own — they all resolve upward to the exact same injector node, and therefore the exact same object.
+Why this creates "a new instance per component": think of each component instance on screen as its own separate house, even if they're all built from the same blueprint (the component class). If that blueprint's providers array says "every house gets its own water tank" (the service), then putting 3 copies of that house on screen means 3 separate water tanks get built — one per house, made fresh the first time 
+that house actually needs water. But if only the parent house has its own water tank, and all the child houses inside it just use the tap without building their own tank, they all end up drawing from the same one shared tank upstairs — because they all look upward to the same source instead of making their own.
+
 
 **A few deeper details worth knowing for a strong answer:**
 
