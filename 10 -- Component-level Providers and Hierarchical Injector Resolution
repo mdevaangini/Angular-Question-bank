@@ -123,7 +123,7 @@ Small example to make it click
 ts
 @Component({
   selector: 'app-card',
-  viewProviders: [CardThemeService], // 👈 only visible INSIDE this component's own view
+  viewProviders: [CardThemeService], // 👈 only visible INSIDE this component's own view  -> If viewProviders: [SomeService] is used, then any component that got projected in via <ng-content> — if it tries to inject that service in its own constructor (to read its properties, call its methods, whatever) — it fails to get that instance. Angular won't hand it the one living in the parent's viewProviders room.
   template: `
     <div class="card-box">
       <p>Theme inside card's own template: {{ theme.color }}</p> <!-- ✅ works -->
