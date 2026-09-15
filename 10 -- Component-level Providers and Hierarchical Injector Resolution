@@ -111,6 +111,44 @@ Where you put providers decides whether you get "one per instance" (Case 1) or "
 **A few deeper details worth knowing for a strong answer:**
 
 - `viewProviders` is a variant of `providers` that's only visible to a component's own template — content projected in via `<ng-content>` from outside cannot see `viewProviders`, only regular `providers`.
+ providers vs viewProviders
+
+Both let a component register a service. The difference is about who's allowed to see it:
+
+providers → visible to the component's own template AND anything projected into it via <ng-content>.
+viewProviders → visible only to the component's own template — the projected content (the stuff from <ng-content>) is blocked out, it can't see it.
+
+///
+Small example to make it click
+ts
+@Component({
+  selector: 'app-card',
+  viewProviders: [CardThemeService], // 👈 only visible INSIDE this component's own view
+  template: `
+    <div class="card-box">
+      <p>Theme inside card's own template: {{ theme.color }}</p> <!-- ✅ works -->
+      <ng-content></ng-content> <!-- content projected here CANNOT see CardThemeService -->
+    </div>
+  `
+})
+class CardComponent {
+  constructor(private theme: CardThemeService) {}
+}
+
+
+<app-card>
+  <app-projected-child></app-projected-child>
+  <!-- ❌ app-projected-child tries to inject CardThemeService → FAILS,
+       because viewProviders doesn't extend to projected content -->
+</app-card>
+
+
+If you'd used providers instead of viewProviders on CardComponent, app-projected-child would have been able to inject CardThemeService successfully — that's the entire difference.
+
+///
+
+
+
 - Resolution modifiers change the walk itself: `@Self()` means "only check my own element injector, don't walk up at all — throw if not found here." `@SkipSelf()` means "skip my own injector, start the walk from my parent." `@Host()` stops the upward walk at a component's host boundary (mostly relevant inside directives). `@Optional()` returns `null` instead of throwing if nothing is ever found.
 - A component's own `providers` array **shadows** anything an ancestor (or root) provided for that same token, for that entire subtree — this is the source of a very common real bug (see the traps section).
 
