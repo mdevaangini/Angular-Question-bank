@@ -1,0 +1,128 @@
+# [Theory] How do you enforce build size limits?
+
+## 1. What is it?
+
+Enforcing build size limits means setting a hard ceiling on how big your compiled app's files are allowed to get - and having the build itself warn you, or outright fail, when someone accidentally crosses that line. In Angular, the built-in tool for this is called **budgets**, configured in `angular.json`. Instead of only finding out your bundle got huge when a user on a slow connection complains, the build tells you immediately, at the moment the change that caused it gets built.
+
+## 2. Why introduced?
+
+Every dependency you add, every large date/chart library you import without thinking about it, and every bit of code that isn't properly lazy-loaded adds to the JavaScript the browser has to download, parse, and run before your app becomes usable. That cost is invisible while you're coding - your local dev machine and fast office wifi hide it completely - but it's very visible to a real user on a mid-range phone on 4G. Without an enforced limit, bundle size only ever tends to grow, one "just one more import" at a time, and by the time it's noticeably slow, it's often the result of dozens of small additions that nobody flagged individually. Budgets turn "app performance" from something you occasionally remember to check into something the build system checks for you, every single time.
+
+## 3. How does it work?
+
+- Angular CLI supports a `budgets` array inside each build configuration in `angular.json`. Each entry defines a `type` (what's being measured), and `maximumWarning`/`maximumError` thresholds.
+- Common budget `type`s: `initial` (the total JS the app needs to boot, before any lazy-loaded routes), `anyComponentStyle` (any single component's CSS file), `bundle` (a specific named bundle), and `any` (any individual output file).
+- When you run `ng build`, the CLI compares the actual output size against these thresholds. Crossing `maximumWarning` prints a warning but the build still succeeds. Crossing `maximumError` **fails the build outright** - `ng build` exits with a non-zero code.
+- That non-zero exit code is the actual enforcement mechanism in practice: hook `ng build` into your CI pipeline (GitHub Actions, GitLab CI, Jenkins, whatever), and a budget-exceeding change simply can't merge or deploy, because the pipeline step fails.
+- Budgets alone only tell you *that* something got too big, not *what* caused it. For that, you reach for a bundle analyzer - `source-map-explorer` or `webpack-bundle-analyzer` - which reads the build's source maps and renders a visual, sized breakdown of exactly which modules/dependencies make up the bundle, so you can find the actual offending import.
+- Beyond budgets themselves, the practices that keep bundles small enough to pass those budgets in the first place: lazy-loading feature routes (`loadComponent`/`loadChildren`) so initial bundle size doesn't include code the user might never visit, checking a library's real bundle cost before adding it (a date-formatting library can range from a few KB to 70+ KB depending which one you pick), and avoiding barrel-file imports that accidentally pull in far more than the one thing you needed (tree-shaking can only remove what it can prove is unused, and it can't always prove that through a big barrel re-export).
+
+## 4. Example
+
+```json
+// angular.json (inside projects.<name>.architect.build.configurations.production)
+{
+  "budgets": [
+    {
+      "type": "initial",
+      "maximumWarning": "500kb",
+      "maximumError": "1mb"
+    },
+    {
+      "type": "anyComponentStyle",
+      "maximumWarning": "4kb",
+      "maximumError": "8kb"
+    }
+  ]
+}
+```
+
+```bash
+# Running a production build with these budgets in place:
+$ ng build --configuration production
+
+Error: bundle initial exceeded maximum budget. Budget 1.00 MB was not met by 128.40 kB with a total of 1.13 MB.
+
+# Exit code is non-zero here - this is what makes CI actually fail the job,
+# not just print a warning that a human might scroll past.
+```
+
+```bash
+# Investigating WHAT caused it, once a budget trips:
+$ npx source-map-explorer dist/my-app/browser/*.js
+# Opens an HTML treemap: bigger boxes = bigger chunks of your bundle,
+# labeled by the actual package/module that produced them.
+```
+
+## 5. Example Explanation – Execution Flow
+
+1. A developer adds a new npm package (say, a full-featured charting library) to a component that loads on the initial route, then opens a PR.
+2. CI runs `ng build --configuration production` as part of the pipeline.
+3. The Angular CLI compiles the app, measures the actual output size of the `initial` bundle, and compares it against the `budgets` entry for `type: "initial"` in `angular.json`.
+4. The new library pushed the initial bundle from 890kb to 1.13mb - past the `maximumError: "1mb"` threshold. The CLI prints the exact overage and **fails the build** with a non-zero exit code.
+5. The CI pipeline step fails because of that exit code, which blocks the PR from merging (assuming CI is a required check) - the size regression never reaches production.
+6. The developer runs `source-map-explorer` locally, sees the charting library is the single largest chunk, and either lazy-loads the route that uses it, switches to a smaller charting library, or imports only the specific chart type needed instead of the whole library - then re-runs the build to confirm it's back under budget.
+
+## 6. When to use?
+
+- Any production Angular app, from day one - budgets are cheap to set up and catch regressions before they ship, rather than after a user complains.
+- Especially important on projects with multiple contributors, where no single person is tracking bundle size by feel across every PR.
+- Worth revisiting the thresholds themselves periodically - a budget set once at project start can become outdated as the app legitimately grows, and either gets bypassed by developers annoyed at constant failures (too strict), or stops catching real regressions (too loose).
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- Turns bundle-size regressions into a build-time failure instead of a production performance complaint discovered much later.
+- Requires no extra tooling to get started - budgets are a built-in Angular CLI feature, configured in a file that's already there.
+- Pairs naturally with CI - the same `ng build` step you're already running for deployment does the enforcement for free.
+
+**Disadvantages**
+- Budgets tell you *that* the bundle is too big, not *why* - diagnosing the actual cause still requires a separate tool like `source-map-explorer`.
+- A single blanket `initial` budget doesn't distinguish between "this route everyone hits on load" and "this rarely-used feature" - it's a coarse, whole-app number unless you also structure the app with proper lazy loading and per-route budgets.
+- Thresholds that are too tight cause constant, low-value CI failures that teams learn to raise "just to make it pass" - at which point the budget has stopped meaning anything.
+
+## 8. Common Interview Traps
+
+- Saying budgets "minify" or "optimize" the bundle - they don't; they only measure and gate, they don't reduce size themselves.
+- Forgetting that `maximumWarning` doesn't fail the build - only `maximumError` does. A team relying only on warnings can still ship a regression, since nothing actually blocks it.
+- Not knowing that enforcement in practice depends on CI treating `ng build`'s non-zero exit code as a failing, required check - a budget with no CI wired to it is just a local warning nobody's forced to look at.
+- Confusing budgets (a size ceiling check) with tree-shaking/lazy-loading (techniques that actually reduce size) - they're complementary, not the same thing: budgets catch when the size-reduction techniques weren't enough or weren't applied.
+
+## 9. Interview Follow-up Questions
+
+**Q1: What's the difference between the `initial` and `bundle` budget types?**
+A: `initial` covers everything needed to boot the app before any lazy-loaded route is visited - it's the number that most directly affects first-load performance. `bundle` targets one specific named bundle (for example, a particular lazy-loaded chunk), letting you set a tighter or looser limit on an individual piece rather than the whole initial payload.
+
+**Q2: If a budget check fails in CI, but the size increase is legitimate and expected, what's the right move?**
+A: Deliberately raise that specific budget's threshold in `angular.json`, as its own reviewed change, with a reason in the PR description - not silently bump it as a side effect of an unrelated change, and not disable the check. That keeps the budget meaningful: a future accidental regression on top of the new baseline still gets caught.
+
+**Q3: How would you catch a bundle-size regression even earlier than a CI build - say, before a PR is even opened?**
+A: Run `ng build --configuration production` (or a lighter equivalent) as a local pre-push git hook, or rely on editor/CI bots that comment bundle-size diffs directly on the PR. The goal is shortening the feedback loop - the earlier a developer sees the size impact of their own change, the cheaper it is to fix before it's someone else's problem in review.
+
+**Q4: Are budgets specific to Angular, or is this a general web build concept?**
+A: The concept - fail the build if output size crosses a threshold - is general and shows up in most modern build tools (webpack's `performance.maxAssetSize`, bundlesize/bundlewatch as standalone CI tools, Next.js's bundle analyzer plugin, and so on). Angular's `budgets` in `angular.json` is just the Angular CLI's built-in, first-class implementation of that same general idea.
+
+## 10. Quick Answer (say this first)
+
+"Angular CLI has a built-in `budgets` setting in `angular.json` where you define size thresholds - like `maximumWarning` and `maximumError` - per bundle type (`initial`, `anyComponentStyle`, specific named bundles, and so on). Crossing `maximumError` makes `ng build` fail with a non-zero exit code, and wiring that build into CI is what actually enforces it - a size regression fails the pipeline and can't merge. Budgets tell you *that* something got too big; a tool like `source-map-explorer` is what you'd reach for to see *what* actually caused it."
+
+## 11. Interview-Ready Answer (full)
+
+"Angular has a built-in mechanism for this called budgets, configured in the `budgets` array of a build configuration in `angular.json`. Each entry has a `type` - things like `initial` for the total JS needed before any lazy route loads, `anyComponentStyle` for a single component's CSS, or `bundle` for one specific named chunk - along with `maximumWarning` and `maximumError` thresholds. When you run `ng build`, the CLI measures the actual output against those thresholds. Crossing the warning threshold just prints a message, but crossing the error threshold fails the build outright with a non-zero exit code.
+
+That exit code is really where the enforcement comes from in practice - budgets by themselves are just numbers in a config file until the build that checks them is a required step in CI. Once `ng build` is part of the pipeline, a PR that pushes a bundle past its budget simply can't merge, because the CI job fails. That turns a size regression into something caught automatically at PR time, instead of something a user on a slow connection notices weeks later in production.
+
+Budgets alone only tell you that a bundle got too big, not why, so I'd pair them with a bundle analyzer - `source-map-explorer` or `webpack-bundle-analyzer` - to get an actual visual, sized breakdown of what's inside the bundle and find the specific dependency or import responsible. And budgets work best alongside the practices that keep size down in the first place - lazy-loading feature routes so they're not part of the initial bundle at all, checking a new dependency's real cost before adding it, and avoiding barrel-file imports that can defeat tree-shaking. Budgets are the safety net that catches it when those practices weren't followed; they're not a substitute for them."
+
+## 12. Quick Revision
+
+1. **Mechanism:** Angular CLI's `budgets` array in `angular.json`, per bundle `type`, with `maximumWarning`/`maximumError` thresholds.
+2. **Enforcement:** crossing `maximumError` fails `ng build` (non-zero exit code) - wiring that into CI as a required check is what actually blocks a regression from merging.
+3. **Warning vs. error:** `maximumWarning` only prints a message; the build still succeeds - only `maximumError` blocks anything.
+4. **Diagnosing the cause:** budgets tell you *that* it's too big; `source-map-explorer`/`webpack-bundle-analyzer` tell you *what* is too big.
+5. **Prevention, not just detection:** lazy-loading routes, checking a library's real size before adding it, and avoiding barrel imports that defeat tree-shaking are what actually keep bundles under budget.
+6. **General concept:** budgets are Angular's version of a pattern most build tools have (webpack's `performance.maxAssetSize`, bundlesize/bundlewatch, etc.).
+
+## 13. Memory Trick
+
+**Think of budgets as a luggage scale at the airport check-in counter.** The scale (the budget) doesn't pack your bag lighter for you - it just tells you, right at check-in (build time), whether you're under the limit (pass), close to it (warning), or over it and not getting on the plane until you fix it (error, build fails). Figuring out *what's* making the bag too heavy - the shoes, the books - is a separate job, the same way `source-map-explorer` is the separate job of figuring out what's actually bloating the bundle.
