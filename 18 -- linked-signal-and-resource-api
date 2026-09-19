@@ -1,0 +1,161 @@
+# [Theory] What is `linkedSignal()` and the `resource()` API? What problems do they solve compared to `computed()` and manual HTTP calls?
+
+## 1. What is it?
+
+Both are newer additions to Angular's signal system, and both exist to cover gaps that `signal()` and `computed()` alone don't handle well:
+
+- **`linkedSignal()`** is a signal that's normally *derived* from another signal (like `computed()`), but - unlike `computed()` - it's also **writable**. You can manually overwrite its value, and it will automatically snap back to being derived again the next time its source changes.
+- **`resource()`** is a signal-based wrapper for **asynchronous data fetching**. You give it a reactive "what to fetch" description and a loader function, and it manages the loading/error/data state and automatic cancellation of stale requests for you - all exposed as signals.
+
+## 2. Why introduced?
+
+**`linkedSignal()`'s gap:** `computed()` is great for pure derived state, but it's read-only - calling `.set()` on a computed signal throws an error. Plenty of real UI state is "mostly derived, but the user can also override it, and it should reset when the source changes" - a classic example is a dropdown that defaults to the first item in a list, but lets the user pick a different one, and should snap back to the new first item if the underlying list changes. Before `linkedSignal()`, building this required a plain `signal()` plus a manually written `effect()` that watches the source and resets the signal - which works, but scatters the "how does this reset" logic into a side effect elsewhere, is easy to get wrong on timing, and isn't obviously connected to its source just by reading the field declaration.
+
+**`resource()`'s gap:** fetching data reactively - "refetch whenever this signal changes, track loading/error state, and don't let a stale in-flight request overwrite a newer one" - is an extremely common need, but doing it by hand with `HttpClient` means manually declaring three separate signals (data, loading, error), writing an `effect()` to trigger the fetch when a dependency changes, and remembering to cancel the previous subscription before starting a new one to avoid a race condition (the same class of problem the async validator's built-in cancellation solved for forms, in this note set's earlier username-availability note - except here there was no built-in equivalent before `resource()` existed). It's the kind of code that gets rewritten slightly differently in every component that needs it, with slightly different bugs each time.
+
+## 3. How does it work?
+
+**`linkedSignal()`:**
+- Basic form: `linkedSignal(() => someComputation())` - looks just like `computed()`, and behaves like it *until* you call `.set()` or `.update()` on it. A manual write sticks - it won't be silently overwritten - until the tracked source signal(s) inside the computation change again, at which point the linked signal recomputes fresh from the computation, discarding the manual override.
+- Advanced form: `linkedSignal({ source: () => sourceSignal(), computation: (source, previous) => ... })` - this variant hands the computation function both the new source value and the linked signal's *previous* value (source and result), which lets you write logic like "keep the current selection if it's still valid in the new list; otherwise fall back to a default" instead of always blindly resetting.
+
+**`resource()`:**
+- You call `resource({ request: () => (...), loader: async ({ request, abortSignal }) => (...) })`. The `request` function is itself a reactive computation - whenever any signal it reads changes, Angular treats that as "the input changed" and re-runs the `loader`.
+- The `loader` receives that request value plus an `AbortSignal`. `resource()` automatically calls `abort()` on that signal if a newer request starts before the current one finishes - so, like the async-validator cancellation covered earlier in this note set, only the most recent request's result is ever applied; a slow, stale response can't come back late and overwrite fresher data.
+- The resource exposes everything as signals: `.value()` (the loaded data, or `undefined` before it resolves), `.status()`/`.isLoading()`, `.error()`, and a `.reload()` method to manually re-trigger the loader with the same request value.
+- There's also `rxResource()` (from `@angular/core/rxjs-interop`) for when the loader naturally returns an RxJS `Observable` - like a direct `HttpClient` call - instead of a `Promise`, so you don't have to manually convert it first.
+- As of this writing, `resource()`/`rxResource()` are still marked as **developer preview** in Angular's own documentation - the API shape is close to final but not yet declared fully stable, which is worth mentioning if asked in an interview.
+
+## 4. Example
+
+```typescript
+// linkedSignal(): a list with a selection that resets when the list changes,
+// but can also be manually overridden by the user in between.
+import { signal, computed, linkedSignal } from '@angular/core';
+
+const items = signal(['Apple', 'Banana', 'Cherry']);
+
+// Defaults to the first item. If the user picks something else, that pick
+// sticks - but the moment `items` itself changes, this recomputes fresh
+// back to the (new) first item, discarding the manual pick.
+const selected = linkedSignal(() => items()[0]);
+
+selected.set('Banana'); // manual override - sticks for now
+console.log(selected()); // 'Banana'
+
+items.set(['Date', 'Elderberry']); // source changed
+console.log(selected()); // 'Date' - snapped back to derived, override discarded
+```
+
+```typescript
+// linkedSignal() advanced form: preserve the selection if it's still valid,
+// only fall back to a default if it isn't.
+const selectedId = linkedSignal<number[], number | undefined>({
+  source: () => items().map((_, i) => i),
+  computation: (validIds, previous) => {
+    const stillValid = previous?.value !== undefined && validIds.includes(previous.value);
+    return stillValid ? previous!.value : validIds[0];
+  },
+});
+```
+
+```typescript
+// resource(): fetching a user's profile reactively, keyed off a signal.
+import { Component, signal } from '@angular/core';
+import { resource } from '@angular/core';
+
+@Component({ /* ... */ })
+export class UserProfileComponent {
+  userId = signal(1);
+
+  userResource = resource({
+    request: () => ({ id: this.userId() }),
+    loader: async ({ request, abortSignal }) => {
+      const res = await fetch(`/api/users/${request.id}`, { signal: abortSignal });
+      if (!res.ok) throw new Error('Failed to load user');
+      return res.json() as Promise<{ id: number; name: string }>;
+    },
+  });
+
+  // In the template: userResource.value(), userResource.isLoading(),
+  // userResource.error() - all plain signal reads, no manual subscribe.
+
+  nextUser(): void {
+    // Changing this signal automatically triggers a new loader run, and
+    // resource() cancels the previous in-flight fetch via abortSignal.
+    this.userId.update((id) => id + 1);
+  }
+}
+```
+
+**Verification status:** these two APIs (`linkedSignal()` and `resource()`/`rxResource()`) require Angular v19 or later, and this note set's StackBlitz sandbox environment is pinned to Angular 17.0.1 by the platform (the same constraint that forced `@Input()`/`@ViewChild` fallbacks on earlier notes in this set). Unlike those earlier cases, there's no older decorator-based equivalent to fall back to here - `linkedSignal()` and `resource()` are genuinely new primitives with no pre-signals equivalent syntax - so I'm not able to build a compiling, click-verified StackBlitz demo for this one on the pinned environment. The code above reflects the real, documented API shape; treat it as accurate reference syntax rather than something verified live in this note set's sandbox.
+
+## 5. Example Explanation – Execution Flow
+
+**`linkedSignal()`:** reading `selected()` the first time runs the computation (`items()[0]`), same as `computed()` would. Calling `selected.set('Banana')` overwrites that value directly - `linkedSignal()` allows writes that `computed()` never would. That manual value is what `selected()` returns from now on, right up until `items` changes again; the moment it does, Angular reruns the computation from scratch (`items()[0]` against the *new* array), and that fresh result replaces whatever was manually set - the override doesn't survive a real source change.
+
+**`resource()`:** setting `userId` to a new value changes what `request()` returns, which `resource()` is watching. It starts a new call to `loader`, handing it an `abortSignal`. If `userId` changes again before that call resolves, `resource()` aborts the in-flight fetch (the `AbortSignal` fires, and a well-behaved `fetch()` call stops early) and starts a fresh loader run for the newest value - so a slow response for an old, no-longer-relevant `userId` can never land after a newer one already resolved. Once the loader's promise resolves, `userResource.value()` updates and any template reading it re-renders - no manual subscription, and no manual "isLoading" flag either, since `.isLoading()` is already tracking that internally.
+
+## 6. When to use?
+
+- **`linkedSignal()`**: any "derived by default, but user-overridable, and should reset when the source meaningfully changes" state - a selected item in a list that can be reloaded, a form field pre-filled from a computed default that a user can still edit, a filter that resets when its underlying dataset changes.
+- **`resource()`**: any component-level async fetch driven by a reactive value - loading a record by a route param or a signal-based ID, a search-as-you-type result set, anything you'd otherwise build with a manual `effect()` + `HttpClient` + hand-rolled loading/error signals.
+- Neither replaces `computed()` for plain, always-derived, never-manually-set values - `computed()` is still the right (and simpler) choice whenever nothing needs to override the result.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- `linkedSignal()` collapses "derived value that both computed() and a manual signal+effect() were both partially solving" into one declarative primitive, with the reset behavior visible right where the signal is declared instead of hidden in a separate effect.
+- `resource()` gives loading/error/data/cancellation for free, as signals, replacing a pattern that was previously hand-rolled slightly differently in every component that needed it.
+- Both compose naturally with the rest of the signals ecosystem - a `resource()`'s `.value()` can feed directly into a `computed()` or another `linkedSignal()`.
+
+**Disadvantages**
+- `resource()`/`rxResource()` are still developer preview as of this writing - the shape could still change before final stabilization, which matters for anyone building on it in production today.
+- `linkedSignal()`'s "reset on source change, but not on manual write" behavior is a specific, somewhat subtle contract - a developer unfamiliar with it can be surprised the first time an override they set gets silently discarded by an unrelated-looking source change.
+- Neither is available on older Angular versions (pre-v19), so codebases on an older major version don't have access to them and must keep using the manual patterns these APIs were designed to replace.
+
+## 8. Common Interview Traps
+
+- Saying `linkedSignal()` is "just `computed()` that you can also write to" without mentioning the reset-on-source-change behavior - that reset is the entire point; without it, it would just be an oddly-named plain `signal()`.
+- Assuming `resource()` behaves like a `computed()` that happens to be async - it isn't purely derived in the same sense, since it also carries loading/error state and a `.reload()` escape hatch that has no `computed()` equivalent.
+- Forgetting that `resource()`'s automatic cancellation depends on the loader actually respecting the passed `abortSignal` - a `loader` using an API that ignores the abort signal won't actually get cancelled, it'll just have its result discarded once it eventually resolves.
+- Not knowing `rxResource()` exists for Observable-returning loaders - reaching for a manual `firstValueFrom()`/`lastValueFrom()` conversion around an `HttpClient` call inside a plain `resource()` loader works, but `rxResource()` is the more direct fit when the source is already RxJS-based.
+
+## 9. Interview Follow-up Questions
+
+**Q1: Could you build what `linkedSignal()` does using `signal()` and `effect()` instead?**
+A: Yes, and that's exactly what people did before it existed - a plain `signal()` for the value, plus an `effect()` that watches the source and calls `.set()` on the signal whenever it changes. The tradeoffs: the reset logic lives in a separate `effect()` block rather than being visible at the point of declaration, effects run asynchronously relative to the signal graph rather than synchronously like a computed's recomputation-on-read, and you have to be careful the effect doesn't also fire from the linked signal's own manual writes if it isn't scoped carefully. `linkedSignal()` packages the whole pattern into one purpose-built primitive instead.
+
+**Q2: How is `resource()`'s cancellation different from the async-validator cancellation covered earlier in this note set?**
+A: They solve the same underlying problem - "don't let a stale, slower response overwrite a newer one" - but through different mechanisms. Angular's async validator cancellation works by unsubscribing from the previous validator call's Observable entirely when a new one starts. `resource()` instead passes each loader call an `AbortSignal` and calls `.abort()` on the old one when a new request begins - which only actually stops the underlying work if the loader's own async call (like `fetch`) is written to respect that abort signal; otherwise the old call still runs to completion in the background, it just gets ignored once it resolves.
+
+**Q3: If `resource()` is still developer preview, what would you use in a production app today instead?**
+A: The manual pattern it's designed to replace - a plain `signal()` (or three: data/loading/error), triggered from an `effect()` watching the relevant reactive inputs, using RxJS's `switchMap` (or manual unsubscribe-and-resubscribe) for cancellation of stale requests. It's more code, but it's built entirely on stable, already-shipped Angular and RxJS APIs. Whether to adopt `resource()` early depends on the team's risk tolerance for an API that could still see breaking changes before it's finalized.
+
+**Q4: Does `linkedSignal()` fire on every source signal read, like `computed()` does?**
+A: Yes - the computation function passed to `linkedSignal()` is tracked the same way `computed()`'s is: any signal read inside it becomes a dependency, and a change to any of those dependencies triggers a fresh recomputation (which, as covered above, also silently discards any manual override that was set in the meantime).
+
+## 10. Quick Answer (say this first)
+
+"`linkedSignal()` is like `computed()` but writable - it's normally derived from a source, but you can manually override it, and it automatically resets back to derived the next time its source actually changes. It solves the 'mostly derived, sometimes user-overridable' pattern that used to need a manual `signal()` plus an `effect()` to reset it. `resource()` is a signal-based async data-fetching primitive - give it a reactive request and a loader function, and it manages loading/error/data state and automatically cancels a stale in-flight request when a newer one starts, replacing the hand-rolled `HttpClient` + `effect()` + manual cancellation pattern people wrote before it existed."
+
+## 11. Interview-Ready Answer (full)
+
+"Both of these fill specific gaps that `signal()` and `computed()` don't cover on their own. `computed()` is read-only by design - you can't call `.set()` on it - which is fine for pure derived values, but plenty of real state is 'derived by default, but the user can also override it, and it should reset when the underlying source actually changes.' `linkedSignal()` is built exactly for that: it looks and behaves like `computed()` until you manually write to it, at which point that override sticks - right up until the tracked source changes again, when it recomputes fresh and the override is discarded. Before this existed, you'd build the same behavior with a plain `signal()` and a separate `effect()` watching the source to reset it, which works but scatters the reset logic away from the signal's own declaration and introduces effect-timing considerations that a computed-style API doesn't have.
+
+`resource()` solves a different, very common gap: reactive async data fetching. You give it a `request` function - itself a reactive computation - and a `loader` that does the actual fetch, and it handles the rest: it re-runs the loader whenever the request value changes, exposes `.value()`, `.isLoading()`, and `.error()` as plain signals, and automatically cancels a stale in-flight request via an `AbortSignal` when a newer request starts, so a slow response for outdated input can never overwrite fresher data. That's the same category of problem the async validator's built-in cancellation solves for Reactive Forms, just generalized to any async fetch rather than form validation specifically. Before `resource()`, this meant hand-rolling separate loading/data/error signals, an `effect()` to trigger the fetch, and manual subscription management to avoid race conditions - code that tended to get rewritten slightly differently, with slightly different bugs, in every component that needed it.
+
+One caveat worth mentioning: `resource()` and its RxJS-flavored sibling `rxResource()` are still developer preview as of this writing, so the API shape isn't fully locked down yet - worth factoring into any decision to adopt it in a production codebase today."
+
+## 12. Quick Revision
+
+1. **`linkedSignal()`:** derived like `computed()`, but writable - manual overrides stick until the source changes, then it recomputes fresh and discards the override.
+2. **Problem it solves:** "mostly derived, sometimes user-overridable" state that previously needed a `signal()` + a manually written `effect()` to reset.
+3. **`resource()`:** signal-based async data fetching - reactive `request`, a `loader` function, and automatic `.value()`/`.isLoading()`/`.error()` signals.
+4. **Problem it solves:** replaces hand-rolled loading/error/data signals plus manual cancellation of stale in-flight requests (the same "only the latest matters" problem async validators solve for forms, generalized to any fetch).
+5. **Cancellation mechanism:** `resource()` uses `AbortSignal` passed into the loader - only effective if the loader's own async call actually respects it.
+6. **Caveat:** `resource()`/`rxResource()` are still developer preview; `linkedSignal()` and `resource()` both require Angular v19+, with no pre-signals equivalent syntax to fall back to on older versions.
+
+## 13. Memory Trick
+
+**`linkedSignal()` is a whiteboard with an eraser and an auto-refresh button.** Normally it just shows you the calculated answer (like `computed()`). You're allowed to grab the eraser and write something else on it yourself - and that stays, until the auto-refresh button gets pressed (the source changes), at which point it wipes your edit and recalculates fresh. **`resource()` is a request desk with a "only serve the latest ticket" rule.** You hand it a request; if you hand it a newer request before the first one comes back, it tells the first one's response to stop mattering (aborts it) and only ever hands you back the answer to your most recent ask - so you're never handed a stale answer to a question you're no longer asking.
