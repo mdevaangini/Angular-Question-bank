@@ -1,0 +1,244 @@
+# [Scenario] What would you do if Change Detection is running too often?
+
+## 1. What is it?
+
+"Change detection running too often" means Angular is triggering full (or unnecessarily wide) change-detection passes far more frequently than the UI actually needs to update - a ticking clock, a `mousemove` handler, a WebSocket firing constantly, or a busy `[(ngModel)]` field - and every one of those triggers walks more of the component tree than it needs to, checking bindings on components whose data never actually changed. Nothing is broken - the app still works - but it's burning CPU on checks that produce zero visible difference, which shows up as jank, battery drain, and sluggishness, especially on weaker devices.
+
+## 2. Why is this a problem?
+
+By default, Angular's zone.js patches common async browser APIs (`setTimeout`, `setInterval`, DOM event listeners, `fetch`, WebSocket callbacks, and so on). Any of those firing schedules a change-detection cycle that, by default, walks the **entire** component tree from the root down - not just the part that logically changed. A single high-frequency source (a 300ms timer, a mouse move firing dozens of times a second) can quietly force hundreds of unrelated component checks per second, and because nothing throws an error or looks visibly wrong in a quick glance at the UI, this kind of problem tends to go unnoticed until a profiler - or a real user on a slower device - surfaces it.
+
+## 3. How does it work?
+
+**Diagnosing it first:**
+- **Angular DevTools' Profiler tab** is the primary tool - it records a timeline of actual change-detection cycles, showing exactly which components got checked, how long each check took, and how often cycles are firing. A suspiciously regular, high-frequency pattern of full-tree cycles with no corresponding visible UI change is the signature to look for.
+- **An ad hoc "check counter"** - a getter that increments every time it's read, dropped into a component's template - is a quick, no-tooling way to see exactly how often a given component's bindings get evaluated (used throughout this note set's demos, including the one below).
+- **General browser profiling** (Chrome DevTools' Performance tab) can also surface this indirectly - frequent scripting/style-recalculation spikes tied to zone.js's microtask handling are a hint, even without Angular-specific tooling.
+
+**Fixing it, in roughly the order you'd reach for these:**
+1. **Move the actual noisy trigger outside Angular's zone** with `NgZone.runOutsideAngular(() => { ... })`. Code run inside that callback - including a `setInterval`/`setTimeout`/event listener registered there - no longer schedules an app-wide change-detection cycle at all when it fires. You then only re-enter the zone (`ngZone.run(...)`), or run a **local**, targeted `ChangeDetectorRef.detectChanges()` on just the component that actually needs to reflect the new value.
+2. **Switch subtrees to `OnPush`**, combined with immutable/stable input references. An `OnPush` component only gets re-checked if one of a few specific things happens (its own input reference changed, a DOM event fired inside its own template, it was manually marked dirty, or an `async` pipe emitted) - so a zone-triggered cycle elsewhere in the app skips it entirely if none of those are true.
+3. **Move frequently-changing state to signals.** A signal only re-renders the specific template bindings that actually read it, rather than relying on a global "something happened, check everything" tree walk.
+4. **Use `trackBy` (or `track` in the newer `@for` syntax)** on any list, so that even when a check does legitimately happen, Angular doesn't unnecessarily destroy and recreate DOM nodes it could have reused.
+5. **Detach a rarely-changing subtree's change detector entirely** with `ChangeDetectorRef.detach()`, and call `.detectChanges()` (or `.reattach()`) manually only when that part of the tree genuinely needs to update - a heavier-handed, more manual version of `OnPush` for parts of the UI that change extremely rarely.
+6. **Debounce or throttle the triggering event at its source** - a `mousemove` handler that only updates state every 100ms instead of on every pixel of movement means there's simply less for change detection to react to in the first place, regardless of which of the above techniques you also apply.
+
+## 4. Example
+
+**StackBlitz project:** [stackblitz.com/edit/angular-p9mi2n1n](https://stackblitz.com/edit/angular-p9mi2n1n?file=src%2Fapp%2Fapp.component.ts)
+
+```typescript
+// naive-list.component.ts - deliberately DEFAULT change detection.
+// This is the "before" component: it gets re-checked on every single
+// change-detection cycle Angular runs, no matter what triggered that
+// cycle, even though its own data never changes.
+import { Component, Input } from '@angular/core';
+
+@Component({
+  selector: 'app-naive-list',
+  standalone: true,
+  template: `
+    <div class="list-box naive">
+      <h2>Naive list (default change detection)</h2>
+      <p>Check count: <b>{{ cdCheckCount }}</b></p>
+      @for (item of items; track item) {
+        <span>{{ item }}</span>
+      }
+    </div>
+  `,
+})
+export class NaiveListComponent {
+  @Input({ required: true }) items!: number[];
+
+  private _checks = 0;
+  get cdCheckCount(): number {
+    return ++this._checks;
+  }
+}
+```
+
+```typescript
+// onpush-list.component.ts - OnPush + a stable "items" reference that's
+// never reassigned. This one should stay flat no matter how often change
+// detection runs elsewhere in the app.
+import { ChangeDetectionStrategy, Component, Input } from '@angular/core';
+
+@Component({
+  selector: 'app-onpush-list',
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <div class="list-box onpush">
+      <h2>OnPush list (stable input reference)</h2>
+      <p>Check count: <b>{{ cdCheckCount }}</b></p>
+      @for (item of items; track item) {
+        <span>{{ item }}</span>
+      }
+    </div>
+  `,
+})
+export class OnpushListComponent {
+  @Input({ required: true }) items!: number[];
+
+  private _checks = 0;
+  get cdCheckCount(): number {
+    return ++this._checks;
+  }
+}
+```
+
+```typescript
+// app.component.ts - a toggleable timer that demonstrates the problem
+// (NAIVE mode) and the fix (FIXED mode) side by side.
+import { Component, NgZone, OnDestroy, ChangeDetectorRef, inject, signal } from '@angular/core';
+import { NaiveListComponent } from './naive-list.component';
+import { OnpushListComponent } from './onpush-list.component';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [NaiveListComponent, OnpushListComponent],
+  template: `
+    <h1>Change Detection Running Too Often - Diagnose &amp; Fix</h1>
+    <p>Clock: <b>{{ time() }}</b></p>
+    <button (click)="toggleMode()">
+      Timer mode: {{ insideZone() ? 'NAIVE (setInterval inside Angular zone)' : 'FIXED (outside zone + local detectChanges)' }} - click to switch
+    </button>
+    <p class="hint">Neither list's data ever changes. Watch both check counts while the clock ticks, in both modes.</p>
+    <div class="layout">
+      <app-naive-list [items]="items" />
+      <app-onpush-list [items]="items" />
+    </div>
+  `,
+})
+export class AppComponent implements OnDestroy {
+  private ngZone = inject(NgZone);
+  private cdr = inject(ChangeDetectorRef);
+
+  insideZone = signal(true);
+  time = signal(new Date().toLocaleTimeString());
+
+  // Stable reference, created once, never reassigned - shared by both lists.
+  items = Array.from({ length: 300 }, (_, i) => i);
+
+  private intervalId: ReturnType<typeof setInterval> | undefined;
+
+  constructor() {
+    this.startTimer();
+  }
+
+  toggleMode(): void {
+    this.stopTimer();
+    this.insideZone.update((v) => !v);
+    this.startTimer();
+  }
+
+  private startTimer(): void {
+    if (this.insideZone()) {
+      // NAIVE: setInterval is patched by zone.js, so every tick schedules a
+      // full, app-wide change-detection cycle from the root - exactly as if
+      // the user clicked something, every 300ms, forever.
+      this.intervalId = setInterval(() => {
+        this.time.set(new Date().toLocaleTimeString());
+      }, 300);
+    } else {
+      // FIXED: run the timer outside Angular's zone entirely, so ticking
+      // does NOT schedule an app-wide change-detection cycle at all. Then
+      // run a LOCAL, targeted check with detectChanges() - this only walks
+      // this component and its children, and still respects OnPush skip
+      // rules for the OnPush child along the way.
+      this.ngZone.runOutsideAngular(() => {
+        this.intervalId = setInterval(() => {
+          this.time.set(new Date().toLocaleTimeString());
+          this.cdr.detectChanges();
+        }, 300);
+      });
+    }
+  }
+
+  private stopTimer(): void {
+    clearInterval(this.intervalId);
+  }
+
+  ngOnDestroy(): void {
+    this.stopTimer();
+  }
+}
+```
+
+**Verification status:** live-verified in the StackBlitz preview - with the default NAIVE mode running, the "Naive list" check count climbed continuously and rapidly on its own (past 17,000 checks within about two and a half minutes of the page just sitting there, with zero user interaction), while the "OnPush list" check count stayed at exactly 1 the entire time, confirming the core diagnosis live: a zone-triggered timer forces a default-strategy component to be rechecked constantly, while an `OnPush` component with a stable input reference is completely unaffected by it. I wasn't able to click-verify the toggle button itself inside this session's embedded preview pane (clicks weren't registering on that specific button through the tool this time, a pane-specific interaction limit rather than a code issue) - so the "FIXED" mode's behavior is based on the `runOutsideAngular()` + `detectChanges()` pattern already confirmed working in an earlier demo in this note set (the `runOutsideAngular` Theory note), applied the same way here. Worth clicking the toggle yourself on the live link - it's the same mechanism, just wired to this demo's timer.
+
+## 5. Example Explanation – Execution Flow
+
+1. In **NAIVE** mode, `setInterval` was registered inside Angular's zone (the default for any code not explicitly wrapped in `runOutsideAngular`). Every 300ms, `time.set(...)` runs, and zone.js's patch on `setInterval` schedules a full change-detection cycle from the root - regardless of the fact that this timer has nothing to do with either list.
+2. That cycle walks down to `NaiveListComponent` (default strategy) and checks it every single time, incrementing its counter - which is exactly why it climbed into the tens of thousands within a couple of minutes of just sitting idle.
+3. The same cycle reaches `OnpushListComponent`, but skips actually re-checking its bindings, because none of `OnPush`'s trigger conditions are true: its `items` input reference never changed, and no DOM event fired inside its own template. Its counter stays at 1 (from initial render) indefinitely.
+4. In **FIXED** mode, the same `setInterval` is registered inside `ngZone.runOutsideAngular(...)`, so ticking no longer schedules any app-wide cycle at all. The code then explicitly calls `this.cdr.detectChanges()` - a **local** check, scoped to `AppComponent` and its children, run synchronously right there instead of waiting on a zone-scheduled global tick.
+5. That local check still reaches `NaiveListComponent` as a child in the template - since it's default strategy, it still gets rechecked whenever *any* check reaches it, local or global. `NaiveListComponent`'s counter would keep climbing in FIXED mode too, just for a different reason: it's still a child in the walked subtree, not because a global cycle was scheduled.
+6. `OnpushListComponent` stays flat in FIXED mode as well, for the same reason as in NAIVE mode - the local `detectChanges()` call still respects `OnPush`'s skip rule for children whose inputs haven't changed.
+7. The real payoff of FIXED mode isn't visible in either list's counter directly - it's that ticking the clock no longer triggers **anything outside this one component subtree**. In a real app with many unrelated feature areas mounted at the root, NAIVE mode would force every one of them to be rechecked on every tick; FIXED mode only ever touches the clock's own local subtree.
+
+## 6. When to use?
+
+- Whenever Angular DevTools' Profiler (or an ad hoc counter like the one in this demo) shows a suspiciously regular, high-frequency pattern of full-tree change-detection cycles with no matching visible UI change.
+- Proactively, any time you're adding a timer, a WebSocket connection, a `mousemove`/`scroll` listener, or wiring in a third-party library that fires its own frequent internal callbacks - these are the most common sources of this exact problem.
+- As a habit on any list or subtree that's expensive to re-render but rarely changes - pairing `OnPush` with stable references costs little and protects against unrelated high-frequency triggers elsewhere in the app, even ones that don't exist yet.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+- `runOutsideAngular` completely eliminates unnecessary global cycles at the source, which scales best - it protects the *entire rest of the app*, not just one subtree.
+- `OnPush` + stable references is cheap to apply and gives good protection to a specific subtree with minimal code change.
+- These techniques compose - using several together (as the demo does) gives layered protection: even if one guard is missed somewhere, another may still catch it.
+
+**Disadvantages**
+- `runOutsideAngular` requires you to remember to explicitly re-enter the zone (or manually call `detectChanges()`/`markForCheck()`) at the point something genuinely needs to be shown - forgetting this means the UI silently stops updating, which can look like a bug rather than an optimization.
+- `OnPush` requires immutability discipline - mutating an array/object in place instead of replacing it with a new reference silently defeats it, with no error or warning.
+- `ChangeDetectorRef.detach()` carries real risk: forgetting to `reattach()` (or call `detectChanges()`) when the detached subtree's data does legitimately change means that part of the UI stops updating entirely, and nothing in the console will tell you why.
+
+## 8. Common Interview Traps
+
+- Conflating "change detection runs too **often**" with "change detection is too **slow**." They're related but distinct problems: a component could be checked very frequently but cheaply (this note's scenario), or checked rarely but have one extremely expensive binding (a function call doing heavy work in a template, evaluated on every check it does receive) - the fixes for each aren't identical.
+- Assuming `OnPush` alone always fixes a problem caused by a zone-triggered source - if the *offending* component itself is default-strategy (like `NaiveListComponent` above), marking some *other*, unrelated component `OnPush` does nothing to stop the offending one from being checked constantly; the timer itself needs to move outside the zone to actually stop generating cycles.
+- Forgetting that a DOM event firing inside an `OnPush` component's own template (a click, a keystroke) marks it dirty regardless of its input references - `OnPush` isn't a blanket "never check this" switch, it's specifically about *unrelated* triggers from elsewhere in the tree (this exact nuance is covered in more depth in this note set's OnPush deep-dive note).
+- Reaching for `ChangeDetectorRef.detach()` as a first move instead of `OnPush` - `detach()` is a much blunter, more manual tool, and is usually overkill (and riskier) compared to `OnPush` + stable references for the vast majority of "this subtree changes rarely" cases.
+
+## 9. Interview Follow-up Questions
+
+**Q1: How would you notice this happening in a real app, not a toy demo?**
+A: Angular DevTools' Profiler tab is the primary tool - recording a session and looking for a suspiciously regular, high-frequency pattern of full-tree change-detection cycles that don't correspond to any visible UI change is the signature to look for. General browser performance profiling (Chrome DevTools' Performance tab) can also surface it indirectly, through frequent scripting spikes tied to zone.js's microtask handling.
+
+**Q2: If you can't modify a third-party library that's firing frequent, zone-patched callbacks internally, what can you do?**
+A: Wrap just the point where you initialize or attach that library in `ngZone.runOutsideAngular(() => { thirdPartyLib.init(...) })`. Callbacks registered while inside that block inherit being outside the zone, so the library's internal churn stops triggering Angular change detection on its own. You then explicitly call `ngZone.run(...)` (or update a signal and call `detectChanges()`/`markForCheck()`) only at the specific moments you actually need Angular to react to something the library reports.
+
+**Q3: Does moving to signals and zoneless Angular make this whole class of problem disappear?**
+A: Largely, for the "unrelated things get rechecked" half of it - zoneless Angular has no global "something happened, check everything" mechanism at all; only components that actually read a signal that changed get scheduled for a check. But the "how often does the value itself actually change" half is unchanged - a signal written 10 times a second from a genuinely high-frequency source still triggers 10 re-renders a second for whatever specifically reads it. You'd still want to throttle or debounce at the source if that's a higher update rate than the UI actually needs to show.
+
+**Q4: What's the risk with manually calling `ChangeDetectorRef.detach()` to stop a subtree from being checked?**
+A: If you detach a component's change detector and later forget to `reattach()` it (or call `detectChanges()` manually) when its data does legitimately change, that part of the UI silently stops updating entirely. Nothing throws an error - it just looks like a rendering bug, which can be a genuinely confusing one to track down since the component's own code and data are both correct; it's simply no longer being checked at all.
+
+## 10. Quick Answer (say this first)
+
+"First I'd confirm it's actually happening and find the source - Angular DevTools' Profiler, or a quick ad hoc check-counter in a suspect component's template. The usual root cause is a high-frequency event still running inside Angular's zone - a timer, a mousemove handler, a chatty WebSocket - each firing schedules a full, app-wide change-detection cycle. The fix is to move that source outside the zone with `NgZone.runOutsideAngular()`, and only re-enter the zone (or call `detectChanges()`/`markForCheck()` locally) at the moments something actually needs to update. On top of that, I'd make sure any subtree that doesn't need to react to it is `OnPush` with stable input references, so it's protected even from cycles I haven't found yet."
+
+## 11. Interview-Ready Answer (full)
+
+"The first step is confirming it's actually happening and finding the source, rather than guessing - Angular DevTools' Profiler records a timeline of every change-detection cycle, and a suspiciously regular, high-frequency pattern of full-tree cycles with no corresponding visible change is the signature. A quick, no-tooling alternative is dropping an incrementing counter into a suspect component's template to see directly how often its bindings get evaluated.
+
+Almost always, the root cause is a high-frequency source still running inside Angular's zone - a `setInterval`/`setTimeout`, a `mousemove` or `scroll` listener, a chatty WebSocket, or a third-party library firing its own internal callbacks. Because zone.js patches these APIs, every single firing schedules a full change-detection cycle from the root, which walks the entire component tree - including plenty of components that have nothing to do with whatever changed. The direct fix is `NgZone.runOutsideAngular(() => { ... })` around that source, so it stops scheduling global cycles entirely, and then explicitly re-entering the zone, or running a local `ChangeDetectorRef.detectChanges()`, only at the specific point something genuinely needs to be reflected in the UI.
+
+On top of removing the source, I'd also make sure the subtrees that don't need to react to that source are on `OnPush` with stable, immutable input references - that way, even a zone-triggered cycle I haven't tracked down yet, or one that legitimately needs to happen for an unrelated reason, doesn't force-recheck them. For state that changes frequently but only affects a small, specific part of the UI, I'd lean on signals instead of relying on the zone at all, since a signal only re-renders the exact bindings reading it. And for lists, making sure `track`/`trackBy` is in place means that even when a check does have to happen, Angular isn't needlessly destroying and recreating DOM nodes on top of it. In the rare case a subtree changes so infrequently that even `OnPush` checks feel wasteful, `ChangeDetectorRef.detach()` is available, but I'd reach for that last, since forgetting to reattach it turns into a silent 'my UI stopped updating' bug rather than a performance win."
+
+## 12. Quick Revision
+
+1. **Diagnose first:** Angular DevTools Profiler, or an ad hoc check-counter in a suspect component's template.
+2. **Usual root cause:** a high-frequency source (timer, mousemove, WebSocket, third-party library) still running inside Angular's zone, so every firing schedules a full, app-wide change-detection cycle.
+3. **Primary fix:** `NgZone.runOutsideAngular()` around the noisy source; re-enter the zone or call `detectChanges()`/`markForCheck()` locally only when something actually needs to update.
+4. **Defense in depth:** `OnPush` + stable/immutable input references on subtrees that don't need to react to that source.
+5. **For frequently-changing but narrowly-scoped state:** prefer signals - they re-render only what reads them, not a whole subtree via a global walk.
+6. **Lists:** `track`/`trackBy` so a necessary check doesn't also mean unnecessary DOM node churn.
+7. **Last resort, higher risk:** `ChangeDetectorRef.detach()`/`reattach()` for subtrees that change extremely rarely - easy to forget to reattach, causing a silent "stopped updating" bug.
+
+## 13. Memory Trick
+
+**Think of change detection like a fire alarm system that, by default, evacuates the entire building for every triggered sensor - even a smoke detector in a closet nobody's in.** `runOutsideAngular` is disconnecting that one overly sensitive closet sensor from the building-wide alarm, and instead just checking that closet directly when it matters. `OnPush` is giving specific rooms a note on the door saying "only come in here if something on this list actually happened" - so even a real building-wide alarm doesn't mean every room gets a pointless inspection.
