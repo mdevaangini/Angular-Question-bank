@@ -129,9 +129,9 @@ export class AppComponent implements OnInit {
 }
 ```
 
-**StackBlitz:** https://stackblitz.com/edit/angular-3sdjfuhr
+**StackBlitz:** https://stackblitz.com/edit/angular-bvuthjg3
 
-> **Verification note:** This project was submitted and forked on StackBlitz to get a permanent link. The file tree, dependencies, and all source files (including `auth.service.ts`, `user.service.ts`, `permissions.service.ts`, and a `fake-backend.interceptor.ts` simulating the three chained endpoints with small delays) compiled without any red error banner in the preview pane. The preview pane itself stayed blank after "Starting dev server" — this is a known environment-side StackBlitz rendering issue seen consistently across this session's recent demos, not a defect in this code. The `AuthFlowService`/`AppComponent` pattern shown above follows the same `switchMap`-chaining approach already verified live in earlier demos this session.
+> **Verification note:** This demo was run live and confirmed working in the browser preview — not just compiled. The app boots, runs the full chain (login → profile → permissions), and renders: "Submitting login...", "Profile loaded: Ada Lovelace (org: org-7)", "Permissions loaded: dashboard:read, reports:write, billing:read", "Login flow complete." A `fake-backend.interceptor.ts` simulates the three chained endpoints with small delays so the sequential nature is visible. (An earlier link for this demo had a real bug — the hand-built StackBlitz project was missing `import 'zone.js'` in `main.ts`, which a full `ng new` scaffold normally wires up via `polyfills`/`angular.json` automatically — causing `NG0908: Angular requires Zone.js` and a permanently blank preview. That's fixed here and the link above is verified live.)
 
 ## 5. Example Explanation / Execution Flow
 
