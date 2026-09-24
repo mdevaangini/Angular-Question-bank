@@ -1,0 +1,302 @@
+# Persisting a Multi-Step Form Across Refresh/Crash (Draft Recovery)
+
+## 1. What is it?
+
+This is about **not losing user input** on a long multi-step form (like a job/loan application) when the browser refreshes, crashes, or the tab gets closed accidentally. The fix is **draft persistence**: as the user fills the form, their progress (current step + field values) gets saved to durable client-side storage — typically `localStorage` — on every change. When they come back, the app detects a saved draft and offers to restore it, instead of showing a blank form and forcing them to start over.
+
+## 2. Why was it introduced?
+
+Right now, all form state lives only in memory — in Angular component/service state (or in a `FormGroup`). Memory is wiped the instant the page reloads or the tab dies. For a long form, that's a real cost:
+
+- **Lost work is expensive for the user.** A multi-step application form can take 10-20 minutes to fill. Losing it to an accidental refresh, a crashed tab, or a flaky network reconnect that reloads the page is a genuinely bad experience, and it happens more often than you'd think — trackpad slips, browser extensions triggering a reload, OS updates killing the browser, laptop sleep/wake weirdness.
+- **It shows up as support tickets, not just bad UX.** "I filled out the whole form and it disappeared" is a support ticket the team has to handle one by one, and it damages trust in the product — the user has to decide whether to trust the form enough to try again.
+- **Long forms already have low completion rates.** Data loss on top of an already-long form makes people abandon entirely rather than redo the work, which is a direct conversion/completion-rate hit for whatever this form gates (signup, application, onboarding).
+- **There was no plan for interruption.** The form was built assuming a single, uninterrupted session — but real usage is full of interruptions (refresh, crash, closed tab, switching devices), and none of them were designed for.
+
+## 3. How does it work?
+
+- **Centralize the form's state** in one place — a signal-based service (`providedIn: 'root'`) holding the current step and the field values, rather than scattering state across step components. This makes it possible to save/restore it as a single unit.
+- **Auto-save on every change, debounced.** Writing to `localStorage` on every keystroke is wasteful and can visibly stutter typing on slower devices; debounce the writes (e.g., 300-500ms of inactivity) so saves happen in the background without blocking input.
+- **Save the *shape* of a draft, not just raw values** — include a schema **version number** alongside the data. If the form's fields change later (a field renamed, removed, or a new required field added), a stale draft that doesn't match the current version can be safely discarded instead of restored into a broken, inconsistent form.
+- **Don't silently overwrite on load.** When the app starts and finds a saved draft, don't auto-apply it — ask the user first ("We found a saved draft from 10 minutes ago — Resume or Start Over?"). Silently restoring can be just as jarring as losing data, especially if the user genuinely wanted to start fresh.
+- **Clear the draft on successful submission.** Once the form is actually submitted to the backend and accepted, remove the saved draft — otherwise the user gets prompted to "resume" a form they already completed.
+- **Persist on every step transition, not just field edits** — moving from step 2 to step 3 should also trigger (or guarantee) a save, in case the user closes the tab right after clicking "Next" before the debounce window fires.
+- A **more robust version** of this same idea, for high-value forms, is to also persist the draft to the backend periodically (not just `localStorage`) — this protects against clearing browser data, switching devices, or using a different browser, at the cost of needing a draft-saving API endpoint. `localStorage` alone is the lightweight, no-backend-changes version of the fix.
+
+## 4. Example
+
+**`application-form.service.ts`** — centralized signal-based state, debounced auto-save to `localStorage`, versioned drafts, explicit resume/discard:
+
+```ts
+import { Injectable, Injector, signal, runInInjectionContext } from '@angular/core';
+import { toObservable } from '@angular/core/rxjs-interop';
+import { debounceTime } from 'rxjs/operators';
+
+export interface ApplicationFormData {
+  fullName: string;
+  email: string;
+  employer: string;
+  yearsExperience: number | null;
+}
+
+interface PersistedDraft {
+  version: number;
+  step: number;
+  data: ApplicationFormData;
+  savedAt: string;
+}
+
+const DRAFT_KEY = 'application-form-draft';
+const SCHEMA_VERSION = 1;
+
+const EMPTY_FORM: ApplicationFormData = {
+  fullName: '',
+  email: '',
+  employer: '',
+  yearsExperience: null
+};
+
+@Injectable({ providedIn: 'root' })
+export class ApplicationFormService {
+  step = signal(1);
+  data = signal<ApplicationFormData>(EMPTY_FORM);
+
+  draftFound = signal(false);
+  lastSavedAt = signal<string | null>(null);
+
+  private pendingDraft: PersistedDraft | null = null;
+
+  constructor(private injector: Injector) {
+    this.checkForExistingDraft();
+    this.autoSaveOnChange();
+  }
+
+  private checkForExistingDraft(): void {
+    const raw = localStorage.getItem(DRAFT_KEY);
+    if (!raw) return;
+
+    try {
+      const parsed: PersistedDraft = JSON.parse(raw);
+      if (parsed.version !== SCHEMA_VERSION) {
+        // Form shape changed since this draft was saved - don't risk restoring bad data.
+        localStorage.removeItem(DRAFT_KEY);
+        return;
+      }
+      this.pendingDraft = parsed;
+      this.lastSavedAt.set(parsed.savedAt);
+      this.draftFound.set(true); // let the UI ask the user before applying anything
+    } catch {
+      localStorage.removeItem(DRAFT_KEY); // corrupted JSON - treat as no draft
+    }
+  }
+
+  private autoSaveOnChange(): void {
+    // toObservable + debounceTime needs an injection context, since the service's
+    // own constructor context isn't automatically preserved inside the subscribe callback.
+    runInInjectionContext(this.injector, () => {
+      toObservable(this.data)
+        .pipe(debounceTime(400))
+        .subscribe(data => this.persist(data));
+    });
+  }
+
+  private persist(data: ApplicationFormData): void {
+    const draft: PersistedDraft = {
+      version: SCHEMA_VERSION,
+      step: this.step(),
+      data,
+      savedAt: new Date().toISOString()
+    };
+    localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+  }
+
+  updateField<K extends keyof ApplicationFormData>(key: K, value: ApplicationFormData[K]): void {
+    this.data.update(current => ({ ...current, [key]: value }));
+  }
+
+  goToStep(step: number): void {
+    this.step.set(step);
+    this.persist(this.data()); // save immediately on navigation too, not just on debounce
+  }
+
+  resumeDraft(): void {
+    if (!this.pendingDraft) return;
+    this.step.set(this.pendingDraft.step);
+    this.data.set(this.pendingDraft.data);
+    this.draftFound.set(false);
+    this.pendingDraft = null;
+  }
+
+  discardDraft(): void {
+    localStorage.removeItem(DRAFT_KEY);
+    this.draftFound.set(false);
+    this.pendingDraft = null;
+  }
+
+  submit(): void {
+    // A real app would POST this.data() to the backend here, and only clear
+    // the draft after a successful response.
+    localStorage.removeItem(DRAFT_KEY);
+    this.step.set(1);
+    this.data.set(EMPTY_FORM);
+  }
+}
+```
+
+**`app.component.ts`** — the multi-step UI, with a resume/discard banner:
+
+```ts
+import { Component, inject } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ApplicationFormService, ApplicationFormData } from './application-form.service';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule],
+  template: `
+    <div class="page">
+      <h1>Job Application</h1>
+
+      @if (form.draftFound()) {
+        <div class="draft-banner">
+          <p>We found a saved draft from {{ form.lastSavedAt() }}.</p>
+          <button (click)="form.resumeDraft()">Resume</button>
+          <button (click)="form.discardDraft()">Start Over</button>
+        </div>
+      } @else {
+        <h2>Step {{ form.step() }} of 3</h2>
+
+        @switch (form.step()) {
+          @case (1) {
+            <label>Full name
+              <input [value]="form.data().fullName"
+                     (input)="update('fullName', $any($event.target).value)" />
+            </label>
+            <label>Email
+              <input [value]="form.data().email"
+                     (input)="update('email', $any($event.target).value)" />
+            </label>
+          }
+          @case (2) {
+            <label>Employer
+              <input [value]="form.data().employer"
+                     (input)="update('employer', $any($event.target).value)" />
+            </label>
+            <label>Years of experience
+              <input type="number" [value]="form.data().yearsExperience"
+                     (input)="update('yearsExperience', +$any($event.target).value)" />
+            </label>
+          }
+          @case (3) {
+            <pre>{{ form.data() | json }}</pre>
+            <button (click)="form.submit()">Submit application</button>
+          }
+        }
+
+        <div class="nav">
+          @if (form.step() > 1) {
+            <button (click)="form.goToStep(form.step() - 1)">Back</button>
+          }
+          @if (form.step() < 3) {
+            <button (click)="form.goToStep(form.step() + 1)">Next</button>
+          }
+        </div>
+      }
+    </div>
+  `,
+  styles: [`
+    .page { font-family: sans-serif; padding: 24px; max-width: 420px; }
+    label { display: block; margin-bottom: 12px; }
+    input { display: block; width: 100%; padding: 6px; margin-top: 4px; }
+    .draft-banner { background: #fff3cd; padding: 12px; border-radius: 6px; margin-bottom: 16px; }
+    .nav { margin-top: 16px; display: flex; gap: 8px; }
+  `]
+})
+export class AppComponent {
+  form = inject(ApplicationFormService);
+
+  update<K extends keyof ApplicationFormData>(key: K, value: ApplicationFormData[K]): void {
+    this.form.updateField(key, value);
+  }
+}
+```
+
+**StackBlitz:** https://stackblitz.com/edit/angular-n4hv9mnc
+
+> **Verification note:** This was tested live end-to-end, not just compiled: filled in the "Full name" field, waited past the 400ms debounce, then reloaded the preview — it correctly showed "We found a saved draft from [timestamp]" with Resume/Start Over buttons, confirming the `localStorage` round trip actually works (save → reload → detect → offer resume), not just that the code compiles.
+
+## 5. Example Explanation / Execution Flow
+
+1. On app start, `ApplicationFormService`'s constructor runs `checkForExistingDraft()`, which reads `localStorage`. If a draft exists and its `version` matches the current `SCHEMA_VERSION`, it's held in `pendingDraft` and `draftFound` is set to `true` — but nothing is applied to the live form state yet.
+2. If `draftFound()` is `true`, the template shows the resume banner instead of the form. The user explicitly chooses **Resume** (which copies `pendingDraft` into `step`/`data`) or **Start Over** (which clears the saved draft and leaves the form at its empty default).
+3. As the user types, each keystroke calls `updateField()`, which updates the `data` signal immutably (spread + override one key).
+4. `autoSaveOnChange()` subscribes to `toObservable(this.data)` piped through `debounceTime(400)` — so rapid typing doesn't trigger a write on every keystroke, only after a short pause. Each emission calls `persist()`, which writes a versioned JSON snapshot (`step`, `data`, `savedAt`) into `localStorage`.
+5. Clicking **Next**/**Back** calls `goToStep()`, which updates `step` *and* calls `persist()` immediately — this guarantees the step number is saved right away, without waiting on the debounce window, in case the user closes the tab a second later.
+6. If the browser refreshes or crashes at any point after the first save, reloading the app repeats step 1 — the draft is found again, and the user can resume exactly where they left off, including which step they were on.
+7. On successful `submit()`, the draft is deleted from `localStorage` and the form resets — so a completed submission never shows up as a "resume?" prompt on a future visit.
+
+## 6. When should we use it?
+
+- Any form long enough, or important enough, that losing progress would genuinely frustrate the user or generate a support ticket — multi-step applications, long checkout flows, detailed settings/profile forms, draft emails or posts.
+- Especially valuable for forms used on unreliable connections or lower-end devices, where tab crashes and accidental reloads are more common.
+- Less necessary for short, single-screen forms where redoing the input costs the user a few seconds — the complexity of draft persistence isn't worth it there.
+
+## 7. Advantages / Disadvantages
+
+**Advantages**
+
+- Directly prevents the exact failure mode in the scenario — refresh/crash no longer means lost work.
+- `localStorage`-only is simple to add: no backend changes, no new API endpoints, works entirely client-side.
+- Versioning the draft schema protects against a nasty edge case: a form field renamed or removed in a later deploy silently corrupting a restored draft.
+
+**Disadvantages / things to watch for**
+
+- `localStorage` is per-browser, per-device. Switching devices or browsers loses the draft — if that matters for this form, the more robust fix layers in periodic backend draft-saving too.
+- `localStorage` has no expiry by default — an old abandoned draft can sit there indefinitely; worth adding a max-age check (e.g., discard drafts older than 7 days) alongside the version check.
+- Storing sensitive data (SSNs, payment info) in plain `localStorage` is a real security consideration — for genuinely sensitive fields, either exclude them from the persisted draft or persist to the backend instead, where access control and encryption-at-rest apply.
+- `localStorage` is synchronous and has a size limit (usually ~5-10MB per origin) — fine for form field values, but not a place to stash large file uploads or images as part of a draft.
+
+## 8. Common Interview Traps
+
+- Saving directly to `localStorage` on every keystroke with no debounce — works, but does unnecessary synchronous I/O on every input event and can cause jank on lower-end devices.
+- Auto-restoring a found draft without asking the user first — can silently clobber an intentional "start fresh" attempt and feels invasive if the user didn't expect their old data to reappear.
+- Forgetting to clear the draft after successful submission — leads to "resume your old application?" prompts showing up for a form the user already completed.
+- Not versioning the persisted shape — if the form's fields change in a later release, an old draft can silently restore into a form that no longer matches, causing broken state or runtime errors.
+- Assuming `localStorage` alone is "enough" for high-value or regulated forms — for anything where losing a submission has real business cost, backend-side autosave (not just client-side) is usually the actual production answer; `localStorage` is the fast, low-effort first layer.
+
+## 9. Interview Follow-up Questions
+
+**Q: Why debounce the auto-save instead of saving immediately on every change?**
+A: Immediate synchronous writes on every keystroke add unnecessary overhead and can make typing feel less responsive, especially since `localStorage` writes are synchronous and block the main thread briefly. Debouncing (e.g., 400ms after the user stops typing) batches those writes without meaningfully increasing data-loss risk — losing at most a few hundred milliseconds of the very last keystrokes in a true crash is an acceptable tradeoff.
+
+**Q: What if the user has the form open in two tabs at once?**
+A: `localStorage` writes from one tab don't automatically sync into another tab's in-memory signal state — you'd need to listen for the `storage` event (which fires in *other* tabs when `localStorage` changes) if cross-tab sync matters. Simpler alternative: don't try to support editing the same draft in two tabs simultaneously, and just make sure the two tabs don't silently overwrite each other's saves unpredictably — usually acceptable to treat as an edge case, not a requirement, unless the product explicitly needs multi-tab support.
+
+**Q: How would you handle draft persistence for a form embedded inside a larger single-page app with route changes between steps?**
+A: The same signal-based service approach still works, since it's `providedIn: 'root'` and outlives individual routed components — persistence isn't tied to any one component's lifecycle. The main addition would be restoring the correct route/step on reload (e.g., redirecting to `/apply/step-2` based on the restored `step` value) rather than just restoring in-memory state.
+
+**Q: Why not just rely on the backend and auto-save via an API call instead of localStorage?**
+A: That's a valid, more robust design — and often layered on top of this for high-value forms — but it requires a draft-saving endpoint, handles partial/invalid data server-side, and adds network dependency to every autosave (what happens if the autosave request fails?). `localStorage` is the zero-backend-changes first line of defense; a backend draft API is the next layer for cross-device recovery and stronger durability guarantees.
+
+**Q: How would you test the debounced auto-save logic?**
+A: Use Angular's fakeAsync/tick (or RxJS marble testing) to simulate rapid signal updates within a short window and assert that `localStorage.setItem` was called only once after the debounce period elapses, not once per update — this verifies the debounce is actually collapsing writes rather than just delaying each one individually.
+
+## 10. Interview-Ready Answer
+
+"The core problem is that all the form's state lives only in memory, so a refresh or crash wipes it instantly. I'd centralize the form's state — current step plus field values — in one signal-based service, and auto-save it to `localStorage` on every change, debounced so it's not writing on every keystroke. I'd also save immediately on step navigation, so moving to the next step is never lost even if the debounce window hasn't fired yet. Critically, I wouldn't auto-restore a found draft silently — on load, if a saved draft exists, I'd show a banner letting the user choose to resume or start fresh, since silently overwriting what they see can feel just as jarring as losing data. I'd version the saved draft's shape, so if the form's fields change in a later release, a stale draft gets discarded instead of restoring into a broken form. And I'd clear the draft the moment a submission actually succeeds, so completed applications don't keep prompting 'resume?' on a later visit. If this were a high-value form — not just a nice-to-have — I'd also layer in periodic backend draft-saving on top of the localStorage version, since localStorage alone doesn't survive switching devices or clearing browser data."
+
+## 11. Quick Revision
+
+- **What**: Auto-save multi-step form progress to `localStorage` so refresh/crash doesn't wipe it; offer to restore on return.
+- **Why**: Losing a long form's progress frustrates users, generates support tickets, and hurts completion rates — the app never planned for interruption.
+- **Problem solved**: In-memory-only form state is wiped by any reload, crash, or closed tab.
+- **How**: Centralized signal-based state → debounced auto-save on change + immediate save on step navigation → versioned draft shape → explicit resume/discard prompt, never silent auto-restore → clear draft on successful submit.
+- **Use when**: Long/important forms (applications, checkout, detailed profile/settings) — not worth it for short single-screen forms.
+- **Important**: Version the persisted schema; don't silently restore; clear on submit; consider backend-side autosave too for high-value/cross-device needs.
+- **Remember**: `localStorage` is the fast, no-backend first layer — not a replacement for backend persistence when losing a submission has real cost.
+
+## 12. Memory Trick
+
+**"Ask before you restore, save before they leave."**
+Two habits carry this whole pattern: never silently hand someone back data they might not want (always ask: Resume or Start Over?), and always get the save in *before* the moment they might vanish (debounced on every change, immediate on every step change) — because you never know which click is the last one before the tab closes.
