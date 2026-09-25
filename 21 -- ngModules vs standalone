@@ -1,0 +1,194 @@
+> **Suggested filename:** `ngmodule-vs-standalone-components.md`
+> **Suggested folder:** `interview-notes/angular/architecture/`
+
+# [Theory] What is the difference between NgModule-based architecture and Standalone Components (Angular 14+)? When would you prefer one over the other?
+
+## 1. What is it?
+
+Both are ways of telling Angular "here's what this piece of the app needs in order to work" - they're two different answers to the same organizational question, just from different eras of the framework.
+
+- **NgModule-based architecture** is the original model: components, directives, and pipes are grouped together and declared inside `@NgModule` classes. To use a component, you have to know which module declares it, import that module wherever you need it, and the app is bootstrapped from one root `AppModule`.
+- **Standalone Components** (introduced as developer preview in Angular v14, and the Angular CLI's default since v17) remove that grouping layer entirely. Each component, directive, or pipe declares `standalone: true` and lists exactly what it needs directly on itself, via its own `imports` array. There's no module wrapping it, and the whole app can be bootstrapped straight from one root component with `bootstrapApplication()`.
+
+## 2. Why introduced?
+
+NgModules added a real layer of indirection that many developers found more confusing than helpful in practice. To use `SomeComponent`, you needed to find which module declared it, import that module into whichever other module wanted to use it, and keep track of the distinction between `declarations` (this module owns and can render this), `imports` (this module can use things from these other modules), `exports` (things from this module other modules are allowed to use), and `providers` (services to register) - four different lists with different rules, easy to mix up as a newcomer. It also meant a component's actual dependency list wasn't visible from the component's own file - you had to go find its module to know what it could use. Standalone components exist to remove that indirection: a component's `imports` array, right there in its own decorator, is the complete, honest list of everything it depends on - no need to go find a separate module file to know what it can use.
+
+## 3. How does it work?
+
+**NgModule-based:**
+```typescript
+// app.module.ts
+import { NgModule } from '@angular/core';
+import { BrowserModule } from '@angular/platform-browser';
+import { FormsModule } from '@angular/forms';
+import { RouterModule } from '@angular/router';
+import { AppComponent } from './app.component';
+import { HeaderComponent } from './header.component';
+import { routes } from './app.routes';
+
+@NgModule({
+  declarations: [AppComponent, HeaderComponent],
+  imports: [BrowserModule, FormsModule, RouterModule.forRoot(routes)],
+  providers: [],
+  bootstrap: [AppComponent],
+})
+export class AppModule {}
+```
+```typescript
+// main.ts
+import { platformBrowserDynamic } from '@angular/platform-browser-dynamic';
+import { AppModule } from './app/app.module';
+
+platformBrowserDynamic().bootstrapModule(AppModule);
+```
+
+**Standalone:**
+```typescript
+// header.component.ts
+import { Component } from '@angular/core';
+import { RouterLink } from '@angular/router';
+
+@Component({
+  selector: 'app-header',
+  standalone: true,
+  imports: [RouterLink], // exactly what THIS component needs, nothing more
+  template: `<a routerLink="/home">Home</a>`,
+})
+export class HeaderComponent {}
+```
+```typescript
+// main.ts
+import { bootstrapApplication } from '@angular/platform-browser';
+import { provideRouter } from '@angular/router';
+import { AppComponent } from './app/app.component';
+import { routes } from './app/app.routes';
+
+bootstrapApplication(AppComponent, {
+  providers: [provideRouter(routes)],
+});
+```
+
+The key structural differences:
+- **Unit of composition:** an NgModule groups many components/directives/pipes together as one unit; a standalone component is its own self-contained unit that imports exactly what its own template needs - other standalone components, directives, pipes, or (for interop) legacy NgModules.
+- **Bootstrapping:** `platformBrowserDynamic().bootstrapModule(AppModule)` vs `bootstrapApplication(RootComponent, { providers: [...] })`.
+- **App-wide configuration (router, HTTP, animations, forms):** NgModule-based apps configure these by importing a module (`RouterModule.forRoot(routes)`, `HttpClientModule`). Standalone apps use plain **functions** instead - `provideRouter(routes)`, `provideHttpClient()`, `provideAnimations()` - passed into `bootstrapApplication`'s `providers` array. These provider functions are more tree-shakable and composable than importing a whole module just to register a few providers.
+- **Interop is intentional, not all-or-nothing:** a standalone component can still list an NgModule inside its own `imports` array (useful for a third-party library that hasn't migrated yet), and an NgModule can still `imports` a standalone component to use it inside NgModule-declared templates. This is what makes incremental migration of an existing app possible, rather than forcing a rewrite.
+
+## 4. Example
+
+A side-by-side of the exact same small feature, both ways:
+
+```typescript
+// --- NgModule-based ---
+// counter.module.ts
+@NgModule({
+  declarations: [CounterComponent],
+  imports: [CommonModule],
+  exports: [CounterComponent],
+})
+export class CounterModule {}
+
+// Somewhere else that wants to use it:
+@NgModule({
+  imports: [CounterModule], // must import the MODULE, not the component
+  declarations: [PageComponent],
+})
+export class PageModule {}
+```
+
+```typescript
+// --- Standalone ---
+// counter.component.ts
+@Component({
+  selector: 'app-counter',
+  standalone: true,
+  imports: [CommonModule],
+  template: `...`,
+})
+export class CounterComponent {}
+
+// Somewhere else that wants to use it:
+@Component({
+  selector: 'app-page',
+  standalone: true,
+  imports: [CounterComponent], // import the COMPONENT directly, no wrapper module
+  template: `<app-counter />`,
+})
+export class PageComponent {}
+```
+
+The standalone version removes an entire file (`counter.module.ts`) and an entire indirection step (importing a module to get a component the module merely re-exports).
+
+## 5. Example Explanation – Execution Flow
+
+**NgModule-based bootstrap:** `bootstrapModule(AppModule)` reads the module's metadata, resolves everything in its `imports` (recursively, for any modules those import too), registers all `providers` app-wide, and instantiates the component(s) listed in `bootstrap`. The Angular compiler's unit of compilation here is effectively the module - which historically also meant tree-shaking granularity was coarser, since the compiler reasoned about what a whole module needed rather than what one specific component actually used.
+
+**Standalone bootstrap:** `bootstrapApplication(AppComponent, { providers })` skips the module-resolution step entirely - there's no module to walk. It registers the given `providers` directly at the application root, then instantiates `AppComponent`, whose own `imports` array tells the compiler exactly what that component (and, transitively, whatever standalone components/directives/pipes it imports) actually needs. Because each component declares its own dependencies directly, the compiler can reason about - and tree-shake - dependencies at the individual component level rather than the whole-module level.
+
+## 6. When to use?
+
+- **Standalone is the default and recommended choice for new work today.** The Angular CLI has generated standalone components by default since v17, and the Angular team's own guidance and documentation are standalone-first going forward - NgModules are fully supported but are effectively in maintenance mode for new development.
+- **NgModule-based is still the right call when maintaining a large existing NgModule app** where a full migration isn't currently worth the churn - Angular's own `ng generate @angular/core:standalone` migration schematic can help convert incrementally, but there's no requirement to do so all at once, or at all, for an app that isn't otherwise changing much.
+- **Interop is common in practice, not a special case:** most real migrations are a mix - new features written as standalone components inside an app whose older, stable areas are still NgModule-based - since the two are designed to coexist indefinitely.
+
+## 7. Advantages / Disadvantages
+
+**NgModule-based**
+
+*Advantages:* a single shared module (a `SharedModule` that declares and re-exports several common components/pipes/directives together) gives one convenient "import this one thing to get a whole bundle" unit, which some teams still find convenient for very large, stable shared libraries. It also has the longest history - most existing Angular documentation, third-party library setup instructions, and StackOverflow answers predating the last couple of years assume this model.
+
+*Disadvantages:* real boilerplate and indirection - `declarations`/`imports`/`exports`/`providers` is a four-way mental model that trips up newcomers, and a component's actual dependency list isn't visible without going to find its module.
+
+**Standalone**
+
+*Advantages:* far less boilerplate per component; a component's `imports` array is a complete, honest, local list of its dependencies; simpler bootstrapping; simpler lazy loading (see Q2 below); it's the direction the framework and its tooling are actively moving.
+
+*Disadvantages:* for a very large shared component library, there's no single ready-made "import this one thing to get a whole bundle" construct the way a `SharedModule` provided - you either re-export an array of standalone components manually or rely on barrel-file conventions instead; being newer, there's proportionally less very old (pre-2023) community content that demonstrates it directly, though this gap has closed substantially since it became the CLI default.
+
+## 8. Common Interview Traps
+
+- Saying standalone components "never use NgModules at all" - a standalone component can still list an NgModule in its own `imports` array for interop with a library that hasn't migrated, and an NgModule can still import a standalone component. It's an incremental, coexisting model, not a strict either/or per app.
+- Confusing "standalone" with "no dependency injection" - DI works exactly the same either way; only *where* providers get registered changes (an NgModule's `providers` array vs. `bootstrapApplication`'s `providers`, a route's `providers`, or a component's own `providers` array).
+- Treating this as an Angular v17 feature - the underlying capability shipped as developer preview in Angular v14; v17 is when the CLI schematics switched to generating standalone by default, and later versions have continued pushing the ecosystem and documentation standalone-first.
+- Implying NgModule-based apps are deprecated or unsupported - they're fully supported today, with no forced migration or removal date; "in maintenance mode for new development" is a guidance statement about where the framework's default and future emphasis lies, not a support-ending announcement.
+
+## 9. Interview Follow-up Questions
+
+**Q1: How do you provide something like HttpClient in a standalone app?**
+A: With the function-based provider `provideHttpClient()`, passed into `bootstrapApplication`'s `providers` array - instead of importing `HttpClientModule` into an NgModule. The same pattern applies to `provideRouter(routes)`, `provideAnimations()`, and similar - these are plain functions that return the provider configuration a module used to bundle, called directly wherever providers are being assembled (the app root, or a specific route's own `providers`).
+
+**Q2: How does lazy loading differ between the two?**
+A: NgModule-based lazy loading points a route's `loadChildren` at an entire feature module (`() => import('./feature/feature.module').then(m => m.FeatureModule)`), and that module then declares its own internal routes. Standalone lazy loading can point a route directly at one component with `loadComponent: () => import('./feature.component').then(m => m.FeatureComponent)` - no wrapper module needed just to lazy-load a single component - or still use `loadChildren` pointing at an exported array of `Route` objects for a lazy-loaded feature area with multiple routes, without any of them needing to be wrapped in a module either.
+
+**Q3: Can a standalone component and an NgModule-declared component coexist in the same app?**
+A: Yes, and this is the intended incremental-migration path, not an edge case. A standalone component can be added to an NgModule's `imports` array (not `declarations` - the module doesn't own it) to be used inside that module's templates, and conversely, an NgModule can be listed in a standalone component's `imports` array to use whatever that module declares.
+
+**Q4: What happens to feature modules that existed purely to enable lazy loading, once standalone is fully adopted?**
+A: They mostly disappear. Since `loadComponent` can lazy-load a single standalone component directly, the common older pattern of "a whole NgModule that exists only to wrap one lazy-loaded route" is no longer needed - a routes file exporting an array of `Route` objects using `loadComponent`/`loadChildren` (pointing at more routes, not a module) typically replaces that layer entirely.
+
+## 10. Quick Answer (say this first)
+
+"NgModules group components/directives/pipes together in a separate `@NgModule` class, with a four-part `declarations`/`imports`/`exports`/`providers` model, and the app bootstraps from a root `AppModule`. Standalone components skip that grouping layer entirely - each component lists exactly what it needs directly in its own `imports` array, and the app bootstraps straight from a root component with `bootstrapApplication()`. Standalone removes a real layer of indirection and boilerplate, and it's the Angular CLI's default and the team's recommended direction since v17 - I'd default to it for anything new, and only stick with NgModules when maintaining an existing app where migrating isn't worth the churn, since the two are designed to interoperate and coexist indefinitely."
+
+## 11. Interview-Ready Answer (full)
+
+"NgModule-based architecture is Angular's original organizational model - components, directives, and pipes get declared inside `@NgModule` classes, using a four-part structure: `declarations` for what the module owns, `imports` for what it needs from other modules, `exports` for what it shares onward, and `providers` for services. The whole app is bootstrapped from one root `AppModule` via `platformBrowserDynamic().bootstrapModule()`. Standalone components, introduced as developer preview in Angular v14 and the CLI's default since v17, remove that grouping layer: each component marks `standalone: true` and lists exactly what it needs - other standalone components, directives, pipes, or even an NgModule for interop - directly in its own `imports` array. The whole app bootstraps straight from a root component with `bootstrapApplication()`, and app-wide configuration that used to mean importing a module - the router, HTTP client, animations - is now done with plain provider functions like `provideRouter()` and `provideHttpClient()` passed into that bootstrap call.
+
+The motivation was reducing indirection: with NgModules, a component's real dependency list wasn't visible from its own file - you had to go find whichever module declared it. With standalone, that list is right there in the component's own decorator, which is both simpler to read and gives the compiler a finer-grained unit to reason about and tree-shake, at the component level instead of the whole-module level.
+
+For when to use each: I'd default to standalone for anything new - it's simpler, it's less boilerplate, lazy loading is more direct since a route can point `loadComponent` at a single component instead of needing a whole wrapper module, and it's where the framework's own tooling and guidance are headed. I'd stick with NgModule-based architecture mainly when maintaining a large existing app that's already built that way and isn't worth a wholesale migration - and importantly, the two aren't mutually exclusive within one app: a standalone component can be imported into an NgModule, and an NgModule can be imported into a standalone component, so a real migration is almost always incremental, new features written as standalone components sitting alongside older, still-NgModule-based parts of the same app, rather than an all-or-nothing rewrite."
+
+## 12. Quick Revision
+
+1. **NgModule-based:** components grouped in `@NgModule` classes (`declarations`/`imports`/`exports`/`providers`), app bootstraps via `bootstrapModule(AppModule)`.
+2. **Standalone:** each component declares `standalone: true` and its own `imports` directly - no wrapping module - app bootstraps via `bootstrapApplication(RootComponent, { providers })`.
+3. **App-wide config:** NgModule imports a module (`HttpClientModule`); standalone calls a provider function (`provideHttpClient()`) instead.
+4. **Interop:** a standalone component can be used inside an NgModule's `imports`, and vice versa - migration is incremental, not all-or-nothing.
+5. **Lazy loading:** NgModule needs a whole feature module for `loadChildren`; standalone can `loadComponent` a single component directly, no wrapper module needed.
+6. **When to use:** standalone by default for new work (CLI default and team's direction since v17); NgModule mainly when maintaining an existing app not worth migrating.
+7. **Not deprecated:** NgModules remain fully supported - "maintenance mode for new development" is a guidance statement, not an end-of-support notice.
+
+## 13. Memory Trick
+
+**NgModules are shipping crates - you have to pack things into a labeled crate before anyone else can use them, and to grab one component you sometimes have to know which crate it's in.** Standalone components are more like items with their own handle and a tag listing exactly what they need attached directly to them - you pick up the one thing you want, read its own tag, and you already know everything it depends on, no crate required. The two can still sit on the same shelf together - nothing stops a crate from holding a tagged, standalone item inside it, or a tagged item from listing a crate as one of the things it needs.
