@@ -1,6 +1,3 @@
-> **Suggested filename:** `dropdown-never-reloads-after-api-failure.md`
-> **Suggested folder:** `interview-notes/angular/scenarios/`
-
 # [Scenario] A dropdown's options load via HTTP. After the API failed once, the dropdown never loads again even when the network recovers — no errors in console. What's the likely bug?
 
 ## 1. What is it?
