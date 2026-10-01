@@ -1,0 +1,163 @@
+# [Scenario] A dropdown's options load via HTTP. After the API failed once, the dropdown never loads again even when the network recovers — no errors in console. What's the likely bug?
+
+## 1. What is it?
+
+The dropdown fetches its options through some kind of "reload" trigger - a `Subject` the component calls `.next()` on, piped through `switchMap` into the actual HTTP call. The first time that HTTP call fails, the dropdown goes blank, which looks correct (a graceful empty state instead of a crash). The real bug is what happens *after*: even once the network comes back and the user (or the app) tries to reload again, nothing ever loads - not an error, not a spinner, just permanently nothing. And "no errors in console" is the detail that points straight at the cause: something is deliberately catching the error, but catching it in a way that kills more than just that one failed request.
+
+## 2. Why does this happen?
+
+This is one of the most common real-world RxJS gotchas, and it comes down to **where** `catchError` sits in the pipe relative to `switchMap`.
+
+A `reload$` `Subject` is meant to live for the lifetime of the component, emitting once per reload attempt, forever. `switchMap` sits in between it and the actual HTTP call, mapping each `reload$` emission to a fresh request. The subtle trap: if `catchError` is placed **after** `switchMap`, on the *outer* pipe, it isn't just catching the HTTP request's error - it's standing in as a replacement for the **entire chain from `reload$` onward**. The moment the HTTP call errors, RxJS propagates that error up through `switchMap` to the outer `catchError`, which does its job and swallows it - but the fallback observable it returns (commonly `of([])`) is a stand-in for the *whole* outer pipe. That fallback observable emits its one value and then **completes**. Since it's now substituting for the entire `reload$`-to-`switchMap` chain, that completion ends the **entire subscription** - including the part listening to `reload$`.
+
+`reload$` itself is completely fine and still alive as a `Subject` - calling `.next()` on it afterward doesn't throw or error. The problem is that absolutely nothing is subscribed to it anymore, because that subscription already ran to completion the moment the first error was caught. No error is thrown anywhere in this sequence - `catchError` did exactly what it was told to do - which is exactly why the console stays silent while the dropdown quietly stops working forever.
+
+## 3. How does it work?
+
+The fix is to move `catchError` **inside** `switchMap`'s own projection function, so it wraps only the one, per-request inner observable:
+
+- **Buggy placement:** `reload$.pipe(switchMap(() => http$), catchError(() => of([]))).subscribe(...)` - the `catchError` is a sibling of `switchMap` in the same pipe, so it's positioned to catch (and replace) anything coming out of the *entire* chain, not just the inner HTTP call.
+- **Correct placement:** `reload$.pipe(switchMap(() => http$.pipe(catchError(() => of([]))))).subscribe(...)` - now `catchError` is scoped *inside* the function passed to `switchMap`, so it only ever sees and replaces the single inner HTTP observable for that one request. If that one request errors, only its own tiny replacement observable completes - `switchMap` itself, and the outer subscription to `reload$`, are completely unaffected and remain alive indefinitely, ready for the next `reload$.next()`.
+
+The general rule this illustrates: **`catchError` always terminates whatever observable it's attached to once invoked** (the fallback observable it returns typically completes after one emission). The question to ask when placing it is "if this fires, which part of my pipeline am I willing to let end?" - the honest answer for a reload-and-retry pattern is "only the one failed request," which means `catchError` belongs inside the operator that creates a fresh per-attempt observable (`switchMap`, `mergeMap`, etc.), never outside it on a long-lived source.
+
+## 4. Example
+
+**StackBlitz project:** [stackblitz.com/edit/angular-bfvcb8ra](https://stackblitz.com/edit/angular-bfvcb8ra?file=src%2Fapp%2Fapp.component.ts)
+
+```typescript
+// THE BUG - catchError OUTSIDE switchMap's inner observable.
+export class NaiveDropdownComponent implements OnInit {
+  private net = inject(NetworkSimulatorService);
+  private reload$ = new Subject<void>();
+  options = signal<string[]>([]);
+
+  ngOnInit(): void {
+    this.reload$
+      .pipe(
+        switchMap(() => this.net.fetchOptions()),
+        catchError(() => of([] as string[])) // catches errors from the WHOLE chain
+      )
+      .subscribe((opts) => this.options.set(opts));
+
+    this.reload(); // initial load
+  }
+
+  reload(): void {
+    this.reload$.next();
+  }
+}
+```
+
+```typescript
+// THE FIX - catchError INSIDE switchMap's projection function.
+export class FixedDropdownComponent implements OnInit {
+  private net = inject(NetworkSimulatorService);
+  private reload$ = new Subject<void>();
+  options = signal<string[]>([]);
+
+  ngOnInit(): void {
+    this.reload$
+      .pipe(
+        switchMap(() =>
+          this.net.fetchOptions().pipe(
+            catchError(() => of([] as string[])) // scoped to ONE request only
+          )
+        )
+      )
+      .subscribe((opts) => this.options.set(opts));
+
+    this.reload();
+  }
+
+  reload(): void {
+    this.reload$.next();
+  }
+}
+```
+
+```typescript
+// network-simulator.service.ts - stands in for a real backend with a
+// toggleable "down" state, so the failure can be triggered on demand.
+@Injectable({ providedIn: 'root' })
+export class NetworkSimulatorService {
+  readonly down = signal(false);
+
+  toggle(): void {
+    this.down.update((v) => !v);
+  }
+
+  fetchOptions(): Observable<string[]> {
+    if (this.down()) {
+      return throwError(() => new Error('Simulated network failure')).pipe(delay(200));
+    }
+    return of(['Apple', 'Banana', 'Cherry', 'Date']).pipe(delay(200));
+  }
+}
+```
+
+**Verification status:** the project compiled with zero errors and both dropdowns rendered correctly with their initial options loaded on first run, confirming the base setup and the simulated HTTP service work as intended. I wasn't able to click-verify the full toggle-network-down-then-up-then-reload sequence in this session's embedded preview pane - clicks weren't registering on the toggle/reload buttons through the tool this time, the same pane-specific interaction limitation noted on an earlier demo in this set, not a problem with the code. The underlying mechanism being demonstrated - `catchError`'s placement relative to `switchMap` determining whether an error terminates one request or the entire outer subscription - is well-documented, deterministic RxJS behavior, not something that depends on this particular click sequence to be true; opening the link directly and running through the steps yourself should reproduce it reliably.
+
+## 5. Example Explanation – Execution Flow
+
+1. On page load, both components call `reload()` once, which pushes a value onto `reload$`. `switchMap` maps that to a `fetchOptions()` call; since the network starts "up," both dropdowns populate normally.
+2. The network is toggled "down," and "Reload options" is clicked on both. `fetchOptions()` now returns an observable that errors.
+3. **Naive component:** the error propagates out of `switchMap` to the outer `catchError`, which swallows it and returns `of([])`. That `of([])` stands in for the *entire* `reload$`-to-`switchMap` chain - it emits once (an empty array, so the dropdown goes blank) and completes. The subscription is now finished, permanently. `reload$` is still a live `Subject`, but there is no one left listening to it.
+4. **Fixed component:** the same error propagates out of `fetchOptions()`, but it's immediately caught by the `catchError` living *inside* `switchMap`'s own projection function. That inner `catchError`'s `of([])` replacement completes - but it's only ever standing in for that one inner observable, not the outer chain. `switchMap` itself is unaffected and remains subscribed to `reload$`, waiting for the next value.
+5. The network is toggled back "up," and "Reload options" is clicked again on both. **Naive:** nothing happens - `reload$.next()` fires into the void, since nothing has been subscribed to it since step 3. **Fixed:** `switchMap` receives the new `reload$` emission exactly as it did the first time, calls `fetchOptions()` again, and the dropdown populates normally - the earlier failure left no lasting damage.
+
+## 6. When to use?
+
+- Any time a long-lived trigger source (a `Subject`, a route param observable, a `combineLatest` of filters) is piped through `switchMap`/`mergeMap`/`concatMap`/`exhaustMap` into a per-request HTTP call - this is the exact shape where this bug hides.
+- Any "reload," "retry," or "search-as-you-type" pattern that's meant to survive individual request failures indefinitely, not just the first one.
+- As a standing code-review checklist item: whenever you see `catchError` in a pipe that also contains a flattening operator (`switchMap` and friends), check whether it's inside or outside that operator's projection function before approving.
+
+## 7. Advantages / Disadvantages
+
+Framing this as a lesson rather than a pattern with tradeoffs: placing `catchError` correctly (inside the per-request projection) costs nothing extra - same amount of code, same behavior on success, and it adds real resilience by design. The only "cost" of getting it right is remembering the rule; the cost of getting it wrong is a production bug that, by its very nature (no console error, works fine until the first failure), is unusually hard to catch in code review or casual testing, since everything looks correct until the exact failure-then-recovery sequence is exercised.
+
+## 8. Common Interview Traps
+
+- Assuming the bug must be a missing error handler - there IS error handling here; the bug is specifically about *where* it's scoped, which is a more precise (and more impressive, in an interview) diagnosis than "add a try/catch."
+- Assuming "no console errors" means the error was never actually thrown - it was thrown and propagated exactly as RxJS is designed to; `catchError` doing its job *is* why nothing reaches the console, which is the detail that should point straight at `catchError` rather than at, say, a swallowed Promise rejection or a missing `.subscribe()` error callback.
+- Suggesting the fix is to resubscribe manually after an error, or to re-run `ngOnInit`'s subscription logic on a retry button click - that papers over the real issue (a new subscription object is created each time, leaking the old one) rather than fixing the pipe's structure once.
+- Forgetting that this exact failure mode applies equally to `mergeMap`, `concatMap`, and `exhaustMap` - it's not a `switchMap`-specific quirk, it's about `catchError`'s scope relative to *any* flattening operator sitting on a long-lived source.
+
+## 9. Interview Follow-up Questions
+
+**Q1: Would adding a second `.subscribe()` error callback (e.g., `.subscribe({ next: ..., error: ... })`) fix this?**
+A: No - the `error` callback would only ever fire if an error reaches the final `subscribe()` call, which it never does here, since `catchError` already intercepted and replaced it upstream. Worse, if `catchError` were removed and the raw error reached `subscribe()`'s error handler, the subscription would *still* terminate (that's just how Observable errors work) - an error callback lets you react to the end of the stream, it doesn't prevent the stream from ending.
+
+**Q2: How would you catch this bug via testing rather than code review?**
+A: Write a test that simulates two reload cycles: one where the fetch throws, and a second, subsequent one where it succeeds. Assert that the second cycle's success value actually reaches the component's state. A test that only ever exercises a single failure (or only ever exercises success) will pass against the buggy version just as easily as the fixed one - the bug only shows up on the *second* trigger after a failure.
+
+**Q3: Is there a way to add retry logic (not just graceful failure) to the fixed version?**
+A: Yes - RxJS's `retry()` operator (or `retry({ count, delay })` for backoff) can be added inside the same inner pipe, before or instead of `catchError`: `this.net.fetchOptions().pipe(retry(2), catchError(() => of([])))`. This would automatically re-attempt the single failed request up to a couple of times before finally falling back to the empty-array replacement - still scoped to that one request, so it doesn't reintroduce the original bug.
+
+**Q4: Does this bug only affect `Subject`-based reload patterns, or could it show up elsewhere?**
+A: It can show up anywhere a flattening operator sits on a source that's expected to keep emitting - a route param `Observable` combined with `switchMap` to refetch on navigation is a very common real-world case, and the exact same `catchError` misplacement there means navigating to a new route after one failed fetch would silently stop refetching for the rest of the component's lifetime.
+
+## 10. Quick Answer (say this first)
+
+"The likely bug is `catchError` placed outside `switchMap`'s inner observable instead of inside it. When the HTTP call errors, that outer `catchError` doesn't just catch the request's error - it replaces the entire chain from the reload trigger onward, and its fallback observable completes after one emission, which ends the whole subscription permanently. No error reaches the console because `catchError` successfully swallowed it; the dropdown just has nothing subscribed to its reload trigger anymore. The fix is to move `catchError` inside `switchMap`'s projection function, so it's scoped to just that one request and the outer subscription survives indefinitely."
+
+## 11. Interview-Ready Answer (full)
+
+"This has the signature of a very specific, very common RxJS mistake: `catchError` is in the pipe, but it's positioned on the outside of a flattening operator like `switchMap` rather than inside it. Here's why that matters. The reload trigger - typically a `Subject` - is meant to live and keep emitting for the component's whole lifetime, with `switchMap` mapping each emission to a fresh HTTP call. If `catchError` sits right after `switchMap`, as a sibling operator in the same pipe, it isn't scoped to just the HTTP call - it's standing in for the entire chain, from the reload trigger all the way through. The first time the HTTP call errors, that error propagates up through `switchMap` to the outer `catchError`, which catches it and returns a fallback observable, commonly `of([])`. That fallback observable emits its one value and then completes - and because it's substituting for the whole outer chain, that completion ends the entire subscription, not just the one failed attempt.
+
+The reload `Subject` itself is completely unaffected and keeps accepting `.next()` calls without any error - but nothing is subscribed to it anymore, since that subscription already ran to completion. And because `catchError` did exactly what it was designed to do, no error is ever thrown or logged anywhere - which is precisely why there's nothing in the console, and why this is more insidious than a simple missing-error-handler bug.
+
+The fix is to move `catchError` inside the function passed to `switchMap`, so it wraps only that one, per-request inner observable. If that single request fails, only its own small replacement observable completes - `switchMap` and the outer subscription to the reload trigger are completely unaffected and remain alive indefinitely, ready for the next reload attempt. The broader principle is that `catchError` always ends whatever observable it's directly attached to, so the right question when placing it is: which part of the pipeline am I willing to let end if this fires? For a reload-and-retry pattern, the honest answer is 'just this one attempt' - which means `catchError` belongs inside the per-attempt operator, never outside it on the long-lived source."
+
+## 12. Quick Revision
+
+1. **Symptom:** dropdown fails once, then never loads again even after the network recovers - no console errors at all.
+2. **Root cause:** `catchError` placed OUTSIDE `switchMap`'s inner observable, so it replaces the entire outer chain (reload trigger + switchMap), not just the failed request.
+3. **Why no console error:** `catchError` successfully swallows the error - that's its whole job - so nothing is ever logged; the dropdown just silently has nothing subscribed to its reload trigger anymore.
+4. **The fix:** move `catchError` INSIDE `switchMap`'s projection function, scoping it to one request at a time, so the outer subscription survives indefinitely.
+5. **General rule:** `catchError` always terminates whatever observable it's directly attached to - decide what you're willing to let end before placing it.
+6. **Not `switchMap`-specific:** the same trap applies to `mergeMap`, `concatMap`, and `exhaustMap` sitting on any long-lived source.
+
+## 13. Memory Trick
+
+**Think of `catchError` as a parachute that, once deployed, ends the flight it was attached to.** Strap it to the whole airplane (outside `switchMap`, on the long-lived source) and one engine failure grounds the entire plane for good - no more flights, ever, even after the weather clears. Strap a separate parachute to each individual passenger's seat instead (inside `switchMap`, on the per-request observable), and if one passenger has a rough landing, everyone else's seat - and the plane itself - is completely unaffected and ready for the next flight.
