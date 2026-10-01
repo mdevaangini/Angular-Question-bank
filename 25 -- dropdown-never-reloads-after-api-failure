@@ -1,3 +1,6 @@
+> **Suggested filename:** `dropdown-never-reloads-after-api-failure.md`
+> **Suggested folder:** `interview-notes/angular/scenarios/`
+
 # [Scenario] A dropdown's options load via HTTP. After the API failed once, the dropdown never loads again even when the network recovers — no errors in console. What's the likely bug?
 
 ## 1. What is it?
@@ -6,11 +9,18 @@ The dropdown fetches its options through some kind of "reload" trigger - a `Subj
 
 ## 2. Why does this happen?
 
-This is one of the most common real-world RxJS gotchas, and it comes down to **where** `catchError` sits in the pipe relative to `switchMap`.
+Here's the plain-language version of what's going on.
 
-A `reload$` `Subject` is meant to live for the lifetime of the component, emitting once per reload attempt, forever. `switchMap` sits in between it and the actual HTTP call, mapping each `reload$` emission to a fresh request. The subtle trap: if `catchError` is placed **after** `switchMap`, on the *outer* pipe, it isn't just catching the HTTP request's error - it's standing in as a replacement for the **entire chain from `reload$` onward**. The moment the HTTP call errors, RxJS propagates that error up through `switchMap` to the outer `catchError`, which does its job and swallows it - but the fallback observable it returns (commonly `of([])`) is a stand-in for the *whole* outer pipe. That fallback observable emits its one value and then **completes**. Since it's now substituting for the entire `reload$`-to-`switchMap` chain, that completion ends the **entire subscription** - including the part listening to `reload$`.
+Think of `reload$` as a button that's supposed to work forever - every time you press it, it's supposed to trigger one fresh attempt to load the options. In the code, pressing it means calling `.next()` on a `Subject`. That `Subject` is piped through `switchMap`, which is the part that actually says "okay, go fetch the data now."
 
-`reload$` itself is completely fine and still alive as a `Subject` - calling `.next()` on it afterward doesn't throw or error. The problem is that absolutely nothing is subscribed to it anymore, because that subscription already ran to completion the moment the first error was caught. No error is thrown anywhere in this sequence - `catchError` did exactly what it was told to do - which is exactly why the console stays silent while the dropdown quietly stops working forever.
+The bug is about where you put the "if this fails, don't crash" code (`catchError`). There are two different places you could put it, and they behave completely differently:
+
+- **Put it in the wrong place (outside/after `switchMap`):** this is like putting a single fuse on the *entire button-and-wiring system*. If one request ever fails, that fuse doesn't just stop that one request - it shuts down the whole system, including the button itself. The button still looks like it's there and you can still press it, but it's no longer wired to anything. Nothing happens when you press it, ever again.
+- **Put it in the right place (inside `switchMap`, around just the one request):** this is like putting a small fuse on just *this one attempt*. If this one attempt fails, only this one attempt gets cut short. The button and all its wiring stay completely fine, ready for the next press.
+
+So in the buggy version: the first time the API call fails, the "catch the error" code catches it - but because of where it's sitting, it ends up replacing the *entire* chain, not just that one failed call. That replacement does its job (shows an empty list instead of crashing) and then it's done - finished, completed, over. And because that replacement was standing in for the whole chain, "it's done" means the *whole chain* is done, including the part that was listening for future button presses.
+
+The `reload$` button itself is perfectly fine the whole time - pressing it later doesn't throw any error. It's just that nobody is listening on the other end anymore, because that connection already finished a while ago. And since the error-catching code did exactly what it was supposed to do (catch the error quietly, without crashing anything), there's nothing left over to show up as a red error in the console. That's why it fails silently instead of with a visible error - the "fix the error" code is actually working correctly, it's just placed in a spot that causes way more damage than intended.
 
 ## 3. How does it work?
 
