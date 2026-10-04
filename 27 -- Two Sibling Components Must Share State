@@ -150,6 +150,7 @@ A: Provide a test double for the service in the TestBed (`providers: [{ provide:
 A: They get the same singleton and will silently share state — which is usually not what you want unless it was deliberate. This is why naming and documenting a shared service's intended scope matters; it's also an argument for route-scoped providers when state should NOT leak across features.
 
 **Q: Could you solve this with a `BehaviorSubject` instead of a signal?**
+---->https://stackblitz.com/edit/angular-ut2nyzci?file=src%2Fapp%2Fcart.service.ts
 A: Yes — same singleton-service pattern, just exposing an RxJS `BehaviorSubject`/`Observable` instead of a signal. Signals are simpler for this exact case (no subscription management, no `async` pipe needed), but either works; the state-location decision (service vs. component) is the same regardless of which reactive primitive you pick.
 
 **Q: Why not just store it on a shared parent component that wraps both routes?**
