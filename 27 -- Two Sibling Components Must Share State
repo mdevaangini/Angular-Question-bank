@@ -1,0 +1,174 @@
+# Two Sibling Components Must Share State That Survives Route Changes
+
+## 1. What is it?
+
+This is a state-sharing problem: two components that are **siblings** (not parent/child) need to read and write the *same* piece of data, and that data must stay alive even after the user navigates away and comes back. A typical example is a shopping cart, a multi-step wizard, or a "currently selected tenant" value that a `/products` page and a `/cart` page both need, where simply refreshing between routes must not wipe it out.
+
+The core question an interviewer is probing is: *where does this shared state live, given that routed components themselves get destroyed and recreated on every navigation?*
+
+## 2. Why was it introduced?
+
+In Angular, **routed components do not persist** across navigation by default. When you navigate from `/products` to `/cart`, Angular destroys the `ProductListComponent` instance (and runs its `ngOnDestroy`), then creates a brand new `CartSummaryComponent` instance. Any state stored directly on either component's class (plain fields, local signals) is gone the moment its owning component is destroyed.
+
+For two *siblings* specifically, there's an extra wrinkle: they're never on screen at the same time (each occupies the same `<router-outlet>` one at a time, or they sit in separate outlets), so you can't just pass an `@Input()` from one to the other the way you would with parent/child. There's no direct line of communication — you need something external to both of them that neither one owns the lifecycle of.
+
+This problem shows up constantly in real apps: a cart that must survive browsing more products, a filter/search state that should persist as the user drills into a detail page and back, a form wizard where step 2 needs what step 1 collected, or a selected workspace that multiple unrelated feature pages all need to read.
+
+## 3. How does it work?
+
+There are several real options, each with a different "container" for the shared state and a different lifetime:
+
+**Option A — A shared service with `providedIn: 'root'`**
+- Angular's DI creates exactly **one instance** of a root-provided service for the entire application, the first time anything injects it.
+- That instance lives for as long as the app is open in the tab — it is completely decoupled from any component's lifecycle, including router navigation.
+- Both sibling components `inject()` the same service and read/write a `signal()` (or a `BehaviorSubject`) on it. Because it's the same instance, updates from one component are immediately visible to the other once it's created.
+- This is the **default, go-to choice** for most mid-size apps.
+
+**Option B — A service scoped to a parent route (route-level `providers`)**
+- Instead of `providedIn: 'root'`, you register the service in the `providers` array of a *parent* route that both sibling routes live under.
+- Angular creates a new instance of that service when the parent route is activated, and destroys it when you navigate *away from that whole subtree* — not on every child-to-child navigation within it.
+- Useful when you want shared state that resets automatically once the user leaves a feature area (e.g., an "edit invoice" flow with multiple steps/siblings, where you don't want stale data to leak into the next invoice they open).
+
+**Option C — Global state management library (NgRx, NgXs, Akita, Elf)**
+- A single app-wide store holds the state; components dispatch actions and select slices via observables/signals.
+- Survives route changes for the same reason as Option A (it's a singleton, not tied to component lifecycle) — but adds structure (actions, reducers/effects, devtools, time-travel debugging) on top.
+- Makes sense when the state is complex, has many interdependent pieces, needs undo/redo, or many unrelated parts of a large app need to react to the same changes.
+
+**Option D — URL state (route params / query params)**
+- Put the shared value directly in the URL: `/cart?promoCode=SAVE10` or a route param.
+- Survives not just route changes but full page refreshes and is shareable/bookmarkable.
+- Only works for state that's reasonably simple to serialize into a string and that *should* be reflected in the URL (filters, selected tab, pagination page) — not for something like an in-memory cart object with nested arrays.
+
+**Option E — `sessionStorage` / `localStorage`**
+- Persist the value to the browser's storage so it survives not just route changes but also full reloads/tab crashes.
+- Usually combined with Option A: the service is the single source of truth at runtime, and it additionally syncs to storage so a page refresh can rehydrate it.
+- Needed when "survives route changes" is actually a stand-in for "survives reloads too" — if the requirement is really just route-to-route, you don't need this at all, and reaching for storage when you didn't need to adds complexity and staleness risk for nothing.
+
+**Option F — Lifting state to a common ancestor component**
+- If both siblings are actually inside a shared parent component (not two top-level routed pages, but two child components rendered by the same parent), you can hold the state as a signal on that parent and pass it down via `input()` / up via `output()`.
+- This *doesn't* solve the "survives route changes" requirement on its own if the parent itself is route-bound and gets destroyed — it only helps when the parent is stable across the interaction.
+
+## 4. Example
+
+```ts
+// cart.service.ts — Option A: root-provided, signal-based shared state
+import { Injectable, signal, computed } from '@angular/core';
+
+export interface CartItem {
+  id: number;
+  name: string;
+  price: number;
+  quantity: number;
+}
+
+@Injectable({ providedIn: 'root' })
+export class CartService {
+  private readonly _items = signal<CartItem[]>([]);
+  readonly items = this._items.asReadonly();
+
+  readonly itemCount = computed(() =>
+    this._items().reduce((sum, item) => sum + item.quantity, 0)
+  );
+
+  addItem(product: { id: number; name: string; price: number }): void {
+    this._items.update(items => {
+      const existing = items.find(i => i.id === product.id);
+      return existing
+        ? items.map(i => i.id === product.id ? { ...i, quantity: i.quantity + 1 } : i)
+        : [...items, { ...product, quantity: 1 }];
+    });
+  }
+}
+```
+
+```ts
+// product-list.component.ts and cart-summary.component.ts are SIBLINGS —
+// neither is the other's parent or child. Each independently injects CartService.
+cart = inject(CartService);
+```
+
+**StackBlitz (fully working, verified running):** https://stackblitz.com/edit/angular-7uszvfvv
+
+Two routed sibling components, `ProductListComponent` (`/products`) and `CartSummaryComponent` (`/cart`), both inject the same root-provided `CartService`. Add items on the Products tab, switch to the Cart tab — the cart is already populated, even though `CartSummaryComponent` was just freshly created by the router and has never seen `ProductListComponent`.
+
+## 5. Example Explanation / Execution Flow
+
+1. The app boots. `CartService` doesn't exist yet — nothing has injected it.
+2. User lands on `/products`. Angular creates `ProductListComponent`, which does `cart = inject(CartService)`. This is the first injection anywhere in the app, so Angular creates the **one and only** `CartService` instance right now and hands it to this component.
+3. User clicks "Add to cart" on the keyboard. This calls `cart.addItem(...)`, which updates the signal **on the service instance**, not on the component.
+4. User clicks the "Cart" nav link. The router destroys `ProductListComponent` entirely (`ngOnDestroy` runs, the class instance is eligible for garbage collection) and instantiates `CartSummaryComponent` for `/cart`.
+5. `CartSummaryComponent` does its own `cart = inject(CartService)`. Angular's DI sees a root-provided singleton already exists and hands back the **same instance** — it does not create a second one.
+6. `CartSummaryComponent`'s template reads `cart.items()` and `cart.total()`. Since this is the same service instance that already has the keyboard in it, the cart shows up immediately, with no manual hand-off between the two components at all.
+
+The component that died never "sent" anything anywhere — the data was never inside the component to begin with. It only ever lived in the service.
+
+## 6. When should we use it?
+
+- **Root-provided service (Option A):** default choice for most mid-size apps — cart, selected filters that should persist app-wide, a logged-in user profile, feature flags, a notifications/toast queue.
+- **Route-scoped service (Option B):** multi-step flows or an editing feature where the shared state should auto-reset once the user leaves that feature area, without you having to remember to clear it manually.
+- **NgRx/Akita/global store (Option C):** large apps, many features reacting to the same state, complex async orchestration, need for strict unidirectional data flow, time-travel debugging, or a large team that benefits from an enforced pattern.
+- **URL state (Option D):** state that's simple, should be shareable/bookmarkable, or should survive a hard refresh — search filters, active tab, pagination.
+- **Storage-backed (Option E):** anything that must survive a full page reload or browser crash, not just an in-app route change (drafts, "resume where you left off").
+- **Lifted to a common parent (Option F):** only when the two components are true children of a stable (non-destroyed) parent — not really applicable to the "survives route changes" scenario unless that parent itself never unmounts.
+
+## 7. Advantages / Disadvantages
+
+**Root-provided service**
+- Advantages: trivial to set up, no extra library, plays naturally with signals and `OnPush`, state and behavior live in one obvious place.
+- Disadvantages: it's effectively global/app-wide — nothing stops an unrelated far-away component from also injecting it and quietly depending on it, which can create hidden coupling if the team isn't disciplined about where it's injected.
+
+**Route-scoped service**
+- Advantages: automatic cleanup, scoped blast radius, avoids "state leaking into the next flow" bugs.
+- Disadvantages: easy to misconfigure (e.g., provide it on the wrong route level and it either never shares or never resets), slightly less obvious to a newcomer where the instance boundary actually is.
+
+**Global store (NgRx etc.)**
+- Advantages: predictable, inspectable (devtools/time-travel), scales well to very complex state graphs, enforces a consistent pattern across a big team.
+- Disadvantages: real boilerplate and a learning curve; for a cart with three fields, it is usually overkill.
+
+**URL / storage-based**
+- Advantages: survives more than just route changes (refresh, closed tab); URL state is shareable.
+- Disadvantages: limited to serializable data; storage can silently drift out of sync with the real app state if not centralized through one service.
+
+## 8. Common Interview Traps
+
+- Saying "just use `@Input()`/`@Output()`" — doesn't work for true siblings with no direct parent-child relationship, and definitely doesn't survive either one being destroyed by routing.
+- Forgetting that `providedIn: 'root'` is what makes the instance a true singleton — if you instead list the same service in a component's own `providers` array, each component that does so gets its **own separate instance**, defeating the entire point.
+- Assuming any service automatically "survives route changes" — it does, but only because the **service**, not the components, is outside the router's lifecycle. Confusing where the lifetime boundary actually sits is the most common mistake.
+- Reaching straight for NgRx for a two-field cart, when a signal-based service does the same job with a fraction of the code — over-engineering is itself a red flag in a design discussion.
+- Forgetting that route-level `providers` creates a *new* instance each time that route subtree is (re)activated — assuming it behaves like `providedIn: 'root'` when it doesn't.
+- Not distinguishing "survives route changes" (needs a non-component owner of the state) from "survives a hard refresh" (needs storage/URL too) — these are different requirements with different solutions.
+
+## 9. Interview Follow-up Questions
+
+**Q: What if the cart also needs to survive a full page refresh, not just route navigation?**
+A: A root service alone won't help — the whole app (and the service instance) is destroyed on a real reload. Pair the service with `localStorage`/`sessionStorage`: write to storage whenever the signal changes, and read it back in the service's constructor on startup.
+
+**Q: How would you unit test a component that depends on this shared service?**
+A: Provide a test double for the service in the TestBed (`providers: [{ provide: CartService, useValue: fakeCartService }]`), or instantiate the real `CartService` fresh per test since it has no external dependencies — either way, you're testing the component's interaction with the service's public API, not its internals.
+
+**Q: What happens if two completely unrelated feature modules both inject the same root service by accident?**
+A: They get the same singleton and will silently share state — which is usually not what you want unless it was deliberate. This is why naming and documenting a shared service's intended scope matters; it's also an argument for route-scoped providers when state should NOT leak across features.
+
+**Q: Could you solve this with a `BehaviorSubject` instead of a signal?**
+A: Yes — same singleton-service pattern, just exposing an RxJS `BehaviorSubject`/`Observable` instead of a signal. Signals are simpler for this exact case (no subscription management, no `async` pipe needed), but either works; the state-location decision (service vs. component) is the same regardless of which reactive primitive you pick.
+
+**Q: Why not just store it on a shared parent component that wraps both routes?**
+A: That only works if the parent itself is never destroyed by the router during the interaction (e.g., it's the top-level `AppComponent`, or a layout component that wraps a whole section via nested routing without itself being swapped out). If the parent is also route-driven and gets torn down, you're back to square one — the service approach avoids depending on any particular component surviving at all.
+
+## 10. Interview-Ready Answer
+
+"Two sibling components can't talk to each other directly — there's no parent-child relationship to pass an `@Input()` through, and since they're routed, each one gets destroyed and recreated as the user navigates. So the fix is to put the shared state somewhere that isn't owned by either component's lifecycle. My default for a mid-size app is a service with `providedIn: 'root'`, holding the state in a signal. Angular's DI only ever creates one instance of that service for the whole app, so when component A updates it and gets destroyed, component B — created fresh by the router — injects that same instance and immediately sees the latest state. If I needed the state to reset automatically once the user leaves a whole feature area, I'd instead provide the service at that feature's parent route instead of root. If the app were much bigger with lots of cross-cutting state and async orchestration, I'd reach for NgRx or a similar store instead, but for a straightforward case like a cart, a root-provided signal service is the simplest thing that's actually correct, and I'd only add localStorage syncing on top if the requirement extended to surviving a hard refresh, not just in-app navigation."
+
+## 11. Quick Revision
+
+- **What:** Two sibling (non-parent-child) components need to share state that outlives route navigation.
+- **Why:** Routed components are destroyed/recreated on navigation; siblings have no direct input/output channel anyway.
+- **Problem solved:** Where to put state so it isn't tied to any one component's lifecycle.
+- **How:** A `providedIn: 'root'` service holding a `signal()`/`BehaviorSubject`, injected by both siblings; route-scoped providers for feature-local sharing; NgRx/global store for large/complex state; URL or storage when the requirement is really "survives refresh," not just route change.
+- **Use when:** Any time two or more unrelated components need the same live data — carts, filters, user/session info, multi-step flows.
+- **Important:** The singleton behavior comes specifically from `providedIn: 'root'` (or an app-root-level `providers` entry) — provide the same service locally on a component and you silently get separate instances per component.
+- **Remember:** The component dies, the service doesn't — build on that boundary, don't fight it.
+
+## 12. Memory Trick
+
+**"Components come and go, services stay."** If two components need to agree on something and one of them might not be alive when the other needs it, the answer is never "pass it directly" — it's "give it a home that outlives both of them."
