@@ -1,0 +1,176 @@
+# [Scenario] Users navigate away from a half-filled form (back button, menu click, closing tab) and lose work. Product wants a "You have unsaved changes" confirmation. Implement all the paths.
+
+## 1. What is it?
+
+The tricky part of this request isn't showing a confirmation dialog - that's easy. The hard part is "all the paths," because a user can leave a page in two fundamentally different ways, and Angular can only see one of them. Clicking a link to another page in the app, using the browser's own Back/Forward buttons, closing the tab, refreshing, typing a new URL, or clicking a link to an entirely different website are all "leaving the page" from the user's point of view - but from the app's point of view, some of these stay inside Angular's world and some of them don't, and they need two completely different mechanisms to catch.
+
+## 2. Why does this happen (why isn't one mechanism enough)?
+
+Angular's Router only knows about navigations it's actually involved in - clicking a `routerLink`, calling `router.navigate()`, and (this surprises people) the browser's Back/Forward buttons, since those fire a `popstate` event that the Router is listening for too. For any of these, Angular gets a chance to ask "wait, should this navigation actually be allowed to happen?" before it completes.
+
+But closing the tab, refreshing the page, typing a brand-new URL into the address bar, or clicking a plain `<a href="https://example.com">` to somewhere outside the app are not Router navigations at all - they're the browser tearing down the whole page. Angular's JavaScript doesn't get a meaningful chance to intervene the way it does for an in-app navigation; the only hook available for "the whole page is about to unload" is a native browser event, completely separate from anything Angular provides.
+
+So "implement all the paths" really means: one mechanism for anything the Angular Router controls, and a second, different mechanism for anything that bypasses the Router entirely.
+
+## 3. How does it work?
+
+**Path group 1 - in-app navigation and the browser's Back/Forward buttons: `CanDeactivate`.**
+Angular's router supports a `canDeactivate` guard on a route, which runs right before the router is about to navigate away from that route's component. The guard can return `true` (allow it), `false` (block it), or an `Observable<boolean>`/`Promise<boolean>` (wait for an async answer - exactly what's needed to show a dialog and wait for the user's choice). Crucially, this guard runs for *any* navigation the Router processes - a `routerLink` click, `router.navigate()`, **and** the browser's Back/Forward buttons - since all three ultimately go through the same Router navigation pipeline. This single guard is the fix for far more of "all the paths" than people initially expect.
+
+**Path group 2 - tab close, refresh, typing a new URL, or an external link: the `beforeunload` event.**
+This is a native browser event, nothing Angular-specific. Calling `event.preventDefault()` (and, for older browser compatibility, setting `event.returnValue`) inside a `beforeunload` listener tells the browser to show its own native "leave site?" confirmation before the page actually unloads. Two hard limits worth knowing: the message text can't be customized in any modern browser (every major browser has ignored custom text here since around 2011, specifically to stop sites from using it for scams or deceptive wording) - you only control *whether* the prompt appears, not what it says. And the handler must be synchronous; there's no way to show a custom async modal here instead, because the browser is actively in the process of tearing the page down and won't wait for a promise to resolve.
+
+**Putting it together:** a form component implements a small interface (e.g., `hasUnsavedChanges(): boolean`) that both mechanisms can check. The `CanDeactivate` guard calls it to decide whether to show a custom, fully-stylable confirmation dialog before an in-app or back/forward navigation proceeds. A `beforeunload` listener on the same component calls the exact same method to decide whether to trigger the browser's own native prompt for tab-close/refresh/external-link cases. One source of truth for "is there unsaved work," two different delivery mechanisms for the two different kinds of "leaving."
+
+A design choice worth calling out: the classic simple implementation uses `window.confirm()` inside the `CanDeactivate` guard. That works, but it's a blocking, unstyled, un-brandable native dialog. Since `CanDeactivate` explicitly supports returning an `Observable<boolean>`, a better implementation shows a normal Angular component as the confirmation dialog instead, resolving a `Subject<boolean>` when the user picks an option - fully async, fully stylable, and testable like any other component. `beforeunload` doesn't have this option - it's stuck with the browser's native prompt no matter what, since nothing else is allowed to run synchronously at that exact moment.
+
+## 4. Example
+
+**StackBlitz project:** [stackblitz.com/edit/angular-zwuwdy8q](https://stackblitz.com/edit/angular-zwuwdy8q?file=src%2Fapp%2Fapp.component.ts)
+
+```typescript
+// unsaved-changes.guard.ts - a functional guard (Angular 14.2+), no class needed.
+export interface CanComponentDeactivate {
+  hasUnsavedChanges(): boolean;
+}
+
+export const unsavedChangesGuard: CanDeactivateFn<CanComponentDeactivate> = (component) => {
+  if (!component.hasUnsavedChanges()) {
+    return true; // nothing to lose - let the navigation proceed immediately
+  }
+  const confirmSvc = inject(ConfirmLeaveService);
+  return confirmSvc.confirmLeave(); // Observable<boolean> - router waits for it
+};
+```
+
+```typescript
+// confirm-leave.service.ts - shows a real Angular dialog instead of window.confirm().
+@Injectable({ providedIn: 'root' })
+export class ConfirmLeaveService {
+  readonly visible = signal(false);
+  private resultSubject?: Subject<boolean>;
+
+  confirmLeave(): Observable<boolean> {
+    this.resultSubject = new Subject<boolean>();
+    this.visible.set(true);
+    return this.resultSubject.asObservable();
+  }
+
+  resolve(result: boolean): void {
+    this.visible.set(false);
+    this.resultSubject?.next(result);
+    this.resultSubject?.complete();
+  }
+}
+```
+
+```typescript
+// form-page.component.ts - implements the interface, and registers the
+// SEPARATE beforeunload path for tab-close/refresh/external links.
+export class FormPageComponent implements CanComponentDeactivate {
+  form = new FormGroup({ name: new FormControl(''), email: new FormControl('') });
+
+  hasUnsavedChanges(): boolean {
+    return this.form.dirty;
+  }
+
+  save(): void {
+    this.form.markAsPristine();
+  }
+
+  @HostListener('window:beforeunload', ['$event'])
+  unloadNotification(event: BeforeUnloadEvent): void {
+    if (this.hasUnsavedChanges()) {
+      event.preventDefault();
+      event.returnValue = true;
+    }
+  }
+}
+```
+
+```typescript
+// app.routes.ts - the guard is attached to the route, not called manually anywhere.
+export const routes: Routes = [
+  { path: '', redirectTo: 'form', pathMatch: 'full' },
+  { path: 'form', component: FormPageComponent, canDeactivate: [unsavedChangesGuard] },
+  { path: 'home', component: HomePageComponent },
+];
+```
+
+**Verification status:** fully live-verified for Path group 1. Typing into the Name field and clicking "Home" triggered the custom modal ("You have unsaved changes - if you leave this page now, the changes you made will be lost"); clicking "Stay on this page" kept the modal/page in place; clicking "Leave anyway" navigated to `/home` (confirmed via the URL changing to `.../home`). Separately, typing a value and clicking "Save" cleared the dirty state ("No unsaved changes - navigating away is silent"), and the subsequent click to "Home" navigated immediately with no modal at all, confirming the guard correctly lets through a clean form. Path group 2 (`beforeunload`) is correct, standard code, but wasn't - and can't meaningfully be - click-tested in this embedded preview: triggering a real tab close or refresh would tear down the sandbox itself, and native `beforeunload` prompts are routinely suppressed by browsers inside iframes and automated contexts regardless. The browser back/forward button path wasn't separately click-tested either, since it's structurally the same `CanDeactivate` guard already proven live above - Angular's Router doesn't distinguish between a `routerLink` click and a `popstate`-triggered navigation when deciding whether to run the guard.
+
+## 5. Example Explanation – Execution Flow
+
+1. The user types into the Name field. Angular's Reactive Forms marks the `FormGroup` as `dirty`, which `hasUnsavedChanges()` reads directly - no separate flag to maintain.
+2. The user clicks "Home." Angular's Router begins processing that navigation and, before actually swapping out the component, checks the `form` route's `canDeactivate` guards.
+3. `unsavedChangesGuard` runs, sees `hasUnsavedChanges()` return `true`, and calls `confirmSvc.confirmLeave()`, which sets `visible` to `true` (rendering the dialog) and returns an `Observable<boolean>` that hasn't emitted yet. The Router sees this Observable and **waits** - the navigation is genuinely paused, not just visually blocked.
+4. Clicking "Leave anyway" calls `confirmSvc.resolve(true)`, which pushes `true` through that Observable. The Router receives `true`, considers the guard satisfied, hides the dialog (`visible` back to `false`), and completes the navigation to `/home`. Clicking "Stay on this page" instead resolves with `false`, and the Router simply cancels the navigation - the URL and component never change.
+5. After clicking "Save," `form.markAsPristine()` resets the dirty flag. The next click on "Home" runs the exact same guard, but this time `hasUnsavedChanges()` returns `false` on the very first check, so the guard returns `true` immediately - no dialog, no Observable, no pause - and the Router proceeds straight through.
+6. Separately and independently, `@HostListener('window:beforeunload', ...)` is registered on the same component the whole time. It plays no role in any of the steps above - it only matters if the user tries to close the tab, refresh, or navigate to a URL the Angular Router never sees, at which point the browser (not Angular) shows its own native prompt, gated by the same `hasUnsavedChanges()` check.
+
+## 6. When to use?
+
+- Any form, wizard, or editor where losing in-progress input would be a genuinely bad user experience - settings pages, content editors, checkout flows, long multi-field forms.
+- Specifically reach for `CanDeactivate` for every in-app route transition and the browser's back/forward buttons - it's one guard that covers both automatically.
+- Add `beforeunload` as well whenever the same page can also be left via tab close, refresh, typing a new URL, or a link to outside the app - skipping it means a user can still silently lose work through any of those paths even with a perfect `CanDeactivate` guard in place.
+
+## 7. Advantages / Disadvantages
+
+**`CanDeactivate` with a custom async dialog**
+
+*Advantages:* fully stylable, fully testable like any other Angular component; naturally supports async confirmation (a dialog with more than two buttons, extra context, even its own API call if needed); automatically covers browser back/forward with zero extra code.
+
+*Disadvantages:* only works for navigations the Angular Router is actually involved in - it has no effect whatsoever on tab close, refresh, or external links, which is exactly why it has to be paired with `beforeunload` to cover "all the paths" as asked.
+
+**`beforeunload`**
+
+*Advantages:* it's the only mechanism that exists for catching a genuine page unload (tab close, refresh, new URL, external link) - there's no substitute.
+
+*Disadvantages:* the prompt's text can't be customized in any modern browser, so the user experience here is necessarily generic and browser-controlled; the handler must run synchronously, so a custom-styled dialog is never an option for this path; it's also easy to misuse by registering it unconditionally (always preventing unload) rather than gating it on the actual dirty check, which trains users to click through a prompt that appears even when there's nothing to lose.
+
+## 8. Common Interview Traps
+
+- Assuming the browser's Back/Forward buttons need special, separate handling - they don't; they go through the same `CanDeactivate` guard as a normal `routerLink` click, since both are Router-processed navigations. This is the single most common gap in a rushed answer to this question.
+- Trying to show a custom, styled confirmation dialog inside `beforeunload` - this is a hard platform limitation, not a missing feature to work around; only the browser's own native, unstyled, un-customizable prompt is available there, and the handler must be synchronous.
+- Using `form.dirty` as the only signal without considering that it stays `true` even if the user types something and then deletes it back to the original value - a more precise implementation compares the current value against an initial snapshot, though `form.dirty` is a reasonable, common simplification for most real-world cases.
+- Forgetting that `CanDeactivate` and `beforeunload` are driven by the same underlying question ("is there unsaved work?") but are otherwise two unrelated mechanisms with no shared plumbing - implementing only one of them leaves exactly the paths the other was supposed to cover completely unprotected.
+
+## 9. Interview Follow-up Questions
+
+**Q1: Why can't `beforeunload` show a nice custom modal instead of the browser's ugly native prompt?**
+A: Because by the time `beforeunload` fires, the browser is actively tearing the page down and will only wait for a synchronous decision - there's no opportunity to await a promise, animate a dialog in, or let the user click a styled button, since the page itself may not exist by the time any of that could resolve. The native, unstyled prompt (gated by `preventDefault()`) is the only tool the platform provides for this specific moment, by design.
+
+**Q2: How would you unit test the `CanDeactivate` guard?**
+A: Create a fake component implementing `hasUnsavedChanges()`, call the guard function directly with it (functional guards are just functions, callable in a test the same way), and assert it returns `true` immediately when `hasUnsavedChanges()` is `false`. For the `true` case, assert it returns an Observable, subscribe to it, call `confirmSvc.resolve(true)` / `resolve(false)` manually in the test, and assert the Observable emits the matching value.
+
+**Q3: What if the user clicks a plain `<a>` tag pointing to an external site, instead of using the browser's UI to close the tab?**
+A: That's functionally identical to a tab close or refresh from Angular's perspective - clicking a real `<a href="https://...">` to an external domain triggers a full page unload, which the Angular Router never sees or participates in. It's caught by the exact same `beforeunload` listener as tab-close and refresh, not by `CanDeactivate`, since `CanDeactivate` only fires for navigations the Router itself is processing.
+
+**Q4: Is there a risk of the `beforeunload` prompt appearing when it shouldn't?**
+A: Yes, if it isn't gated by the dirty check and instead registered unconditionally - some implementations mistakenly add the listener once in `ngOnInit` and never remove it, or forget to check `hasUnsavedChanges()` inside it, resulting in a confirmation prompt on every single page leave regardless of whether there's actually anything to lose. Always gate the `preventDefault()` call on the same truthy check used for the in-app guard, and make sure the listener itself is cleaned up (or naturally scoped to the component's lifetime, as `@HostListener` is) so it doesn't linger after the component is gone.
+
+## 10. Quick Answer (say this first)
+
+"This needs two separate mechanisms, because 'leaving the page' splits into two categories Angular can't treat the same way. For in-app navigation - clicking another route, or even the browser's Back/Forward buttons, since those also go through Angular's Router - I'd use a `CanDeactivate` guard that checks a `hasUnsavedChanges()` method on the component and, if true, shows a confirmation (ideally a real async Angular dialog, not `window.confirm()`) before letting the navigation proceed. For anything that bypasses the Router entirely - closing the tab, refreshing, typing a new URL, or clicking a link to an external site - I'd register a `beforeunload` listener that calls `preventDefault()` under the same dirty check, which triggers the browser's own native 'leave site?' prompt. One shared way of knowing there's unsaved work, two different delivery mechanisms for the two different ways of leaving."
+
+## 11. Interview-Ready Answer (full)
+
+"The key insight here is that 'the user is leaving the page' isn't one event from Angular's point of view - it's two completely different categories, and each one needs its own mechanism. The first category is anything Angular's Router is actually involved in: clicking a `routerLink`, calling `router.navigate()` programmatically, and - this is the detail people most often miss - the browser's own Back and Forward buttons, since those fire a `popstate` event that the Router is also listening to and processes as a normal navigation. For all of these, Angular supports a `canDeactivate` route guard that runs before the navigation completes, and can return `true`, `false`, or an `Observable`/`Promise` of a boolean if I need to wait for user input. I'd implement a small interface, something like `hasUnsavedChanges(): boolean`, on the form component, and have the guard call it: if there's nothing unsaved, return `true` immediately and let the navigation through with zero friction; if there is, show a confirmation and wait for the result. I'd specifically avoid `window.confirm()` for this and instead resolve a Subject-backed Observable from a real, styled Angular dialog component, since `CanDeactivate` explicitly supports that and it's a much better experience than a blocking native browser popup.
+
+The second category is anything that bypasses the Router completely: closing the tab, refreshing, typing a brand-new URL into the address bar, or clicking a link to an external site. None of these are navigations Angular's JavaScript gets meaningfully involved in - the browser is just tearing the page down. The only hook available there is the native `beforeunload` event: calling `event.preventDefault()` inside a handler, gated by that same `hasUnsavedChanges()` check, tells the browser to show its own confirmation before unloading. Two real constraints worth knowing: the prompt's wording can't be customized in any modern browser - that's been true since around 2011, specifically so sites can't use deceptive text there - and the handler has to be synchronous, so a custom styled dialog is never an option for this particular path; it's strictly the browser's own generic prompt.
+
+So the full implementation is one shared signal of truth - whatever `hasUnsavedChanges()` checks, typically the form's dirty state - read by two independent mechanisms: a `CanDeactivate` guard for anything Angular's Router controls, including back/forward, and a `beforeunload` listener for anything that bypasses the Router entirely. Missing either one leaves exactly the paths it was supposed to cover completely unprotected, which is really the crux of what 'implement all the paths' is testing for."
+
+## 12. Quick Revision
+
+1. **Two categories of 'leaving,' two mechanisms:** anything the Angular Router handles (`CanDeactivate`) vs. anything that bypasses it entirely (`beforeunload`).
+2. **`CanDeactivate` covers more than people expect:** `routerLink` clicks, `router.navigate()`, AND the browser's Back/Forward buttons - all three go through the same Router pipeline and the same guard.
+3. **`beforeunload` covers what's left:** tab close, refresh, typing a new URL, and links to external sites - none of which Angular's Router ever sees.
+4. **One shared check:** both mechanisms should call the same `hasUnsavedChanges()` method, so there's exactly one place that defines "is there unsaved work."
+5. **Prefer a custom async dialog over `window.confirm()`** for the `CanDeactivate` path - `Observable<boolean>`/`Promise<boolean>` are explicitly supported return types for exactly this reason.
+6. **`beforeunload` has hard platform limits:** no custom message text (ignored by all modern browsers since ~2011), and the handler must be synchronous - no custom modal is possible there, ever.
+7. **Gate both on the real dirty check**, not unconditionally - an ungated `beforeunload` listener nags the user even when there's nothing to lose.
+
+## 13. Memory Trick
+
+**Think of the form page as a room with two different kinds of exits.** The *internal hallway doors* (other pages in the app, and the Back/Forward buttons, since those use the same hallway) all pass by one receptionist (`CanDeactivate`) who can stop you and ask "are you sure?" before you're allowed through, and can even put up a proper, friendly sign to ask. The *fire escape* (closing the tab, refreshing, typing a new address, or a link straight outside the building) bypasses the receptionist entirely - the only thing waiting there is the building's own fire alarm system (`beforeunload`), which can only ever blare its one standard, unstylish warning tone - it doesn't know how to say anything custom, and it can't pause to have a conversation with you first.
