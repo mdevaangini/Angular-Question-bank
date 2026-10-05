@@ -115,6 +115,12 @@ A common middle ground: resolve only the small, critical piece (the record itsel
 Resolvers always run when a route is entered fresh (for example /home → /product/5). They only re-run while staying on the same route if something specific changes. By default that means only path params (/product/5 → /product/6 re-runs; /product/5 → /product/5?sort=desc does not).
 
 The trap is that a resolver depending on query params shows stale data when they change, because the resolver doesn't re-run. Fix it with runGuardsAndResolvers: 'paramsOrQueryParamsChange' (or 'always') on the route.
+{
+  path: 'product/:id',
+  component: ProductPage,
+  resolve: { product: productResolver },
+  runGuardsAndResolvers: 'paramsOrQueryParamsChange'
+}
 
 
 - Presenting it as an either/or. The strongest answer is a hybrid: resolve what the page can't exist without, skeleton the rest.
