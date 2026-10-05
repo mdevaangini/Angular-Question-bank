@@ -1,0 +1,156 @@
+> **Suggested filename:** `route-resolvers-vs-skeleton-ui.md`
+> **Suggested folder:** `interview-notes/angular/routing/`
+
+# [Theory] What are route resolvers? Trade-off: resolver vs loading data in the component with a skeleton UI.
+
+## 1. What is it?
+
+A route resolver is a small function you attach to a route. Angular runs it **before** the route's component is created, waits for it to finish, and then hands the result to the component. So by the time the component appears on screen, its data is already there.
+
+The alternative is the opposite order: show the component right away, and let it fetch its own data. While it waits, it shows a placeholder, usually a "skeleton" (grey boxes shaped like the real content).
+
+Same goal (get data to the screen), different answer to one question: **do we wait before showing the page, or show the page and wait inside it?**
+
+## 2. Why were resolvers introduced?
+
+Without a resolver, every component has to handle the "data hasn't arrived yet" state itself: a loading flag, null checks in the template, an error branch. That's repeated in every component. It also means the page can flash half-empty content before the data lands.
+
+A resolver moves that waiting into the router. The component can then be written as if its data always exists, because the router won't create it until the data is ready. It also gives you a clean place to say "if this data can't be loaded, don't even go to this page" (for example, redirect to a 404 when a product ID doesn't exist).
+
+## 3. How does it work?
+
+- You write a resolver function (`ResolveFn<T>`) that returns the data, or an `Observable`/`Promise` of it.
+- You attach it to a route under `resolve: { product: productResolver }`.
+- When the user navigates to that route, the router runs the resolver first. **Navigation is paused** until it finishes. The URL doesn't change, and the old page stays on screen.
+- When it finishes, the router creates the component and gives it the data under the key you chose (`product`). You read it from `ActivatedRoute.data`, or, with `withComponentInputBinding()`, receive it directly as an input named `product`.
+- If the resolver errors, the navigation fails. The new component is never created, so you must handle the error (catch it and redirect, or return a fallback), or the user just stays on the old page with nothing visible happening.
+- Resolvers re-run by default when route params change, but not when only query params change (controlled by `runGuardsAndResolvers`).
+
+## 4. Example
+
+```typescript
+// product.resolver.ts
+import { inject } from '@angular/core';
+import { ResolveFn, Router } from '@angular/router';
+import { catchError, of } from 'rxjs';
+import { EMPTY } from 'rxjs';
+
+export const productResolver: ResolveFn<Product> = (route) => {
+  const api = inject(ProductApi);
+  const router = inject(Router);
+  return api.getProduct(route.paramMap.get('id')!).pipe(
+    catchError(() => {
+      router.navigate(['/not-found']); // don't leave the user stuck
+      return EMPTY;                    // cancel this navigation
+    })
+  );
+};
+```
+
+```typescript
+// routes
+{ path: 'product/:id', component: ProductPage, resolve: { product: productResolver } }
+```
+
+```typescript
+// component - data is already here, no loading flag needed
+export class ProductPage {
+  product = input.required<Product>();   // needs withComponentInputBinding()
+  // (older style: inject(ActivatedRoute).data.subscribe(...) )
+}
+```
+
+The skeleton alternative, for comparison:
+
+```typescript
+// component fetches its own data and shows a placeholder meanwhile
+export class ProductPage {
+  private api = inject(ProductApi);
+  id = input.required<string>();
+  state = toSignal(this.api.getProduct(this.id()).pipe(
+    map(p => ({ loading: false, product: p })),
+    catchError(() => of({ loading: false, product: null }))
+  ), { initialValue: { loading: true, product: null } });
+}
+// template: @if (state().loading) { <app-skeleton/> } @else { ...real content... }
+```
+
+## 5. Example Explanation – Execution Flow
+
+**With a resolver:** user clicks a link → router starts navigation → resolver runs and the old page stays visible → data arrives → router creates `ProductPage` with data in hand → page appears fully filled in. If the API is slow, the user sees nothing change for a while after clicking.
+
+**With a skeleton:** user clicks a link → router creates `ProductPage` immediately → page appears with grey placeholder boxes → component starts its own fetch → data arrives → placeholders are swapped for real content. If the API is slow, the user sees the new page right away, but it looks empty for a while.
+
+## 6. When to use which?
+
+**Use a resolver when:**
+- The page is meaningless without the data (a detail page for one record).
+- A missing or invalid record should stop the navigation entirely (404, redirect, "no access").
+- You want the component simple, with no loading/error branches.
+- The fetch is usually fast, so a short pause before navigation is acceptable.
+
+**Use component-level loading with a skeleton when:**
+- The API can be slow or unpredictable. A frozen click with no feedback feels broken.
+- The page has a useful shell (header, filters, layout) that can show immediately while the data fills in.
+- Different parts of the page load independently (each can show its own skeleton and arrive on its own).
+- Perceived speed matters more than "no half-empty states."
+
+A common middle ground: resolve only the small, critical piece (the record itself, to decide 404 vs. OK), and load the heavy secondary data (comments, recommendations) in the component with skeletons.
+
+## 7. Advantages / Disadvantages
+
+**Resolver**
+- Advantages: components stay simple; data guaranteed present; failed loads can block navigation or redirect cleanly; no flash of empty content.
+- Disadvantages: navigation feels frozen while waiting, with no built-in loading UI (you must add a global router-event spinner yourself); everything the route needs is waited on, so one slow call delays the whole page; error handling is easy to forget and leaves users stuck; harder to show partial content.
+
+**Component + skeleton**
+- Advantages: instant response to the click; the page shell appears immediately; each section can load and fail independently; easy to show retry buttons inside the page.
+- Disadvantages: every component repeats loading/error/empty handling (unless you build shared helpers); possible layout shift when real content replaces the skeleton; navigating to an invalid record shows a page first, then an error, rather than never entering the page.
+
+## 8. Common Interview Traps
+
+- Saying resolvers make the app "faster." They don't make the request faster. They only change **when** the waiting happens (before the page, instead of inside it). Often the page feels slower, because the click seems to do nothing.
+- Forgetting there's **no default loading indicator** during a resolver. You need to listen to router events (`NavigationStart`/`NavigationEnd`) yourself to show a spinner or progress bar.
+- Not handling errors in the resolver. An unhandled error cancels the navigation and the user is left on the old page with no message.
+- Assuming resolvers re-run on every navigation. They only re-run when the route's params change (or per `runGuardsAndResolvers`); query-param-only changes don't re-trigger them by default.
+- Presenting it as an either/or. The strongest answer is a hybrid: resolve what the page can't exist without, skeleton the rest.
+
+## 9. Interview Follow-up Questions
+
+**Q1: How do you show a loading indicator while a resolver runs?**
+A: The router emits `NavigationStart` when navigation begins and `NavigationEnd`/`NavigationCancel`/`NavigationError` when it finishes. Listen to those (in a root component or service), toggle a `loading` signal, and show a top progress bar or spinner. Angular gives you nothing automatically here.
+
+**Q2: Resolver vs. `CanActivate` guard. When would you use the guard to load data?**
+A: Guards decide *whether* a navigation may proceed (permission checks). Resolvers *fetch data* for the page. Mixing them is a smell. One valid overlap: when the "does this record exist?" check is the same call as the data fetch, a resolver that redirects on failure covers both.
+
+**Q3: What happens if you have multiple resolvers on one route?**
+A: They run in parallel, and the navigation waits for all of them. That means the slowest one sets the delay, which is a reason to keep resolvers to the essentials.
+
+**Q4: Can you get the benefits of both?**
+A: Yes. Resolve the critical record (decides 404 and gives the page its title), then in the component load secondary sections with their own skeletons. The user gets a correct, immediate-enough page without a fully frozen click.
+
+## 10. Quick Answer (say this first)
+
+"A resolver is a function on a route that Angular runs before creating the component, waiting for the data so the component is never shown without it. The alternative is showing the component immediately and loading inside it behind a skeleton. The trade-off: resolvers keep components simple and let a bad record block navigation (like a 404), but the click feels frozen while waiting and there's no built-in loading UI. Skeletons respond instantly and let sections load independently, but every component handles its own loading and error states. I'd resolve only what the page can't exist without, and skeleton the rest."
+
+## 11. Interview-Ready Answer (full)
+
+"A route resolver is a function attached to a route that Angular runs before it creates the route's component. The router waits for the resolver to finish, then passes the result to the component, either through `ActivatedRoute.data` or directly as an input if you've enabled component input binding. The benefit is that the component can assume its data exists, with no loading flag and no null checks, and you get a natural place to cancel or redirect a navigation if the data can't be loaded, like sending a user to a 404 when a record doesn't exist.
+
+The alternative is to let the component render immediately and fetch its own data, showing a skeleton placeholder until it arrives. The trade-off is really about where the user waits. With a resolver, they wait before the page appears: the old page stays on screen, the URL hasn't changed, and unless you build your own indicator from the router's navigation events, a click looks like it did nothing. With a skeleton, the page appears right away and fills in, which usually feels faster even though the actual network time is identical, and different sections can load independently. The cost is that every component carries its own loading, error, and empty handling, and an invalid record shows a page before failing.
+
+A resolver doesn't make anything faster; it just moves the waiting. So I'd choose based on the page. For a detail page that's meaningless without its record, or where an invalid ID should never render, I'd resolve that one critical piece. For anything slow, secondary, or independently loadable, I'd load it in the component behind skeletons. In practice that hybrid is usually the best answer: resolve the essential, skeleton the rest, and make sure the resolver always handles its errors so users are never stuck on the old page."
+
+## 12. Quick Revision
+
+1. **Resolver:** route function that runs before the component is created and delivers data to it.
+2. **Skeleton approach:** component renders immediately and loads its own data behind a placeholder.
+3. **Core trade-off:** resolver waits *before* the page (frozen-feeling click, simple component); skeleton waits *inside* the page (instant feel, more component logic).
+4. **Resolver wins for:** data the page can't exist without, and 404/redirect on bad records.
+5. **Skeleton wins for:** slow APIs, independent sections, perceived speed.
+6. **Gotchas:** no built-in loading indicator; unhandled errors strand the user; resolvers don't speed anything up.
+7. **Best answer:** hybrid. Resolve the critical record, skeleton the secondary data.
+
+## 13. Memory Trick
+
+**A resolver is a restaurant that won't seat you until your food is ready. A skeleton is one that seats you immediately and brings the plates as they come.** The first gives you a complete table but leaves you standing at the door, wondering if anyone saw you. The second feels welcoming but you watch an empty table for a while. The smart restaurant seats you for the drinks (what the page truly needs) and brings the rest as it's ready.
