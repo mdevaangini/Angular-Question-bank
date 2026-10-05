@@ -59,6 +59,7 @@ export class ProductPage {
 
 The skeleton alternative, for comparison:
 
+
 ```typescript
 // component fetches its own data and shows a placeholder meanwhile
 export class ProductPage {
