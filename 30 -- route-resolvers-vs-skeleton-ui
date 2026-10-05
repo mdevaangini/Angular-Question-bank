@@ -1,6 +1,3 @@
-> **Suggested filename:** `route-resolvers-vs-skeleton-ui.md`
-> **Suggested folder:** `interview-notes/angular/routing/`
-
 # [Theory] What are route resolvers? Trade-off: resolver vs loading data in the component with a skeleton UI.
 
 ## 1. What is it?
