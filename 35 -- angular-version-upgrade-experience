@@ -1,0 +1,97 @@
+> **Suggested filename:** `angular-version-upgrade-experience.md`
+> **Suggested folder:** `interview-notes/angular/scenarios/`
+
+# [Scenario] Describe your experience upgrading an Angular application from one version to another. What approach did you follow during the migration?
+
+> **How to use this note:** this is an experience question, so the interviewer wants *your* story. The note gives you the approach and a answer structure. Replace the `[brackets]` with your real project details (versions, size of app, what broke). Don't claim steps you didn't do; interviewers will probe.
+
+## 1. What is it?
+
+An upgrade question tests whether you treat a framework upgrade as a **planned, low-risk process** instead of "run one command and hope." They want to hear: how you prepared, how you moved in small safe steps, how you verified nothing broke, and how you handled the things that always go wrong (incompatible libraries, breaking changes).
+
+## 2. Why is this hard in real life?
+
+- Angular releases a major version about every 6 months, and each one can change build tools, TypeScript/Node requirements, APIs, and third-party library compatibility.
+- A big app has many moving parts: Angular itself, Angular Material/CDK, RxJS, TypeScript, NgRx, and other libraries. They all have to line up.
+- Skipping versions (for example 12 → 17 in one jump) multiplies the risk, because you can't tell which change broke what.
+- Old apps often have no safety net (few tests), so a "successful" upgrade can still hide broken behavior.
+
+## 3. The approach (what a good answer covers)
+
+**1. Prepare before touching anything**
+- Read the official Angular Update Guide (update.angular.io) for your from → to versions. It lists the exact steps and breaking changes.
+- Make sure the app builds and tests pass on the **current** version first. Otherwise you can't tell what you broke.
+- Start from a clean git state on a dedicated upgrade branch.
+- Check third-party libraries (Material, NgRx, charts, UI kits) for a version that supports the target Angular. Anything without one is a blocker to plan around early.
+- Check Node and TypeScript requirements for the target version.
+
+**2. Upgrade one major version at a time**
+- Never jump several majors at once. Do 14 → 15, verify; 15 → 16, verify; and so on.
+- Each step: `ng update @angular/core@N @angular/cli@N`, then the other packages (`@angular/material`, `@ngrx/store`, etc.).
+- `ng update` runs automatic **migration schematics** that rewrite code for breaking changes. Review its diff instead of trusting it blindly.
+- Commit after every successful major version, so you can roll back to a known-good point.
+
+**3. Fix and verify at each step**
+- Resolve compile errors and peer-dependency conflicts properly. Avoid `--force` / `--legacy-peer-deps` as a permanent fix; if used, treat it as a temporary workaround with a ticket to remove it.
+- Run unit tests, then end-to-end tests, then a manual smoke test of the critical user flows (login, main features).
+- Compare bundle size and build time before and after (builder changes like webpack → esbuild can affect both).
+
+**4. Roll out safely**
+- Run the full CI pipeline, deploy to a staging environment first, and test there.
+- Prefer a gradual release (canary or small percentage) with a quick rollback plan.
+- Freeze or coordinate merges during the upgrade so the team isn't fighting conflicts on the same files.
+
+**5. Adopt new features separately, afterward**
+- Don't mix "upgrade" with "refactor to new style." Once stable, adopt optional modernizations in their own small PRs: standalone components, new control flow (`@if`/`@for`), `inject()`, signals. Angular provides schematics for several of these (for example `ng generate @angular/core:standalone`).
+
+## 4. Example answer you can adapt
+
+"We upgraded [app name], a [size/type] app, from Angular [X] to [Y]. Before touching anything I read the official Update Guide for each version, made sure the app built and tests passed on the current version, and checked that our key dependencies, [Material / NgRx / etc.], had versions supporting the target.
+
+I upgraded one major version at a time instead of jumping, on a dedicated branch. At each step I ran `ng update` for Angular core and CLI first, then the related libraries, reviewed what the migration schematics changed, fixed any compile errors, then ran unit and e2e tests and a manual smoke test of the critical flows before committing and moving to the next version.
+
+The main issues we hit were [your real examples: e.g. a library with no compatible version, RxJS import changes, Material component changes, stricter TypeScript errors]. We solved them by [what you did: upgraded/replaced the library, fixed types, etc.].
+
+For rollout we deployed to staging first, compared bundle size and build time, then released [gradually/all at once] with a rollback plan. Only after the upgrade was stable did we start adopting newer features like standalone components and the new control flow, in separate small PRs, so a bug could be traced to one change."
+
+## 5. Common Interview Traps
+
+- Claiming the upgrade was "just `ng update`." That signals you haven't done a real one. Real upgrades involve dependency conflicts and manual fixes.
+- Jumping several major versions at once. It's the most common mistake and makes failures hard to diagnose.
+- Using `--force` or `--legacy-peer-deps` and never revisiting it.
+- Skipping a test baseline, so you can't prove nothing regressed.
+- Mixing the upgrade with refactoring to new features, which makes bugs impossible to attribute.
+- Making up a detailed story you didn't live. Follow-ups like "what exactly broke?" expose it quickly. If you've only done a small upgrade, say so and describe how you'd scale the process.
+
+## 6. Interview Follow-up Questions
+
+**Q1: What do you do when a third-party library doesn't support the new Angular version?**
+A: Check for a newer release or maintained fork first. If none, look for a replacement library, or isolate the library behind a small wrapper so it can be swapped later. As a last resort, delay the upgrade, or temporarily pin with a documented workaround and a ticket to remove it.
+
+**Q2: How do you know the upgrade didn't break anything with little test coverage?**
+A: Baseline first: record bundle size, build time, and the behavior of critical flows before upgrading. Add tests around the highest-risk areas before the upgrade, then do a structured manual smoke test and a staged rollout with monitoring and a rollback plan.
+
+**Q3: Why one major version at a time?**
+A: Each major version has its own breaking changes and migration schematics, designed to run in order. One step at a time makes any failure traceable to a single change, and you get a known-good commit to fall back to at every step.
+
+**Q4: What changed in the biggest upgrades you know of?**
+A: Examples worth knowing: Ivy replacing the old renderer (v9); Angular Material moving to MDC-based components (v15); standalone components becoming the default and the esbuild-based builder (v17); built-in control flow (`@if`/`@for`) and signals maturing (v17+). Mention only ones relevant to your real experience.
+
+## 7. Quick Answer (say this first)
+
+"I treat an upgrade as a planned process: read the official Update Guide, confirm the app builds and tests pass first, and check that key libraries support the target version. Then upgrade one major version at a time on a branch using `ng update`, review the migration changes, fix issues, run unit, e2e, and smoke tests, and commit before the next step. Deploy to staging, then roll out with a rollback plan. Adopting new features like standalone components comes afterward, separately."
+
+## 8. Quick Revision
+
+1. Prepare: Update Guide, green baseline, clean branch, library compatibility, Node/TS versions.
+2. One major version at a time, never a big jump.
+3. `ng update` core and CLI first, then libraries; review the schematic diffs.
+4. Fix properly; treat `--force` as temporary only.
+5. Verify every step: unit, e2e, manual smoke, bundle size.
+6. Stage, roll out gradually, keep a rollback plan.
+7. Adopt new features (standalone, control flow, signals) in separate PRs after the upgrade.
+8. Tell your real story. Don't invent one.
+
+## 9. Memory Trick
+
+**"Read, Baseline, Step, Verify, Stage, Modernize"**: read the guide, baseline the current state, step one version at a time, verify each step, stage the rollout, and modernize only after it's stable.
